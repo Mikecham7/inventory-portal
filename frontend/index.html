@@ -1,204 +1,177 @@
 <!DOCTYPE html>
-<html lang="en">
+<html>
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Inventory Portal</title>
-    <link rel="preconnect" href="https://fonts.googleapis.com" />
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
+    <title>ECL Inventory & Chat Portal</title>
     <link rel="stylesheet" href="styles.css" />
   </head>
   <body>
-    <div id="loginScreen" class="auth-screen active">
-      <div class="auth-card">
-        <div class="auth-brand">
-          <div class="brand-logo">IP</div>
-          <div>
-            <p class="overline">Inventory Control</p>
-            <h1>Portal Login</h1>
-          </div>
+    <div class="portal-login-overlay" id="portalLoginWindow">
+      <div class="portal-login-box">
+        <img src="https://static.wixstatic.com/media/32ab39_dfd6e4b0422f4d30ac72594477453225~mv2.png" alt="ECL Logo" />
+        <h2>ELECTRIC CITY LOGISTICS</h2>
+        <p>Inventory & Fulfillment Management Portal</p>
+        <div class="login-error" id="loginErrorMsg"></div>
+        <div class="portal-login-form">
+          <label>Username</label>
+          <input type="text" id="portalUser" placeholder="Enter username..." autocomplete="username" />
+          <label>Password</label>
+          <input type="password" id="portalPass" placeholder="Enter password..." autocomplete="current-password" />
         </div>
-
-        <form id="loginForm" class="auth-form">
-          <label>
-            <span>Username</span>
-            <input type="text" id="username" name="username" placeholder="Enter username" required />
-          </label>
-
-          <label>
-            <span>Password</span>
-            <input type="password" id="password" name="password" placeholder="Enter password" required />
-          </label>
-
-          <button type="submit" class="primary-btn wide">Login</button>
-          <p id="loginMessage" class="login-message" aria-live="polite"></p>
-        </form>
+        <button class="portal-login-btn" onclick="executePortalAuth()">Sign In</button>
       </div>
     </div>
 
-    <div id="appShell" class="app-shell hidden">
-      <aside class="sidebar">
-        <div class="brand-box">
-          <div class="brand-logo">IP</div>
+    <div class="header">
+      <div class="header-top">
+        <div class="header-brand">
+          <img class="header-logo" src="https://static.wixstatic.com/media/32ab39_dfd6e4b0422f4d30ac72594477453225~mv2.png" alt="ECL Logo" />
           <div>
-            <p class="overline">Operations</p>
-            <h2>Inventory Portal</h2>
+            <h1 id="portalBrandTitle">ELECTRIC CITY LOGISTICS</h1>
+            <p id="portalBrandSubtitle">Professional Prep & Fulfillment Services</p>
           </div>
         </div>
-
-        <nav class="sidebar-nav">
-          <button class="nav-button active" type="button">Dashboard</button>
-          <button class="nav-button" type="button">Inventory</button>
-          <button class="nav-button" type="button">Orders</button>
-          <button class="nav-button" type="button">Suppliers</button>
-          <button class="nav-button" type="button">Reports</button>
-        </nav>
-
-        <div class="status-box">
-          <p class="overline">System Status</p>
-          <strong id="summaryStatus">Online</strong>
-          <small id="summaryMeta">Connected to Google Sheets</small>
+        <div class="header-right">
+          <span class="client-tag" id="activeClientHeader">CLIENT: —</span>
+          <button class="logout-btn" onclick="executePortalLogout()">Sign Out</button>
         </div>
-      </aside>
-
-      <main class="main-panel">
-        <header class="topbar">
-          <div>
-            <p class="overline">Overview</p>
-            <h3>Warehouse Dashboard</h3>
-          </div>
-
-          <div class="toolbar">
-            <button type="button" class="secondary-btn">Export</button>
-            <button type="button" class="primary-btn" id="openAddModal">+ Add Item</button>
-          </div>
-        </header>
-
-        <section class="stats-grid">
-          <article class="stat-card blue">
-            <span>Total Items</span>
-            <strong id="totalItems">0</strong>
-            <small>Across all locations</small>
-          </article>
-
-          <article class="stat-card green">
-            <span>Low Stock</span>
-            <strong id="lowStockCount">0</strong>
-            <small>Needs reorder</small>
-          </article>
-
-          <article class="stat-card orange">
-            <span>Inventory Value</span>
-            <strong id="inventoryValue">$0.00</strong>
-            <small>Estimated value</small>
-          </article>
-
-          <article class="stat-card purple">
-            <span>Active SKUs</span>
-            <strong id="activeSkus">0</strong>
-            <small>Tracked products</small>
-          </article>
-        </section>
-
-        <section class="inventory-panel">
-          <div class="panel-head">
-            <div>
-              <p class="overline">Inventory List</p>
-              <h4>Current Stock</h4>
-            </div>
-            <div class="search-box">
-              <input id="searchInput" type="search" placeholder="Search item, SKU, or location" />
-            </div>
-          </div>
-
-          <div class="table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th>Item</th>
-                  <th>SKU</th>
-                  <th>Category</th>
-                  <th>Qty</th>
-                  <th>Price</th>
-                  <th>Location</th>
-                  <th>Status</th>
-                  <th>Actions</th>
-                </tr>
-              </thead>
-              <tbody id="inventoryTableBody"></tbody>
-            </table>
-          </div>
-        </section>
-      </main>
-    </div>
-
-    <div id="itemModal" class="modal hidden" aria-hidden="true">
-      <div class="modal-backdrop" data-close="true"></div>
-      <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
-        <div class="modal-header">
-          <div>
-            <p class="overline">Inventory</p>
-            <h4 id="modalTitle">Add Item</h4>
-          </div>
-          <button type="button" class="close-btn" id="closeModal">×</button>
-        </div>
-
-        <form id="inventoryForm">
-          <div class="form-grid">
-            <label>
-              <span>Item Name</span>
-              <input name="itemName" required />
-            </label>
-
-            <label>
-              <span>SKU</span>
-              <input name="sku" required />
-            </label>
-
-            <label>
-              <span>Category</span>
-              <input name="category" required />
-            </label>
-
-            <label>
-              <span>Location</span>
-              <input name="location" required />
-            </label>
-
-            <label>
-              <span>Quantity</span>
-              <input name="quantity" type="number" min="0" required />
-            </label>
-
-            <label>
-              <span>Unit Price</span>
-              <input name="unitPrice" type="number" min="0" step="0.01" required />
-            </label>
-
-            <label>
-              <span>Reorder Level</span>
-              <input name="reorderLevel" type="number" min="0" required />
-            </label>
-
-            <label>
-              <span>Status</span>
-              <select name="status">
-                <option value="In Stock">In Stock</option>
-                <option value="Low Stock">Low Stock</option>
-                <option value="Out of Stock">Out of Stock</option>
-                <option value="On Order">On Order</option>
-              </select>
-            </label>
-          </div>
-
-          <div class="form-actions">
-            <button type="button" class="secondary-btn" id="cancelBtn">Cancel</button>
-            <button type="submit" class="primary-btn">Save Item</button>
-          </div>
-        </form>
       </div>
     </div>
+
+    <div class="admin-switcher" id="adminSwitcher">
+      <label>👁 VIEWING:</label>
+      <div id="adminSwitcherBtns" style="display:flex;gap:6px;flex-wrap:wrap;"></div>
+    </div>
+
+    <div class="tabs" id="mainTabs">
+      <div class="tab active" onclick="goToDashboard()">📊 Dashboard</div>
+      <div class="tab" id="tabUpdate" onclick="requestUpdatePage()">✏️ Update</div>
+      <div class="tab" onclick="goToLogs()">📋 Logs</div>
+      <div class="tab" onclick="showPage('chat')">💬 Chat</div>
+    </div>
+
+    <div id="loadingScreen" class="content" style="display:none;">
+      <div class="loading-screen"><div class="spinner"></div>Loading portal...</div>
+    </div>
+
+    <div id="page-dashboard" class="page content active" style="display:block;">
+      <div class="summary-grid">
+        <div class="summary-card"><div class="num" id="s-total">—</div><div class="lbl">TOTAL SKUs</div></div>
+        <div class="summary-card warn"><div class="num" id="s-low">—</div><div class="lbl">LOW STOCK</div></div>
+        <div class="summary-card danger"><div class="num" id="s-out">—</div><div class="lbl">OUT OF STOCK</div></div>
+      </div>
+      <div class="filter-bar">
+        <input type="text" id="tableSearch" placeholder="🔍 Search SKU or product..." oninput="renderTable()" />
+        <div class="filter-btn-row">
+          <button class="filter-btn active" id="f-all" onclick="setFilter('all')">All</button>
+          <button class="filter-btn" id="f-in" onclick="setFilter('in')">In Stock</button>
+          <button class="filter-btn" id="f-low" onclick="setFilter('low')">Low Stock</button>
+          <button class="filter-btn" id="f-out" onclick="setFilter('out')">Out of Stock</button>
+        </div>
+      </div>
+      <div class="data-cards" id="inventoryCards"></div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>SKU</th><th>PRODUCT TITLE</th>
+              <th class="center">QTY</th><th class="center">STATUS</th><th class="center">EDIT</th>
+            </tr>
+          </thead>
+          <tbody id="inventoryBody"><tr><td colspan="5" class="no-results">Loading...</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div id="page-update" class="page content" style="display:none;">
+      <div class="update-card">
+        <h2>🔍 Find Item</h2>
+        <label>Search by SKU or Product Name:</label>
+        <div class="search-wrap">
+          <input type="text" id="searchInput" placeholder="e.g. C-15-Zn or Copper..." autocomplete="off" oninput="filterSearch()" />
+          <div class="search-results" id="searchResults" style="display:none;"></div>
+        </div>
+        <div id="selectedItem" style="display:none;">
+          <div class="selected-banner">
+            <div class="sl">SELECTED ITEM</div>
+            <div class="ss" id="selSku"></div>
+            <div class="st" id="selTitle"></div>
+          </div>
+          <div class="qty-display">
+            <div><div class="ql">CURRENT QTY ON HAND</div><div class="qv" id="selQty">—</div></div>
+            <span class="badge" id="selBadge"></span>
+          </div>
+          <hr class="divider" />
+          <h2>⚡ Quick Adjust</h2>
+          <div class="amt-row">
+            <label>Amount:</label>
+            <input type="number" id="adjustAmt" value="1" min="1" />
+          </div>
+          <div class="action-row">
+            <button class="big-btn minus" onclick="adjustQty(-1)">− Remove</button>
+            <button class="big-btn plus" onclick="adjustQty(1)">+ Add</button>
+          </div>
+          <hr class="divider" />
+          <h2>✏️ Set Exact Quantity</h2>
+          <div class="set-row">
+            <button class="btn-set" onclick="setExactQty()">Set</button>
+            <input type="number" id="setQtyVal" min="0" placeholder="Enter new qty..." />
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div id="page-logs" class="page content" style="display:none;">
+      <div class="update-card">
+        <h2>📋 Activity Log</h2>
+        <p style="color:#666;font-size:12px;margin-bottom:12px;">Stock adjustment history — most recent first.</p>
+        <div class="filter-bar" style="margin-bottom:10px;">
+          <input type="text" id="logSearch" placeholder="🔍 Filter..." oninput="filterLogs()" />
+        </div>
+        <div class="table-wrap" id="logTableWrap" style="display:block;">
+          <div class="no-results" style="padding:30px;">Loading log...</div>
+        </div>
+      </div>
+    </div>
+
+    <div id="page-chat" class="page content" style="display:none;">
+      <div class="chat-container">
+        <div class="chat-subheading">
+          <h2>SECURE PORTAL CHAT</h2>
+          <span class="status-text"><span class="status-dot"></span>Live Thread</span>
+        </div>
+        <div class="identity-bar">
+          <span>Session: <strong id="displayIdentity">—</strong></span>
+          <span class="staff-presence" id="staffPresenceTag"><span class="pdot"></span>Staff is viewing</span>
+        </div>
+        <div class="messages-box" id="msgBox"></div>
+        <div class="typing-indicator" id="typingIndicator">Someone is typing…</div>
+        <div class="input-area">
+          <button class="action-btn" onclick="insertEmoji('😊')" title="Smile">😊</button>
+          <button class="action-btn" onclick="insertEmoji('👍')" title="Thumbs up">👍</button>
+          <div class="input-wrapper">
+            <input type="text" id="msgInput" placeholder="Type a message…" autocomplete="off" />
+          </div>
+          <button class="send-btn" onclick="submitMessage()" title="Send">➔</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="pin-overlay" id="pinOverlay">
+      <div class="pin-box">
+        <h3>Protected Action</h3>
+        <p>Enter your 3-digit PIN to continue</p>
+        <input type="password" id="pinInput" maxlength="3" placeholder="•••" inputmode="numeric" />
+        <div class="pin-actions">
+          <button class="pin-btn cancel" onclick="closePinPrompt()">Cancel</button>
+          <button class="pin-btn confirm" onclick="verifyPinPrompt()">Unlock</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="footer">Electric City Logistics LLC &nbsp;|&nbsp; eclsupport@electriccitylogistics.com &nbsp;|&nbsp; (406)-948-2719</div>
+    <div class="toast" id="toast"></div>
 
     <script src="app.js"></script>
   </body>
