@@ -20,6 +20,75 @@
           <input type="password" id="portalPass" placeholder="Enter password..." autocomplete="current-password" />
         </div>
         <button class="portal-login-btn" onclick="executePortalAuth()">Sign In</button>
+        <div class="portal-auth-links">
+          <a href="#" onclick="showAuthScreen('activate'); return false;">Create Account</a>
+          <span>&middot;</span>
+          <a href="#" onclick="showAuthScreen('recover'); return false;">Forgot Password?</a>
+        </div>
+      </div>
+    </div>
+
+    <div class="portal-login-overlay" id="activateAccountWindow" style="display:none;">
+      <div class="portal-login-box">
+        <img src="https://static.wixstatic.com/media/32ab39_dfd6e4b0422f4d30ac72594477453225~mv2.png" alt="ECL Logo" />
+        <h2>CREATE YOUR ACCOUNT</h2>
+        <p>Enter the username and activation code you were given.</p>
+        <div class="login-error" id="activateErrorMsg"></div>
+        <div id="activateFormFields">
+          <div class="portal-login-form">
+            <label>Username</label>
+            <input type="text" id="activateUsername" placeholder="Your username..." autocomplete="username" />
+            <label>Activation Code</label>
+            <input type="text" id="activateCode" placeholder="XXXX-XXXX" autocomplete="off" />
+            <label>New Password</label>
+            <input type="password" id="activatePassword" placeholder="At least 8 characters..." autocomplete="new-password" />
+            <label>Confirm Password</label>
+            <input type="password" id="activatePasswordConfirm" placeholder="Re-enter password..." autocomplete="new-password" />
+          </div>
+          <button class="portal-login-btn" onclick="submitActivateAccount()">Create Account</button>
+        </div>
+        <div id="activateSuccessPanel" style="display:none;">
+          <div class="recovery-code-box">
+            <p><strong>Save this recovery code somewhere safe.</strong> You'll need it if you ever forget your password — it won't be shown again.</p>
+            <div class="recovery-code-value" id="activateRecoveryCode"></div>
+          </div>
+          <button class="portal-login-btn" onclick="finishActivateAccount()">Continue to Sign In</button>
+        </div>
+        <div class="portal-auth-links">
+          <a href="#" onclick="showAuthScreen('login'); return false;">Back to Sign In</a>
+        </div>
+      </div>
+    </div>
+
+    <div class="portal-login-overlay" id="recoverAccountWindow" style="display:none;">
+      <div class="portal-login-box">
+        <img src="https://static.wixstatic.com/media/32ab39_dfd6e4b0422f4d30ac72594477453225~mv2.png" alt="ECL Logo" />
+        <h2>RESET YOUR PASSWORD</h2>
+        <p>Enter your username and recovery code.</p>
+        <div class="login-error" id="recoverErrorMsg"></div>
+        <div id="recoverFormFields">
+          <div class="portal-login-form">
+            <label>Username</label>
+            <input type="text" id="recoverUsername" placeholder="Your username..." autocomplete="username" />
+            <label>Recovery Code</label>
+            <input type="text" id="recoverCode" placeholder="XXXX-XXXX" autocomplete="off" />
+            <label>New Password</label>
+            <input type="password" id="recoverPassword" placeholder="At least 8 characters..." autocomplete="new-password" />
+            <label>Confirm Password</label>
+            <input type="password" id="recoverPasswordConfirm" placeholder="Re-enter password..." autocomplete="new-password" />
+          </div>
+          <button class="portal-login-btn" onclick="submitRecoverAccount()">Reset Password</button>
+        </div>
+        <div id="recoverSuccessPanel" style="display:none;">
+          <div class="recovery-code-box">
+            <p><strong>Your password has been reset.</strong> Here is your new recovery code — save it, the old one no longer works.</p>
+            <div class="recovery-code-value" id="recoverRecoveryCode"></div>
+          </div>
+          <button class="portal-login-btn" onclick="finishRecoverAccount()">Continue to Sign In</button>
+        </div>
+        <div class="portal-auth-links">
+          <a href="#" onclick="showAuthScreen('login'); return false;">Back to Sign In</a>
+        </div>
       </div>
     </div>
 
@@ -47,8 +116,10 @@
     <div class="tabs" id="mainTabs">
       <div class="tab active" onclick="goToDashboard()">📊 Dashboard</div>
       <div class="tab" id="tabUpdate" onclick="requestUpdatePage()">✏️ Update</div>
+      <div class="tab" id="tabAdd" onclick="goToAddItem()" style="display:none;">＋ Add</div>
       <div class="tab" onclick="goToLogs()">📋 Logs</div>
       <div class="tab" onclick="showPage('chat')">💬 Chat</div>
+      <div class="tab" id="tabClients" onclick="showPage('clients')" style="display:none;">🏷️ Clients</div>
     </div>
 
     <div id="loadingScreen" class="content" style="display:none;">
@@ -59,28 +130,35 @@
       <div class="summary-grid">
         <div class="summary-card"><div class="num" id="s-total">—</div><div class="lbl">TOTAL SKUs</div></div>
         <div class="summary-card warn"><div class="num" id="s-low">—</div><div class="lbl">LOW STOCK</div></div>
+        <div class="summary-card" id="s-partial-card" style="display:none;"><div class="num" id="s-partial">—</div><div class="lbl">PARTIALLY SHIPPED</div></div>
         <div class="summary-card danger"><div class="num" id="s-out">—</div><div class="lbl">OUT OF STOCK</div></div>
       </div>
       <div class="filter-bar">
         <input type="text" id="tableSearch" placeholder="🔍 Search SKU or product..." oninput="renderTable()" />
         <div class="filter-btn-row">
-          <button class="filter-btn active" id="f-all" onclick="setFilter('all')">All</button>
-          <button class="filter-btn" id="f-in" onclick="setFilter('in')">In Stock</button>
-          <button class="filter-btn" id="f-low" onclick="setFilter('low')">Low Stock</button>
-          <button class="filter-btn" id="f-out" onclick="setFilter('out')">Out of Stock</button>
+          <button class="filter-btn active" id="f-all" data-filter="all" type="button">All</button>
+          <button class="filter-btn" id="f-in" data-filter="in" type="button">In Stock</button>
+          <button class="filter-btn" id="f-low" data-filter="low" type="button">Low Stock</button>
+          <button class="filter-btn" id="f-out" data-filter="out" type="button">Out of Stock</button>
         </div>
       </div>
       <div class="data-cards" id="inventoryCards"></div>
-      <div class="table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th>SKU</th><th>PRODUCT TITLE</th>
-              <th class="center">QTY</th><th class="center">STATUS</th><th class="center">EDIT</th>
+      <div class="table-shell">
+        <button class="table-scroll-btn left" id="tableScrollLeft" type="button" aria-label="Scroll left">←</button>
+        <button class="table-scroll-btn right" id="tableScrollRight" type="button" aria-label="Scroll right">→</button>
+        <div class="table-wrap" id="inventoryTableWrap">
+          <table>
+            <thead>
+            <tr id="inventoryHeaderRow">
+              <th>PRODUCT TITLE</th>
+              <th class="center">QTY</th>
+              <th class="center">STATUS</th>
+              <th class="center">EDIT</th>
             </tr>
-          </thead>
-          <tbody id="inventoryBody"><tr><td colspan="5" class="no-results">Loading...</td></tr></tbody>
-        </table>
+            </thead>
+            <tbody id="inventoryBody"><tr><td colspan="5" class="no-results">Loading...</td></tr></tbody>
+          </table>
+        </div>
       </div>
     </div>
 
@@ -120,6 +198,27 @@
           </div>
         </div>
       </div>
+
+      <div class="update-card" style="margin-top:20px;">
+        <h2>➕ Create Product</h2>
+        <div id="createProductReadOnlyNotice" style="display:none; color:#b45309; background:#fff7ed; border:1px solid #fed7aa; padding:8px 10px; border-radius:8px; margin-bottom:12px; font-size:12px; font-weight:700;"></div>
+        <div class="set-row" style="display:grid;grid-template-columns:1fr 1fr 110px auto;gap:8px;align-items:end;">
+          <div id="newProductSkuWrap">
+            <label style="display:block;font-size:11px;font-weight:700;color:#475569;margin-bottom:6px;">SKU</label>
+            <input type="text" id="newProductSku" placeholder="A-25-Cu-01" style="width:100%;padding:10px 12px;border:1px solid #dfe7f1;border-radius:8px;" />
+          </div>
+          <div id="newProductTitleWrap">
+            <label id="newProductTitleLabel" style="display:block;font-size:11px;font-weight:700;color:#475569;margin-bottom:6px;">Product Title</label>
+            <input type="text" id="newProductTitle" placeholder="Copper Marker" style="width:100%;padding:10px 12px;border:1px solid #dfe7f1;border-radius:8px;" />
+          </div>
+          <div>
+            <label style="display:block;font-size:11px;font-weight:700;color:#475569;margin-bottom:6px;">Qty</label>
+            <input type="number" id="newProductQty" value="0" min="0" style="width:100%;padding:10px 12px;border:1px solid #dfe7f1;border-radius:8px;" />
+          </div>
+          <button id="createProductSubmit" class="btn-set" onclick="createProduct()">Add</button>
+        </div>
+        <div id="customProductFields" style="margin-top:12px; display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:10px;"></div>
+      </div>
     </div>
 
     <div id="page-logs" class="page content" style="display:none;">
@@ -144,9 +243,14 @@
         <div class="identity-bar">
           <span>Session: <strong id="displayIdentity">—</strong></span>
           <span class="staff-presence" id="staffPresenceTag"><span class="pdot"></span>Staff is viewing</span>
+          <a id="driveFolderLink" href="#" target="_blank" rel="noreferrer" style="color:#0f766e; font-weight:700; text-decoration:none;">Open Drive Folder</a>
+          <span style="font-size:11px; color:#64748b;">Must be signed in with the email you provided us for Google Drive access.</span>
         </div>
         <div class="messages-box" id="msgBox"></div>
-        <div class="typing-indicator" id="typingIndicator">Someone is typing…</div>
+        <div class="typing-indicator" id="typingIndicator" style="display:none;">Someone is typing…</div>
+        <div class="chat-file-row" style="padding:0 12px 10px; display:flex; gap:8px; align-items:center; background:#f8fafc; border-top:1px solid #e2e8f0;">
+          <input type="url" id="chatFileUrl" placeholder="Google Drive file URL (optional)" style="flex:1; padding:10px 12px; border:1px solid #dfe7f1; border-radius:8px; font-size:12px;" />
+        </div>
         <div class="input-area">
           <button class="action-btn" onclick="insertEmoji('😊')" title="Smile">😊</button>
           <button class="action-btn" onclick="insertEmoji('👍')" title="Thumbs up">👍</button>
@@ -154,6 +258,119 @@
             <input type="text" id="msgInput" placeholder="Type a message…" autocomplete="off" />
           </div>
           <button class="send-btn" onclick="submitMessage()" title="Send">➔</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="page-clients" class="page content" style="display:none;">
+      <div class="update-card">
+        <h2>🏷️ Add New Client</h2>
+        <p style="color:#666;font-size:12px;margin-bottom:12px;">Creates the login, portal settings, and a ready-to-use inventory sheet — no code changes needed.</p>
+        <div id="addClientMsg" style="display:none;margin-bottom:12px;padding:8px 10px;border-radius:8px;font-size:12px;font-weight:700;"></div>
+
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+          <div>
+            <label class="ac-label">Client ID</label>
+            <input type="text" id="acClientId" placeholder="CL-004" style="width:100%;padding:10px 12px;border:1px solid #dfe7f1;border-radius:8px;" />
+          </div>
+          <div>
+            <label class="ac-label">Client Name</label>
+            <input type="text" id="acClientName" placeholder="New Client Co" style="width:100%;padding:10px 12px;border:1px solid #dfe7f1;border-radius:8px;" />
+          </div>
+          <div>
+            <label class="ac-label">Username</label>
+            <input type="text" id="acUsername" placeholder="newclient" style="width:100%;padding:10px 12px;border:1px solid #dfe7f1;border-radius:8px;" />
+          </div>
+          <div>
+            <label class="ac-label">Email (optional)</label>
+            <input type="text" id="acEmail" placeholder="client@email.com" style="width:100%;padding:10px 12px;border:1px solid #dfe7f1;border-radius:8px;" />
+          </div>
+          <div>
+            <label class="ac-label">Drive Folder URL (optional)</label>
+            <input type="text" id="acDriveFolderUrl" placeholder="https://drive.google.com/..." style="width:100%;padding:10px 12px;border:1px solid #dfe7f1;border-radius:8px;" />
+          </div>
+          <div>
+            <label class="ac-label">Portal Title (optional)</label>
+            <input type="text" id="acPortalTitle" placeholder="ECL Inventory Portal" style="width:100%;padding:10px 12px;border:1px solid #dfe7f1;border-radius:8px;" />
+          </div>
+          <div>
+            <label class="ac-label">Accent Color (optional)</label>
+            <input type="text" id="acAccentColor" placeholder="#F5C518" style="width:100%;padding:10px 12px;border:1px solid #dfe7f1;border-radius:8px;" />
+          </div>
+        </div>
+
+        <div style="margin-top:14px;display:flex;gap:16px;flex-wrap:wrap;">
+          <label class="ac-check"><input type="checkbox" id="acEnableAddItem" checked /> Client can add items</label>
+          <label class="ac-check"><input type="checkbox" id="acAllowChat" checked /> Allow chat</label>
+          <label class="ac-check"><input type="checkbox" id="acAllowLogs" checked /> Allow logs</label>
+          <label class="ac-check"><input type="checkbox" id="acAllowUpdate" checked /> Allow update</label>
+          <label class="ac-check"><input type="checkbox" id="acReadOnly" /> Read-only dashboard</label>
+        </div>
+
+        <hr class="divider" />
+        <h2>📋 Dashboard / Add-Item Fields</h2>
+        <p style="color:#666;font-size:12px;margin-bottom:10px;">Every field you add here becomes a column on the dashboard and a field on the Add Item form.</p>
+        <div id="acFieldsList"></div>
+        <button type="button" class="btn-set" style="margin-top:8px;" onclick="addClientFieldRow()">+ Add Field</button>
+
+        <div style="margin-top:18px;">
+          <button type="button" class="big-btn plus" onclick="submitNewClient()">Create Client</button>
+        </div>
+      </div>
+
+      <div class="update-card">
+        <h2>✏️ Edit Existing Client</h2>
+        <p style="color:#666;font-size:12px;margin-bottom:12px;">Change settings or add/rename/remove fields any time — the sheet columns update to match.</p>
+        <div id="editClientMsg" style="display:none;margin-bottom:12px;padding:8px 10px;border-radius:8px;font-size:12px;font-weight:700;"></div>
+
+        <label class="ac-label">Select Client</label>
+        <select id="ecClientSelect" style="width:100%;padding:10px 12px;border:1px solid #dfe7f1;border-radius:8px;margin-bottom:14px;" onchange="loadClientForEdit(this.value)">
+          <option value="">— Choose a client —</option>
+        </select>
+
+        <div id="editClientForm" style="display:none;">
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+            <div>
+              <label class="ac-label">Client Name</label>
+              <input type="text" id="ecClientName" style="width:100%;padding:10px 12px;border:1px solid #dfe7f1;border-radius:8px;" />
+            </div>
+            <div>
+              <label class="ac-label">Drive Folder URL</label>
+              <input type="text" id="ecDriveFolderUrl" style="width:100%;padding:10px 12px;border:1px solid #dfe7f1;border-radius:8px;" />
+            </div>
+            <div>
+              <label class="ac-label">Portal Title</label>
+              <input type="text" id="ecPortalTitle" style="width:100%;padding:10px 12px;border:1px solid #dfe7f1;border-radius:8px;" />
+            </div>
+            <div>
+              <label class="ac-label">Accent Color</label>
+              <input type="text" id="ecAccentColor" style="width:100%;padding:10px 12px;border:1px solid #dfe7f1;border-radius:8px;" />
+            </div>
+          </div>
+
+          <div style="margin-top:14px;display:flex;gap:16px;flex-wrap:wrap;">
+            <label class="ac-check"><input type="checkbox" id="ecEnableAddItem" /> Client can add items</label>
+            <label class="ac-check"><input type="checkbox" id="ecAllowChat" /> Allow chat</label>
+            <label class="ac-check"><input type="checkbox" id="ecAllowLogs" /> Allow logs</label>
+            <label class="ac-check"><input type="checkbox" id="ecAllowUpdate" /> Allow update</label>
+            <label class="ac-check"><input type="checkbox" id="ecReadOnly" /> Read-only dashboard</label>
+          </div>
+
+          <hr class="divider" />
+          <h2>📋 Dashboard / Add-Item Fields</h2>
+          <p style="color:#666;font-size:12px;margin-bottom:10px;">Rename a field's label to rename its column, or remove it to delete the column (and its data) entirely.</p>
+          <div id="ecFieldsList"></div>
+          <button type="button" class="btn-set" style="margin-top:8px;" onclick="addEditClientFieldRow()">+ Add Field</button>
+
+          <hr class="divider" />
+          <h2>🔑 Account Access</h2>
+          <p style="color:#666;font-size:12px;margin-bottom:10px;">If the client lost their activation code or recovery code, reset their account here and give them the new activation code.</p>
+          <button type="button" class="btn-set" onclick="resetClientAccountPrompt()">Reset Account (new activation code)</button>
+
+          <div style="margin-top:18px;display:flex;gap:10px;">
+            <button type="button" class="big-btn plus" onclick="submitClientEdit()">Save Changes</button>
+            <button type="button" class="big-btn minus" onclick="deleteClientPrompt()">Delete Client</button>
+          </div>
         </div>
       </div>
     </div>
