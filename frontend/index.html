@@ -10,89 +10,105 @@
     <link rel="stylesheet" href="styles.css" />
   </head>
   <body>
-    <div class="app-shell">
-      <aside class="sidebar">
-        <div class="brand">
-          <div class="brand-mark">I</div>
+    <div id="loginScreen" class="auth-screen active">
+      <div class="auth-card">
+        <div class="auth-brand">
+          <div class="brand-logo">IP</div>
           <div>
-            <p class="eyebrow">Operations</p>
-            <h1>Inventory Portal</h1>
+            <p class="overline">Inventory Control</p>
+            <h1>Portal Login</h1>
           </div>
         </div>
 
-        <nav class="nav">
-          <button class="nav-item active" type="button">
-            <span>Dashboard</span>
-          </button>
-          <button class="nav-item" type="button">
-            <span>Inventory</span>
-          </button>
-          <button class="nav-item" type="button">
-            <span>Orders</span>
-          </button>
-          <button class="nav-item" type="button">
-            <span>Suppliers</span>
-          </button>
-          <button class="nav-item" type="button">
-            <span>Reports</span>
-          </button>
+        <form id="loginForm" class="auth-form">
+          <label>
+            <span>Username</span>
+            <input type="text" id="username" name="username" placeholder="Enter username" required />
+          </label>
+
+          <label>
+            <span>Password</span>
+            <input type="password" id="password" name="password" placeholder="Enter password" required />
+          </label>
+
+          <button type="submit" class="primary-btn wide">Login</button>
+          <p id="loginMessage" class="login-message" aria-live="polite"></p>
+        </form>
+      </div>
+    </div>
+
+    <div id="appShell" class="app-shell hidden">
+      <aside class="sidebar">
+        <div class="brand-box">
+          <div class="brand-logo">IP</div>
+          <div>
+            <p class="overline">Operations</p>
+            <h2>Inventory Portal</h2>
+          </div>
+        </div>
+
+        <nav class="sidebar-nav">
+          <button class="nav-button active" type="button">Dashboard</button>
+          <button class="nav-button" type="button">Inventory</button>
+          <button class="nav-button" type="button">Orders</button>
+          <button class="nav-button" type="button">Suppliers</button>
+          <button class="nav-button" type="button">Reports</button>
         </nav>
 
-        <div class="sidebar-card">
-          <p class="eyebrow">Quick summary</p>
-          <strong id="summaryStatus">System online</strong>
-          <small id="summaryMeta">Syncing with Google Sheets</small>
+        <div class="status-box">
+          <p class="overline">System Status</p>
+          <strong id="summaryStatus">Online</strong>
+          <small id="summaryMeta">Connected to Google Sheets</small>
         </div>
       </aside>
 
-      <main class="content">
+      <main class="main-panel">
         <header class="topbar">
           <div>
-            <p class="eyebrow">Overview</p>
-            <h2>Warehouse dashboard</h2>
+            <p class="overline">Overview</p>
+            <h3>Warehouse Dashboard</h3>
           </div>
 
-          <div class="topbar-actions">
-            <button class="secondary-btn" type="button">Export</button>
-            <button class="primary-btn" id="openAddModal" type="button">+ Add item</button>
+          <div class="toolbar">
+            <button type="button" class="secondary-btn">Export</button>
+            <button type="button" class="primary-btn" id="openAddModal">+ Add Item</button>
           </div>
         </header>
 
-        <section class="stats-grid" id="statsGrid">
-          <article class="stat-card accent-blue">
-            <span>Total items</span>
+        <section class="stats-grid">
+          <article class="stat-card blue">
+            <span>Total Items</span>
             <strong id="totalItems">0</strong>
-            <small id="totalItemsTrend">Across all locations</small>
+            <small>Across all locations</small>
           </article>
 
-          <article class="stat-card accent-green">
-            <span>Low stock</span>
+          <article class="stat-card green">
+            <span>Low Stock</span>
             <strong id="lowStockCount">0</strong>
-            <small>Needs reorder soon</small>
+            <small>Needs reorder</small>
           </article>
 
-          <article class="stat-card accent-orange">
-            <span>Inventory value</span>
-            <strong id="inventoryValue">$0</strong>
-            <small>Estimated stock value</small>
+          <article class="stat-card orange">
+            <span>Inventory Value</span>
+            <strong id="inventoryValue">$0.00</strong>
+            <small>Estimated value</small>
           </article>
 
-          <article class="stat-card accent-purple">
+          <article class="stat-card purple">
             <span>Active SKUs</span>
             <strong id="activeSkus">0</strong>
-            <small>Unique products in list</small>
+            <small>Tracked products</small>
           </article>
         </section>
 
-        <section class="panel">
-          <div class="panel-header">
+        <section class="inventory-panel">
+          <div class="panel-head">
             <div>
-              <p class="eyebrow">Inventory list</p>
-              <h3>Current stock</h3>
+              <p class="overline">Inventory List</p>
+              <h4>Current Stock</h4>
             </div>
-
-            <div class="search-wrap">
-              <input id="searchInput" type="search" placeholder="Search item, SKU, location..." />
+            <div class="search-box">
+              <input id="searchInput" type="search" placeholder="Search item, SKU, or location" />
             </div>
           </div>
 
@@ -117,21 +133,21 @@
       </main>
     </div>
 
-    <div class="modal hidden" id="itemModal" aria-hidden="true">
+    <div id="itemModal" class="modal hidden" aria-hidden="true">
       <div class="modal-backdrop" data-close="true"></div>
       <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
         <div class="modal-header">
           <div>
-            <p class="eyebrow">Inventory</p>
-            <h3 id="modalTitle">Add item</h3>
+            <p class="overline">Inventory</p>
+            <h4 id="modalTitle">Add Item</h4>
           </div>
-          <button class="close-btn" id="closeModal" type="button" aria-label="Close">×</button>
+          <button type="button" class="close-btn" id="closeModal">×</button>
         </div>
 
         <form id="inventoryForm">
           <div class="form-grid">
             <label>
-              <span>Item name</span>
+              <span>Item Name</span>
               <input name="itemName" required />
             </label>
 
@@ -156,12 +172,12 @@
             </label>
 
             <label>
-              <span>Unit price</span>
+              <span>Unit Price</span>
               <input name="unitPrice" type="number" min="0" step="0.01" required />
             </label>
 
             <label>
-              <span>Reorder level</span>
+              <span>Reorder Level</span>
               <input name="reorderLevel" type="number" min="0" required />
             </label>
 
@@ -177,8 +193,8 @@
           </div>
 
           <div class="form-actions">
-            <button class="secondary-btn" type="button" id="cancelBtn">Cancel</button>
-            <button class="primary-btn" type="submit">Save item</button>
+            <button type="button" class="secondary-btn" id="cancelBtn">Cancel</button>
+            <button type="submit" class="primary-btn">Save Item</button>
           </div>
         </form>
       </div>
