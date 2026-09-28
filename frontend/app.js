@@ -34,6 +34,14 @@ const RECOVER_ACCOUNT_URL = window.location.hostname === 'localhost' || window.l
   ? 'http://localhost:3001/api/account/recover'
   : '/api/account/recover';
 
+const NOTIFICATIONS_URL = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
+  ? 'http://localhost:3001/api/notifications'
+  : '/api/notifications';
+
+const UPDATE_QUANTITY_URL = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
+  ? 'http://localhost:3001/api/inventory/quantity'
+  : '/api/inventory/quantity';
+
 const defaultInventory = [];
 
 const CLIENT_INVENTORY_FIELDS = {
@@ -228,8 +236,143 @@ const state = {
   clientProfile: null,
   newClientFields: [],
   editClientId: '',
-  editClientFields: []
+  editClientFields: [],
+  notifications: { chat: 0, inventory: 0, total: 0, items: [] }
 };
+
+let chatRequestId = 0;
+let inventoryRequestId = 0;
+let notificationRequestId = 0;
+let chatSignature = null;
+let inventorySignature = null;
+let syncGeneration = 0;
+const syncTimers = { chat: null, inventory: null, notifications: null };
+const syncFailures = { chat: 0, inventory: 0, notifications: 0 };
+const syncIntervals = { chat: 10000, inventory: 15000, notifications: 30000 };
+
+function stopBackgroundSync() {
+  syncGeneration += 1;
+  Object.keys(syncTimers).forEach((kind) => {
+    clearTimeout(syncTimers[kind]);
+    syncTimers[kind] = null;
+  });
+}
+
+function scheduleBackgroundSync(kind, delay, generation = syncGeneration) {
+  clearTimeout(syncTimers[kind]);
+  if (!state.auth || document.hidden) return;
+  syncTimers[kind] = setTimeout(async () => {
+    if (generation !== syncGeneration || !state.auth || document.hidden) return;
+    if (kind === 'chat' && !document.getElementById('page-chat')?.classList.contains('active')) return;
+
+    const clientId = state.activeClientId;
+    const status = kind === 'chat' ? await loadChatMessages(clientId)
+      : kind === 'inventory' ? await fetchInventory(clientId) : await fetchNotifications(clientId);
+    if (generation !== syncGeneration || !state.auth || document.hidden || clientId !== state.activeClientId) return;
+
+    syncFailures[kind] = status === 200 ? 0 : syncFailures[kind] + 1;
+    const nextDelay = status === 200 ? syncIntervals[kind]
+      : Math.min(120000, (status === 429 ? 30000 : syncIntervals[kind] * 2) * (2 ** Math.min(syncFailures[kind] - 1, 3)));
+    scheduleBackgroundSync(kind, nextDelay, generation);
+  }, delay);
+}
+
+function startBackgroundSync(immediate = false) {
+  stopBackgroundSync();
+  if (!state.auth || document.hidden) return;
+  scheduleBackgroundSync('inventory', immediate ? 0 : syncIntervals.inventory);
+  scheduleBackgroundSync('notifications', immediate ? 1500 : syncIntervals.notifications);
+  if (document.getElementById('page-chat')?.classList.contains('active')) {
+    scheduleBackgroundSync('chat', immediate ? 1000 : syncIntervals.chat);
+  }
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) stopBackgroundSync();
+  else startBackgroundSync(true);
+});
+
+function renderNotifications() {
+  const anchor = document.getElementById('notificationAnchor');
+  const badge = document.getElementById('notificationBadge');
+  const list = document.getElementById('notificationList');
+  const clear = document.getElementById('notificationClear');
+  if (!anchor || !badge || !list) return;
+  anchor.style.display = state.auth ? 'block' : 'none';
+  const { total, items } = state.notifications;
+  badge.style.display = total ? 'block' : 'none';
+  badge.textContent = total > 99 ? '99+' : String(total);
+  const button = document.getElementById('notificationButton');
+  if (button) button.setAttribute('aria-label', `${total} unread notifications`);
+  if (clear) clear.style.display = total ? 'block' : 'none';
+  list.replaceChildren();
+  if (!items.length) {
+    list.textContent = 'No unread notifications.';
+    return;
+  }
+  items.forEach((item) => {
+    const row = document.createElement('button');
+    row.type = 'button';
+    row.className = 'notification-row';
+    const heading = document.createElement('strong');
+    heading.textContent = `${item.kind === 'chat' ? 'Chat' : 'Inventory'}${state.isAdmin ? ` · ${item.clientId}` : ''}`;
+    const description = document.createElement('span');
+    description.textContent = item.description || 'New activity';
+    row.append(heading, description);
+    row.addEventListener('click', () => openNotification(item));
+    list.append(row);
+  });
+}
+
+function toggleNotifications() {
+  const panel = document.getElementById('notificationPanel');
+  if (!panel) return;
+  const open = panel.style.display === 'none';
+  panel.style.display = open ? 'block' : 'none';
+  document.getElementById('notificationButton')?.setAttribute('aria-expanded', String(open));
+}
+
+async function fetchNotifications(clientId = state.activeClientId) {
+  if (!state.auth || !state.session?.notificationToken) return 401;
+  const requestId = ++notificationRequestId;
+  const session = state.session;
+  try {
+    const response = await fetch(`${NOTIFICATIONS_URL}?clientId=${encodeURIComponent(clientId || session.clientId)}`, {
+      headers: { Authorization: `Bearer ${session.notificationToken}`, Accept: 'application/json' }
+    });
+    if (!response.ok) return response.status;
+    const summary = await response.json();
+    if (requestId === notificationRequestId && state.auth && state.session === session && state.activeClientId === clientId) {
+      state.notifications = summary;
+      renderNotifications();
+    }
+    return 200;
+  } catch (error) {
+    return 0;
+  }
+}
+
+async function markNotificationsRead(kind, clientId = state.activeClientId) {
+  if (!state.session?.notificationToken) return;
+  try {
+    const response = await fetch(`${NOTIFICATIONS_URL}/read`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${state.session.notificationToken}` },
+      body: JSON.stringify({ kind, clientId })
+    });
+    if (!response.ok) throw new Error('Unable to mark notifications read.');
+    await fetchNotifications();
+  } catch (error) {
+    showToast('Unable to mark notifications read', 'error');
+  }
+}
+
+async function openNotification(item) {
+  toggleNotifications();
+  if (state.isAdmin && item.clientId !== state.activeClientId) await switchClientView(item.clientId);
+  showPage(item.kind === 'chat' ? 'chat' : 'dashboard', false);
+  await markNotificationsRead(item.kind, item.clientId);
+}
 
 const portalLoginWindow = document.getElementById('portalLoginWindow');
 const loginErrorMsg = document.getElementById('loginErrorMsg');
@@ -291,9 +434,16 @@ function setPage(pageId) {
   if (tabIndex !== undefined && tabs[tabIndex]) {
     tabs[tabIndex].classList.add('active');
   }
+  if (state.auth && !document.hidden) {
+    if (pageId === 'page-chat') scheduleBackgroundSync('chat', 0);
+    else {
+      clearTimeout(syncTimers.chat);
+      syncTimers.chat = null;
+    }
+  }
 }
 
-function showPage(pageName) {
+function showPage(pageName, markChatRead = true) {
   const routeMap = {
     dashboard: 'page-dashboard',
     update: 'page-update',
@@ -305,6 +455,14 @@ function showPage(pageName) {
   const targetPage = routeMap[pageName] || pageName;
   if (targetPage && document.getElementById(targetPage)) {
     setPage(targetPage);
+  }
+  if (targetPage === 'page-chat' && markChatRead && state.auth && state.notifications.chat) {
+    const clientId = state.activeClientId;
+    loadChatMessages(clientId).then((status) => {
+      if (status === 200 && state.activeClientId === clientId && document.getElementById('page-chat')?.classList.contains('active')) {
+        markNotificationsRead('chat', clientId);
+      }
+    });
   }
   if (targetPage === 'page-clients') {
     renderClientFieldRows();
@@ -577,6 +735,7 @@ function renderTable() {
 function renderChatMessages() {
   if (!msgBox) return;
   const messages = Array.isArray(state.messages) ? state.messages : [];
+  const atBottom = msgBox.scrollHeight - msgBox.scrollTop - msgBox.clientHeight < 60;
   const typingIndicator = document.getElementById('typingIndicator');
   if (typingIndicator) {
     typingIndicator.style.display = 'none';
@@ -606,27 +765,31 @@ function renderChatMessages() {
     `;
   }).join('');
 
-  msgBox.scrollTop = msgBox.scrollHeight;
+  if (atBottom) msgBox.scrollTop = msgBox.scrollHeight;
 }
 
 async function loadChatMessages(clientId = state.activeClientId || state.session?.clientId || 'CL-001') {
+  const requestId = ++chatRequestId;
+  const session = state.session;
   try {
     const response = await fetch(`${CHAT_URL}?clientId=${encodeURIComponent(clientId)}`, {
       headers: { Accept: 'application/json' }
     });
 
-    if (!response.ok) {
-      state.messages = [];
-      renderChatMessages();
-      return;
-    }
+    if (!response.ok) return response.status;
 
     const payload = await response.json();
-    state.messages = Array.isArray(payload) ? payload : [];
-    renderChatMessages();
+    if (requestId === chatRequestId && state.auth && state.session === session && state.activeClientId === clientId && Array.isArray(payload)) {
+      const signature = JSON.stringify(payload);
+      if (signature !== chatSignature) {
+        chatSignature = signature;
+        state.messages = payload;
+        renderChatMessages();
+      }
+    }
+    return 200;
   } catch (error) {
-    state.messages = [];
-    renderChatMessages();
+    return 0;
   }
 }
 
@@ -771,24 +934,30 @@ function finishRecoverAccount() {
 async function fetchInventory(clientId = state.activeClientId || state.session?.clientId || 'CL-001') {
   const targetClientId = String(clientId || '').trim() || 'CL-001';
   const inventoryUrl = `${API_URL}?clientId=${encodeURIComponent(targetClientId)}`;
+  const requestId = ++inventoryRequestId;
+  const session = state.session;
 
   try {
     const response = await fetch(inventoryUrl, {
       headers: { Accept: 'application/json' }
     });
 
-    if (!response.ok) {
-      throw new Error('Unable to load inventory');
-    }
+    if (!response.ok) return response.status;
 
     const result = await response.json();
-    state.items = Array.isArray(result) ? result.map((item) => normalizeInventoryItem(item, targetClientId)) : [];
+    if (requestId === inventoryRequestId && state.auth && state.session === session && state.activeClientId === targetClientId && Array.isArray(result)) {
+      const signature = JSON.stringify(result);
+      if (signature !== inventorySignature) {
+        inventorySignature = signature;
+        state.items = result.map((item) => normalizeInventoryItem(item, targetClientId));
+        updateSummary();
+        renderTable();
+      }
+    }
+    return 200;
   } catch (error) {
-    state.items = [];
+    return 0;
   }
-
-  updateSummary();
-  renderTable();
 }
 
 async function fetchClientRoster() {
@@ -987,9 +1156,19 @@ function renderProductForm() {
 }
 
 async function switchClientView(clientId, clientName) {
+  stopBackgroundSync();
+  notificationRequestId += 1;
   state.activeClientId = String(clientId || '').trim().toUpperCase();
   state.filter = 'all';
   state.query = '';
+  state.items = [];
+  state.messages = [];
+  inventorySignature = null;
+  chatSignature = null;
+  state.notifications = { chat: 0, inventory: 0, total: 0, items: [] };
+  renderNotifications();
+  inventoryRequestId += 1;
+  chatRequestId += 1;
   if (tableSearch) tableSearch.value = '';
 
   renderClientHeader();
@@ -998,9 +1177,13 @@ async function switchClientView(clientId, clientName) {
   renderAdminSwitcher();
   renderDriveFolderLink();
   renderProductForm();
+  updateSummary();
   renderTable();
+  renderChatMessages();
   await fetchInventory(state.activeClientId);
   await loadChatMessages(state.activeClientId);
+  await fetchNotifications(state.activeClientId);
+  startBackgroundSync();
 }
 
 async function executePortalAuth() {
@@ -1065,6 +1248,8 @@ async function executePortalAuth() {
     renderProductForm();
     renderTable();
     await loadChatMessages(state.activeClientId);
+    await fetchNotifications(state.activeClientId);
+    startBackgroundSync();
     showToast('Signed in successfully', 'success');
   } catch (error) {
     if (loginErrorMsg) {
@@ -1075,6 +1260,12 @@ async function executePortalAuth() {
 }
 
 function executePortalLogout() {
+  stopBackgroundSync();
+  chatRequestId += 1;
+  inventoryRequestId += 1;
+  notificationRequestId += 1;
+  chatSignature = null;
+  inventorySignature = null;
   state.auth = false;
   state.session = null;
   state.isAdmin = false;
@@ -1083,6 +1274,10 @@ function executePortalLogout() {
   state.selectedItemId = null;
   state.pinUnlocked = false;
   state.messages = [];
+  state.notifications = { chat: 0, inventory: 0, total: 0, items: [] };
+  document.getElementById('notificationPanel') && (document.getElementById('notificationPanel').style.display = 'none');
+  renderNotifications();
+  state.items = [];
   state.clientProfile = null;
   renderChatMessages();
   renderAdminSwitcher();
@@ -1100,6 +1295,8 @@ function executePortalLogout() {
   if (portalUser) portalUser.value = '';
   if (portalPass) portalPass.value = '';
   setPage('page-dashboard');
+  updateSummary();
+  renderTable();
   showToast('Signed out', 'success');
 }
 
@@ -1245,6 +1442,8 @@ async function submitMessage() {
       fileUrl,
       fileName
     });
+    chatRequestId += 1;
+    chatSignature = null;
     renderChatMessages();
     msgInput.value = '';
     if (fileInput) fileInput.value = '';
@@ -1304,7 +1503,31 @@ function selectItem(id) {
   }
 }
 
-function adjustQty(delta) {
+async function saveQuantity(item, quantity) {
+  const clientId = state.activeClientId;
+  try {
+    const response = await fetch(UPDATE_QUANTITY_URL, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${state.session?.notificationToken || ''}` },
+      body: JSON.stringify({ clientId, sku: item.sku, qty: quantity })
+    });
+    const result = await response.json();
+    if (!response.ok || !result.success) throw new Error(result.error || 'Unable to update inventory.');
+    if (clientId !== state.activeClientId || !state.auth) return;
+    item.qty = quantity;
+    item.status = getStatusText(getItemStatus(item));
+    inventorySignature = null;
+    updateSummary();
+    renderTable();
+    selectItem(item.id);
+    showToast(`Inventory updated to ${quantity}`, 'success');
+    await fetchInventory(clientId);
+  } catch (error) {
+    showToast(error.message || 'Unable to update inventory', 'error');
+  }
+}
+
+async function adjustQty(delta) {
   if (!state.selectedItemId) {
     showToast('Select an item first', 'error');
     return;
@@ -1315,15 +1538,10 @@ function adjustQty(delta) {
 
   const amount = Number(document.getElementById('adjustAmt')?.value || 1);
   const nextQty = Math.max(0, Number(item.qty ?? item.quantity ?? 0) + (amount * delta));
-  item.qty = nextQty;
-  item.status = getStatusText(getItemStatus(item));
-  updateSummary();
-  renderTable();
-  selectItem(item.id);
-  showToast(`Inventory updated to ${nextQty}`, 'success');
+  await saveQuantity(item, nextQty);
 }
 
-function setExactQty() {
+async function setExactQty() {
   if (!state.selectedItemId) {
     showToast('Select an item first', 'error');
     return;
@@ -1333,12 +1551,7 @@ function setExactQty() {
   const item = state.items.find((entry) => String(entry.id) === String(state.selectedItemId));
   if (!item) return;
 
-  item.qty = Math.max(0, val);
-  item.status = getStatusText(getItemStatus(item));
-  updateSummary();
-  renderTable();
-  selectItem(item.id);
-  showToast(`Set quantity to ${item.qty}`, 'success');
+  await saveQuantity(item, Math.max(0, val));
 }
 
 async function createProduct() {
@@ -1374,7 +1587,7 @@ async function createProduct() {
   try {
     const response = await fetch(CREATE_ITEM_URL, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${state.session?.notificationToken || ''}` },
       body: JSON.stringify({ clientId, sku: sku || title, title, qty, status: qty <= 5 ? 'Low Stock' : 'In Stock', extraFields, isAdmin: state.isAdmin, role: state.session?.role || (state.isAdmin ? 'admin' : 'client') })
     });
 

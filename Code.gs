@@ -931,6 +931,25 @@ function getUnreadCount(clientId, isStaffViewer, lastSeenEpochMs) {
   }
 }
 
+function onEdit(e) {
+  if (!e || !e.range || !e.source) return;
+  var sheet = e.range.getSheet();
+  var clientId = sheet.getName();
+  if (!/^CL-\d{3,}$/.test(clientId) || clientId === "CL-000") return;
+  var rowNumber = e.range.getRow();
+  if (rowNumber < (clientId === "CL-001" ? 9 : 2)) return;
+
+  var sku = sheet.getRange(rowNumber, clientId === "CL-001" ? 2 : 1).getDisplayValue().trim();
+  if (!sku) return;
+  var log = e.source.getSheetByName("Inventory_Events");
+  if (!log) {
+    log = e.source.insertSheet("Inventory_Events");
+    log.appendRow(["Timestamp", "ClientID", "Description", "ActorUsername"]);
+  }
+  var email = Session.getActiveUser().getEmail() || "";
+  log.appendRow([new Date(), clientId, "Edited " + sku + " (" + e.range.getA1Notation() + ")", email]);
+}
+
 function doGet() {
   var htmlOutput;
   try {

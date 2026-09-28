@@ -63,6 +63,19 @@ button { cursor: pointer; }
 .logout-btn:active { background: #bd2130; }
 @media (min-width: 480px) { .logout-btn { font-size: 11px; padding: 5px 10px; } }
 
+.notification-anchor { position: relative; }
+.notification-button { width: 32px; height: 32px; position: relative; background: transparent; border: 1px solid #7a96ae; border-radius: 4px; color: white; font-size: 16px; }
+.notification-button:focus-visible, .notification-row:focus-visible { outline: 2px solid var(--yellow); outline-offset: 2px; }
+.notification-badge { position: absolute; top: -7px; right: -7px; min-width: 18px; height: 18px; padding: 1px 3px; background: #c83232; color: white; border-radius: 9px; font-size: 10px; font-weight: bold; line-height: 16px; }
+.notification-panel { position: absolute; top: 38px; right: -58px; width: min(340px, calc(100vw - 20px)); max-height: min(420px, 70vh); overflow-y: auto; background: white; color: var(--navy); border: 1px solid var(--border); border-radius: 6px; box-shadow: 0 10px 24px rgba(0,0,0,.2); z-index: 120; }
+.notification-heading { display: flex; align-items: center; justify-content: space-between; padding: 12px; border-bottom: 1px solid var(--border); }
+.notification-heading button { border: none; background: transparent; color: var(--mid); font-size: 12px; font-weight: bold; }
+.notification-list { padding: 8px 12px; font-size: 12px; }
+.notification-row { display: block; width: 100%; padding: 10px 0; border: none; border-bottom: 1px solid var(--border); background: transparent; color: var(--navy); text-align: left; }
+.notification-row:last-child { border-bottom: none; }
+.notification-row strong { display: block; font-size: 11px; margin-bottom: 3px; }
+.notification-row span { display: block; overflow-wrap: anywhere; }
+
 .admin-switcher { display: none; align-items: center; gap: 6px; padding: 5px 10px 5px; background: rgba(245,197,24,.08); border-bottom: 1px solid rgba(245,197,24,.2); }
 .admin-switcher.show { display: flex; flex-wrap: wrap; }
 .admin-switcher label { color: var(--yellow); font-size: 10px; font-weight: bold; white-space: nowrap; }

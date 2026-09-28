@@ -39,6 +39,33 @@ async function verifySecret(value, hash) {
   return bcrypt.compare(String(value ?? ''), String(hash));
 }
 
+function notificationSigningKey() {
+  const privateKey = process.env.GOOGLE_PRIVATE_KEY;
+  if (!privateKey) throw new Error('Missing Google Sheets environment variables.');
+  return crypto.createHash('sha256').update(`portal-notifications:${privateKey}`).digest();
+}
+
+function signNotificationSession(username, clientId, role) {
+  const payload = Buffer.from(JSON.stringify({ username, clientId, role, expires: Date.now() + 12 * 60 * 60 * 1000 })).toString('base64url');
+  const signature = crypto.createHmac('sha256', notificationSigningKey()).update(payload).digest('base64url');
+  return `${payload}.${signature}`;
+}
+
+function readNotificationSession(req) {
+  const token = String(req.get('Authorization') || '').replace(/^Bearer\s+/i, '');
+  const [payload, signature] = token.split('.');
+  if (!payload || !signature) return null;
+  const expected = crypto.createHmac('sha256', notificationSigningKey()).update(payload).digest();
+  const received = Buffer.from(signature, 'base64url');
+  if (received.length !== expected.length || !crypto.timingSafeEqual(received, expected)) return null;
+  try {
+    const session = JSON.parse(Buffer.from(payload, 'base64url').toString());
+    return session.expires > Date.now() && session.username && session.clientId ? session : null;
+  } catch (error) {
+    return null;
+  }
+}
+
 function getServiceAccountAuth() {
   const serviceAccountEmail = process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL;
   const privateKey = (process.env.GOOGLE_PRIVATE_KEY || '').replace(/\\n/g, '\n');
@@ -622,6 +649,7 @@ async function listInventoryForClient(targetClientId) {
 
     return result;
   } catch (error) {
+    if (error?.response?.status === 429) throw error;
     console.warn(`Inventory sheet ${sheetName} did not load:`, error.message);
     return [];
   }
@@ -888,7 +916,131 @@ app.get('/api/chat', async (req, res) => {
     return res.json(history);
   } catch (error) {
     console.error('Chat fetch error:', error);
-    return res.status(500).json({ message: 'Unable to fetch chat history.' });
+    return res.status(error?.response?.status === 429 ? 429 : 500).json({ message: 'Unable to fetch chat history.' });
+  }
+});
+
+const NOTIFICATION_STATE_HEADERS = ['Username', 'ClientID', 'ChatSeenAt', 'InventorySeenAt'];
+const INVENTORY_EVENT_HEADERS = ['Timestamp', 'ClientID', 'Description', 'ActorUsername'];
+
+async function recordInventoryEvent(clientId, description, username) {
+  try {
+    const sheet = await getOrCreateSheet('Inventory_Events', INVENTORY_EVENT_HEADERS);
+    await withRetry(() => sheet.addRow({
+      Timestamp: new Date().toISOString(), ClientID: clientId, Description: description, ActorUsername: username || ''
+    }));
+  } catch (error) {
+    console.warn('Inventory notification was not recorded:', error.message);
+  }
+}
+
+function summarizeUnreadNotifications(chatMessages, inventoryEvents, seenAt, username, isStaff) {
+  const chatSeen = Date.parse(seenAt.chat || '') || 0;
+  const inventorySeen = Date.parse(seenAt.inventory || '') || 0;
+  const chat = chatMessages.filter((message) =>
+    Date.parse(message.timestamp) > chatSeen && Boolean(message.isStaff) !== isStaff);
+  const inventory = inventoryEvents.filter((event) =>
+    Date.parse(event.timestamp) > inventorySeen && event.actorUsername !== username);
+  return {
+    chat: chat.length,
+    inventory: inventory.length,
+    total: chat.length + inventory.length,
+    items: [...chat.map((entry) => ({ ...entry, kind: 'chat' })), ...inventory.map((entry) => ({ ...entry, kind: 'inventory' }))]
+  };
+}
+
+async function loadNotificationRows(sheetName) {
+  const sheet = await findSheetByTitle(sheetName);
+  return sheet ? withRetry(() => sheet.getRows()) : [];
+}
+
+app.get('/api/notifications', async (req, res) => {
+  try {
+    const session = readNotificationSession(req);
+    if (!session) return res.status(401).json({ message: 'Sign in again to view notifications.' });
+    const isStaff = session.role === 'admin' || session.clientId === 'CL-000';
+    const requestedClientId = normalizeClientId(req.query.clientId || session.clientId);
+    const clientId = isStaff ? requestedClientId : session.clientId;
+    const [chatRows, eventRows, seenRows] = await Promise.all([
+      loadNotificationRows('Chat_log'),
+      loadNotificationRows('Inventory_Events'),
+      loadNotificationRows('Notification_State')
+    ]);
+    const seenByClient = {};
+    for (const row of seenRows) {
+      if (row.get('Username') !== session.username) continue;
+      seenByClient[normalizeClientId(row.get('ClientID'))] = {
+        chat: row.get('ChatSeenAt'), inventory: row.get('InventorySeenAt')
+      };
+    }
+    const globalSeen = isStaff ? seenByClient['CL-000'] || {} : {};
+    const chats = chatRows.map((row) => ({
+      timestamp: row.get('Timestamp') || '',
+      clientId: normalizeClientId(row.get('ClientID')),
+      isStaff: String(row.get('IsStaff') || '').trim() === '1',
+      description: String(row.get('Sender') || 'Someone') + ': ' + String(row.get('Message') || 'New message')
+    }));
+    const events = eventRows.map((row) => ({
+      timestamp: row.get('Timestamp') || '',
+      clientId: normalizeClientId(row.get('ClientID')),
+      actorUsername: String(row.get('ActorUsername') || ''),
+      description: String(row.get('Description') || 'Inventory updated')
+    }));
+    const scopedClients = new Set([...chats, ...events].map((entry) => entry.clientId).filter((id) =>
+      id && id !== 'CL-000' && (clientId === 'CL-000' || id === clientId)));
+    let chat = 0;
+    let inventory = 0;
+    const items = [];
+    for (const scopedId of scopedClients) {
+      const localSeen = seenByClient[scopedId] || {};
+      const seenAt = {
+        chat: Date.parse(localSeen.chat || '') > Date.parse(globalSeen.chat || '') ? localSeen.chat : globalSeen.chat || localSeen.chat,
+        inventory: Date.parse(localSeen.inventory || '') > Date.parse(globalSeen.inventory || '') ? localSeen.inventory : globalSeen.inventory || localSeen.inventory
+      };
+      const summary = summarizeUnreadNotifications(
+        chats.filter((entry) => entry.clientId === scopedId),
+        events.filter((entry) => entry.clientId === scopedId),
+        seenAt, session.username, isStaff
+      );
+      chat += summary.chat;
+      inventory += summary.inventory;
+      items.push(...summary.items);
+    }
+    items.sort((a, b) => Date.parse(b.timestamp) - Date.parse(a.timestamp));
+    return res.json({ chat, inventory, total: chat + inventory, items: items.slice(0, 10) });
+  } catch (error) {
+    console.error('Notification fetch error:', error.message);
+    return res.status(error?.response?.status === 429 ? 429 : 500).json({ message: 'Unable to load notifications.' });
+  }
+});
+
+app.post('/api/notifications/read', async (req, res) => {
+  try {
+    const session = readNotificationSession(req);
+    if (!session) return res.status(401).json({ message: 'Sign in again to clear notifications.' });
+    const isStaff = session.role === 'admin' || session.clientId === 'CL-000';
+    const clientId = isStaff ? normalizeClientId(req.body?.clientId || session.clientId) : session.clientId;
+    const kind = req.body?.kind;
+    if (!clientId || !['chat', 'inventory', 'all'].includes(kind)) {
+      return res.status(400).json({ message: 'Client and notification type are required.' });
+    }
+    const sheet = await getOrCreateSheet('Notification_State', NOTIFICATION_STATE_HEADERS);
+    const rows = await withRetry(() => sheet.getRows());
+    const row = rows.find((entry) => entry.get('Username') === session.username && normalizeClientId(entry.get('ClientID')) === clientId);
+    const now = new Date().toISOString();
+    const changes = {};
+    if (kind === 'chat' || kind === 'all') changes.ChatSeenAt = now;
+    if (kind === 'inventory' || kind === 'all') changes.InventorySeenAt = now;
+    if (row) {
+      for (const [header, value] of Object.entries(changes)) row.set(header, value);
+      await withRetry(() => row.save());
+    } else {
+      await withRetry(() => sheet.addRow({ Username: session.username, ClientID: clientId, ...changes }));
+    }
+    return res.json({ success: true });
+  } catch (error) {
+    console.error('Notification read error:', error.message);
+    return res.status(error?.response?.status === 429 ? 429 : 500).json({ message: 'Unable to mark notifications read.' });
   }
 });
 
@@ -993,10 +1145,53 @@ app.post('/api/inventory/create', async (req, res) => {
     }
 
     await withRetry(() => sheet.addRow(row));
+    await recordInventoryEvent(targetClientId, `Added ${itemTitle || itemSku}`, readNotificationSession(req)?.username);
     return res.json({ success: true, sheet: sheetName, item: row });
   } catch (error) {
     console.error('Inventory create error:', error);
     return res.status(500).json({ success: false, error: 'Unable to create inventory item.' });
+  }
+});
+
+app.put('/api/inventory/quantity', async (req, res) => {
+  try {
+    const session = readNotificationSession(req);
+    if (!session) return res.status(401).json({ success: false, error: 'Sign in again to update inventory.' });
+    const clientId = normalizeClientId(req.body?.clientId);
+    const isStaff = session.role === 'admin' || session.clientId === 'CL-000';
+    const sku = String(req.body?.sku || '').trim();
+    const quantity = Number(req.body?.qty);
+    if (!clientId || !sku || !Number.isSafeInteger(quantity) || quantity < 0 || (!isStaff && session.clientId !== clientId)) {
+      return res.status(400).json({ success: false, error: 'Invalid inventory update.' });
+    }
+    if (clientId === 'CL-002') return res.status(400).json({ success: false, error: 'Use the shipment workflow for this client.' });
+
+    const sheet = await findSheetByTitle(clientId);
+    if (!sheet) return res.status(404).json({ success: false, error: 'Inventory sheet not found.' });
+    const profile = clientId === 'CL-001' || clientId === 'CL-003' ? null : await getClientProfile(clientId);
+    const skuColumn = clientId === 'CL-001' ? 1 : 0;
+    const quantityColumn = clientId === 'CL-001' ? 3 : clientId === 'CL-003' ? 2 : 2 + profile.fields.length;
+    const statusColumn = clientId === 'CL-003' ? -1 : quantityColumn + 1;
+    const startRow = clientId === 'CL-001' ? 8 : 1;
+    const endRow = sheet.rowCount;
+    const lastColumn = Math.max(skuColumn, quantityColumn, statusColumn) + 1;
+    await withRetry(() => sheet.loadCells(`A1:${String.fromCharCode(64 + lastColumn)}${endRow}`));
+    let rowIndex = -1;
+    for (let index = startRow; index < endRow; index += 1) {
+      if (String(sheet.getCell(index, skuColumn).value || '').trim() === sku) {
+        rowIndex = index;
+        break;
+      }
+    }
+    if (rowIndex < 0) return res.status(404).json({ success: false, error: 'Item not found.' });
+    sheet.getCell(rowIndex, quantityColumn).value = quantity;
+    if (statusColumn >= 0) sheet.getCell(rowIndex, statusColumn).value = quantity === 0 ? 'Out of Stock' : quantity <= 5 ? 'Low Stock' : 'In Stock';
+    await withRetry(() => sheet.saveUpdatedCells());
+    await recordInventoryEvent(clientId, `Updated ${sku} to ${quantity}`, session.username);
+    return res.json({ success: true, qty: quantity });
+  } catch (error) {
+    console.error('Inventory quantity update error:', error.message);
+    return res.status(error?.response?.status === 429 ? 429 : 500).json({ success: false, error: 'Unable to update inventory.' });
   }
 });
 
@@ -1049,7 +1244,8 @@ app.post('/api/login', async (req, res) => {
       message: 'Login successful',
       clientId,
       clientName,
-      role
+      role,
+      notificationToken: signNotificationSession(String(user.get('Username') || '').trim(), clientId, role)
     });
   } catch (error) {
     console.error('Google Sheets login error:', error);
@@ -1156,7 +1352,7 @@ app.get('/api/inventory', async (req, res) => {
     const message = error.message && error.message.includes('Missing Google Sheets environment variables')
       ? 'Google Sheets configuration is missing or invalid. Update the .env values for GOOGLE_SERVICE_ACCOUNT_EMAIL, GOOGLE_PRIVATE_KEY, and GOOGLE_SHEET_ID.'
       : 'Unable to fetch inventory items.';
-    res.status(500).json({ message });
+    res.status(error?.response?.status === 429 ? 429 : 500).json({ message });
   }
 });
 
@@ -1177,5 +1373,8 @@ module.exports = {
   getSheetNameForClient,
   isAdminClient,
   getClientRoster,
-  listInventoryForClient
+  listInventoryForClient,
+  summarizeUnreadNotifications,
+  signNotificationSession,
+  readNotificationSession
 };
