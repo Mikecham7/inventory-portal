@@ -50,6 +50,7 @@ button { cursor: pointer; }
 .header-logo { height: 30px; width: auto; border-radius: 4px; flex-shrink: 0; }
 .header h1 { color: var(--yellow); font-size: 12px; letter-spacing: .3px; line-height: 1.2; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .header p { color: #7a96ae; font-size: 10px; margin-top: 2px; display: none; }
+@media (max-width: 599px) { .header-brand > div { display: none; } }
 @media (min-width: 480px) {
   .header { padding: 10px 14px; }
   .header h1 { font-size: 17px; }
@@ -671,6 +672,8 @@ tbody tr:hover {
 .table-shell tbody tr:hover td:first-child { background: var(--light); }
 
 @media (max-width: 699px) {
+  .table-shell { padding-top: 44px; }
+  .table-shell .table-scroll-btn { top: 2px; transform: none; }
   .table-shell .table-wrap {
     max-height: calc(100vh - 230px);
     max-height: calc(100dvh - 230px);
@@ -678,6 +681,12 @@ tbody tr:hover {
   }
   .table-shell table { font-size: 11px; }
   .table-shell thead th:first-child,
-  .table-shell tbody td:first-child { min-width: 130px; max-width: 160px; }
+  .table-shell tbody td:first-child {
+    width: 120px;
+    min-width: 120px;
+    max-width: 120px;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
   .table-scroll-btn { width: 40px; height: 40px; }
 }
