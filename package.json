@@ -9,6 +9,7 @@
     "dev": "node api/server.js",
     "test": "node --test tests/portal.test.js",
     "migrate:clients": "node scripts/migrate-client-settings.js",
+    "archive:chat": "node scripts/archive-chat.js",
     "build": "echo \"No build step required for this static frontend.\""
   },
   "keywords": [

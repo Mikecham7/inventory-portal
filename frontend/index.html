@@ -17,7 +17,10 @@
           <label>Username</label>
           <input type="text" id="portalUser" placeholder="Enter username..." autocomplete="username" />
           <label>Password</label>
-          <input type="password" id="portalPass" placeholder="Enter password..." autocomplete="current-password" />
+          <div class="password-field">
+            <input type="password" id="portalPass" placeholder="Enter password..." autocomplete="current-password" />
+            <button type="button" class="password-toggle" data-action="toggle-password" data-target="portalPass" aria-label="Show password" aria-pressed="false" title="Show password"><svg class="eye-open" viewBox="0 0 24 24" aria-hidden="true"><path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7S1 12 1 12z"/><circle cx="12" cy="12" r="3"/></svg><svg class="eye-closed" viewBox="0 0 24 24" aria-hidden="true"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 19c-7 0-11-7-11-7a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 7 11 7a18.5 18.5 0 0 1-2.16 3.19"/><path d="M1 1l22 22"/></svg></button>
+          </div>
         </div>
         <button class="portal-login-btn" onclick="executePortalAuth()">Sign In</button>
         <div class="portal-auth-links">
@@ -41,9 +44,15 @@
             <label>Activation Code</label>
             <input type="text" id="activateCode" placeholder="XXXX-XXXX" autocomplete="off" />
             <label>New Password</label>
-            <input type="password" id="activatePassword" placeholder="At least 8 characters..." autocomplete="new-password" />
+            <div class="password-field">
+              <input type="password" id="activatePassword" placeholder="At least 8 characters..." autocomplete="new-password" />
+              <button type="button" class="password-toggle" data-action="toggle-password" data-target="activatePassword" aria-label="Show password" aria-pressed="false" title="Show password"><svg class="eye-open" viewBox="0 0 24 24" aria-hidden="true"><path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7S1 12 1 12z"/><circle cx="12" cy="12" r="3"/></svg><svg class="eye-closed" viewBox="0 0 24 24" aria-hidden="true"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 19c-7 0-11-7-11-7a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 7 11 7a18.5 18.5 0 0 1-2.16 3.19"/><path d="M1 1l22 22"/></svg></button>
+            </div>
             <label>Confirm Password</label>
-            <input type="password" id="activatePasswordConfirm" placeholder="Re-enter password..." autocomplete="new-password" />
+            <div class="password-field">
+              <input type="password" id="activatePasswordConfirm" placeholder="Re-enter password..." autocomplete="new-password" />
+              <button type="button" class="password-toggle" data-action="toggle-password" data-target="activatePasswordConfirm" aria-label="Show password" aria-pressed="false" title="Show password"><svg class="eye-open" viewBox="0 0 24 24" aria-hidden="true"><path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7S1 12 1 12z"/><circle cx="12" cy="12" r="3"/></svg><svg class="eye-closed" viewBox="0 0 24 24" aria-hidden="true"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 19c-7 0-11-7-11-7a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 7 11 7a18.5 18.5 0 0 1-2.16 3.19"/><path d="M1 1l22 22"/></svg></button>
+            </div>
           </div>
           <button class="portal-login-btn" onclick="submitActivateAccount()">Create Account</button>
         </div>
@@ -73,9 +82,15 @@
             <label>Recovery Code</label>
             <input type="text" id="recoverCode" placeholder="XXXX-XXXX" autocomplete="off" />
             <label>New Password</label>
-            <input type="password" id="recoverPassword" placeholder="At least 8 characters..." autocomplete="new-password" />
+            <div class="password-field">
+              <input type="password" id="recoverPassword" placeholder="At least 8 characters..." autocomplete="new-password" />
+              <button type="button" class="password-toggle" data-action="toggle-password" data-target="recoverPassword" aria-label="Show password" aria-pressed="false" title="Show password"><svg class="eye-open" viewBox="0 0 24 24" aria-hidden="true"><path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7S1 12 1 12z"/><circle cx="12" cy="12" r="3"/></svg><svg class="eye-closed" viewBox="0 0 24 24" aria-hidden="true"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 19c-7 0-11-7-11-7a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 7 11 7a18.5 18.5 0 0 1-2.16 3.19"/><path d="M1 1l22 22"/></svg></button>
+            </div>
             <label>Confirm Password</label>
-            <input type="password" id="recoverPasswordConfirm" placeholder="Re-enter password..." autocomplete="new-password" />
+            <div class="password-field">
+              <input type="password" id="recoverPasswordConfirm" placeholder="Re-enter password..." autocomplete="new-password" />
+              <button type="button" class="password-toggle" data-action="toggle-password" data-target="recoverPasswordConfirm" aria-label="Show password" aria-pressed="false" title="Show password"><svg class="eye-open" viewBox="0 0 24 24" aria-hidden="true"><path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7S1 12 1 12z"/><circle cx="12" cy="12" r="3"/></svg><svg class="eye-closed" viewBox="0 0 24 24" aria-hidden="true"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 19c-7 0-11-7-11-7a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 7 11 7a18.5 18.5 0 0 1-2.16 3.19"/><path d="M1 1l22 22"/></svg></button>
+            </div>
           </div>
           <button class="portal-login-btn" onclick="submitRecoverAccount()">Reset Password</button>
         </div>
@@ -102,14 +117,15 @@
           </div>
         </div>
         <div class="header-right">
-          <span class="client-tag" id="activeClientHeader">CLIENT: —</span>
           <div class="notification-anchor" id="notificationAnchor" style="display:none;">
-            <button class="notification-button" id="notificationButton" type="button" aria-label="Notifications" aria-expanded="false" title="Notifications" onclick="toggleNotifications()">🔔<span class="notification-badge" id="notificationBadge" style="display:none;">0</span></button>
+            <button class="notification-button" id="notificationButton" type="button" aria-label="Notifications" aria-expanded="false" aria-controls="notificationPanel" title="Notifications" onclick="toggleNotifications()">🔔<span class="notification-badge" id="notificationBadge" style="display:none;">0</span></button>
             <div class="notification-panel" id="notificationPanel" style="display:none;" role="region" aria-label="Unread notifications">
               <div class="notification-heading"><strong>Notifications</strong><button type="button" id="notificationClear" onclick="markNotificationsRead('all')">Mark all read</button></div>
               <div class="notification-list" id="notificationList">No unread notifications.</div>
             </div>
           </div>
+          <span class="client-tag" id="activeClientHeader">CLIENT: —</span>
+          <span class="header-divider" aria-hidden="true"></span>
           <button class="logout-btn" onclick="executePortalLogout()">Sign Out</button>
         </div>
       </div>
@@ -196,6 +212,12 @@
             <div class="ss" id="selSku"></div>
             <div class="st" id="selTitle"></div>
           </div>
+          <div id="detailsEditor" hidden>
+            <h2>✏️ Product Details</h2>
+            <div id="detailFields" class="ac-settings-grid detail-grid"></div>
+            <button type="button" class="btn-set" style="margin-top:10px;" onclick="saveItemDetails()">Save details</button>
+            <hr class="divider" />
+          </div>
           <div id="shipmentEditor" hidden>
             <div class="qty-display">
               <div><div class="ql">CURRENT STATUS</div></div>
@@ -250,7 +272,7 @@
         <div id="createProductReadOnlyNotice" style="display:none; color:#b45309; background:#fff7ed; border:1px solid #fed7aa; padding:8px 10px; border-radius:8px; margin-bottom:12px; font-size:12px; font-weight:700;"></div>
         <div class="set-row" style="display:grid;grid-template-columns:1fr 1fr 110px auto;gap:8px;align-items:end;">
           <div id="newProductSkuWrap">
-            <label class="ac-label" for="newProductSku">SKU</label>
+            <label class="ac-label" for="newProductSku">SKU (optional)</label>
             <input type="text" id="newProductSku" class="ac-input" placeholder="A-25-Cu-01" />
           </div>
           <div id="newProductTitleWrap">
@@ -485,7 +507,12 @@
         </select>
 
         <div id="editClientForm" style="display:none;">
-          <div id="ecLegacyNote" class="ac-note" style="display:none;">This is a built-in client. Its sheet columns and layout stay as they are; you can change field visibility, Quick Edit, filter mapping, and overstock level.</div>
+          <div id="ecLegacyNote" class="ac-note" style="display:none;">This is a built-in client. Its sheet columns and layout stay as they are; you can change the email, field visibility, Quick Edit, filter mapping, and overstock level.</div>
+          <div style="margin-bottom:10px;">
+            <label class="ac-label" for="ecEmail">Email</label>
+            <input type="email" id="ecEmail" class="ac-input" maxlength="254" placeholder="client@email.com" autocomplete="off" />
+            <p class="billing-hint" style="margin:4px 0 0;">Needed for the client's Drive folder button to work.</p>
+          </div>
           <div id="ecGenericSettings">
           <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
             <div>

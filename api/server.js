@@ -168,10 +168,19 @@ function normalizeClientId(value) {
 }
 
 // Concurrent callers for the same key share one in-flight Sheets read; failures are never cached.
+// Every portal user shares one Google service account (about 60 reads/minute in total), so reads are
+// cached long enough for all users to share them; writes invalidate the affected keys immediately.
 const readCache = new Map();
-const INVENTORY_CACHE_MS = 8000;
-const PROFILE_CACHE_MS = 60000;
-const ROWS_CACHE_MS = 4000;
+const lastGoodReads = new Map();
+const INVENTORY_CACHE_MS = 30000;
+const PROFILE_CACHE_MS = 5 * 60 * 1000;
+const ROWS_CACHE_MS = 20000;
+const CHAT_CACHE_MS = 8000;
+const STALE_READ_MAX_MS = 15 * 60 * 1000;
+
+function isRateLimitError(error) {
+  return (error?.response?.status || error?.code) === 429;
+}
 
 function cachedRead(key, ttlMs, loader) {
   const hit = readCache.get(key);
@@ -180,9 +189,13 @@ function cachedRead(key, ttlMs, loader) {
   entry.promise = loader().then((value) => {
     entry.pending = false;
     entry.at = Date.now();
+    lastGoodReads.set(key, { value, at: entry.at });
     return value;
   }, (error) => {
     if (readCache.get(key) === entry) readCache.delete(key);
+    // When Google is rate limiting, slightly old data is far better than an error screen.
+    const stale = lastGoodReads.get(key);
+    if (isRateLimitError(error) && stale && Date.now() - stale.at < STALE_READ_MAX_MS) return stale.value;
     throw error;
   });
   readCache.set(key, entry);
@@ -250,6 +263,9 @@ async function findSheetByTitle(sheetName) {
   return doc.sheetsByTitle[targetName] || doc.sheetsByIndex.find((sheet) => sheet.title === targetName) || null;
 }
 
+// Sheet objects whose header row has already been checked, so writes don't spend a read re-checking it.
+const verifiedHeaderSheets = new WeakSet();
+
 async function getOrCreateSheet(sheetName, headers = []) {
   const doc = await getDoc();
   let sheet = doc.sheetsByTitle[sheetName] || doc.sheetsByIndex.find((entry) => entry.title === sheetName);
@@ -258,7 +274,7 @@ async function getOrCreateSheet(sheetName, headers = []) {
     sheet = await doc.addSheet({ title: sheetName, headerValues: headers.length ? headers : undefined });
   }
 
-  if (headers.length) {
+  if (headers.length && !verifiedHeaderSheets.has(sheet)) {
     // Only checking cell A1 (as before) let stale sheets with an incomplete header row
     // (e.g. just "Timestamp, Sender, Message") silently keep missing columns like
     // ClientID/IsStaff, so getRows()/row.get() couldn't read data written into them.
@@ -279,6 +295,7 @@ async function getOrCreateSheet(sheetName, headers = []) {
       }
       await withRetry(() => sheet.setHeaderRow([...headers, ...currentHeaders.slice(headers.length)]));
     }
+    verifiedHeaderSheets.add(sheet);
   }
 
   return sheet;
@@ -440,7 +457,8 @@ function applyClientSettings(profile, row) {
 }
 
 function withEditColumn(columns, profile) {
-  const base = columns.filter((label) => label !== 'EDIT');
+  // Header must match the cells renderTable draws, or later columns shift under the wrong heading.
+  const base = columns.filter((label) => label !== 'EDIT' && !(profile.hideQtyColumn && label === 'QTY'));
   return profile.readOnly || profile.hideQuickEdit ? base : [...base, 'EDIT'];
 }
 
@@ -789,6 +807,7 @@ async function loadInventoryForClient(targetClientId) {
             id: `${sheetName}-${index}`,
             clientId: String(targetClientId || sheetName || '').trim(),
             sku: String(row[0] || '').trim() || titleValue,
+            rawSku: String(row[0] || '').trim(),
             title: titleValue,
             itemName: titleValue,
             qty: qtyValue,
@@ -1032,6 +1051,10 @@ app.put('/api/admin/clients/:clientId', async (req, res) => {
     }
 
     const body = req.body || {};
+    const email = body.email === undefined ? null : String(body.email || '').trim();
+    if (email && (email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))) {
+      return res.status(400).json({ success: false, error: 'Enter a valid email address.' });
+    }
     const quickEditPin = String(body.quickEditPin || '').trim();
     if (quickEditPin && !isValidQuickEditPin(quickEditPin)) {
       return res.status(400).json({ success: false, error: 'Quick Edit PIN must be 4-32 characters with no spaces.' });
@@ -1089,6 +1112,7 @@ app.put('/api/admin/clients/:clientId', async (req, res) => {
     }
 
     row.set('Client_Settings_JSON', JSON.stringify(settings));
+    if (email !== null) row.set('Email', email);
     if (quickEditPin) row.set('Quick_Edit_PIN_Hash', await hashSecret(quickEditPin));
 
     await withRetry(() => row.save());
@@ -1130,19 +1154,15 @@ app.get('/api/chat', async (req, res) => {
   if (!session) return res.status(401).json({ message: 'Sign in again to view chat.' });
   try {
     const clientId = isStaffSession(session) ? normalizeClientId(req.query.clientId || session.clientId) : normalizeClientId(session.clientId);
-    const allMessages = await cachedRead('rows:Chat_log:history', ROWS_CACHE_MS, async () => {
-      const sheet = await getOrCreateSheet('Chat_log', ['Timestamp', 'Sender', 'Message', 'ClientID', 'IsStaff', 'FileUrl', 'FileName']);
-      const rows = await withRetry(() => sheet.getRows());
-      return rows.map((row) => ({
-        timestamp: row.get('Timestamp') || row.get('timestamp') || '',
-        sender: row.get('Sender') || row.get('sender') || 'Unknown',
-        message: row.get('Message') || row.get('message') || '',
-        clientId: normalizeClientId(row.get('ClientID') || row.get('clientId') || row.get('Client_ID') || ''),
-        isStaff: String(row.get('IsStaff') || row.get('isStaff') || '0').trim() === '1',
-        fileUrl: isGoogleDriveUrl(row.get('FileUrl') || row.get('fileUrl')) ? String(row.get('FileUrl') || row.get('fileUrl')).trim() : '',
-        fileName: row.get('FileName') || row.get('fileName') || ''
-      }));
-    });
+    const allMessages = (await loadNotificationRows('Chat_log')).map((row) => ({
+      timestamp: row.get('Timestamp') || row.get('timestamp') || '',
+      sender: row.get('Sender') || row.get('sender') || 'Unknown',
+      message: row.get('Message') || row.get('message') || '',
+      clientId: normalizeClientId(row.get('ClientID') || row.get('clientId') || row.get('Client_ID') || ''),
+      isStaff: String(row.get('IsStaff') || row.get('isStaff') || '0').trim() === '1',
+      fileUrl: isGoogleDriveUrl(row.get('FileUrl') || row.get('fileUrl')) ? String(row.get('FileUrl') || row.get('fileUrl')).trim() : '',
+      fileName: row.get('FileName') || row.get('fileName') || ''
+    }));
     const history = allMessages
       .filter((message) => message.clientId === clientId || (clientId === 'CL-000' && message.clientId))
       .map((message) => ({ ...message, clientId: message.clientId || clientId }));
@@ -1185,9 +1205,11 @@ function summarizeUnreadNotifications(chatMessages, inventoryEvents, seenAt, use
 }
 
 function loadNotificationRows(sheetName) {
-  return cachedRead(`rows:${sheetName}`, ROWS_CACHE_MS, async () => {
+  const key = `rows:${sheetName}`;
+  return cachedRead(key, sheetName === 'Chat_log' ? CHAT_CACHE_MS : ROWS_CACHE_MS, async () => {
     const sheet = await findSheetByTitle(sheetName);
-    return sheet ? withRetry(() => sheet.getRows()) : [];
+    // With a recent copy to fall back on, give up quickly instead of making the user wait out retries.
+    return sheet ? withRetry(() => sheet.getRows(), lastGoodReads.has(key) ? 1 : 4) : [];
   });
 }
 
@@ -1326,20 +1348,23 @@ app.post('/api/chat', async (req, res) => {
 
 app.post('/api/inventory/create', async (req, res) => {
   try {
-    const { clientId, sku, title, qty, notes, extraFields = {}, isAdmin } = req.body || {};
+    const { clientId, sku, title, qty, notes, extraFields = {} } = req.body || {};
     const kind = req.body?.kind === 'order' ? 'order' : 'inventory';
     const status = kind === 'order' ? 'Not Shipped' : req.body?.status;
     const targetClientId = String(clientId || 'CL-001').trim() || 'CL-001';
     const itemSku = String(sku || '').trim();
     const itemTitle = String(title || '').trim();
     const values = extraFields && typeof extraFields === 'object' ? { ...extraFields } : {};
-    const adminAccess = Boolean(isAdmin) || String(req.body?.role || '').toLowerCase() === 'admin';
+    // Staff status comes from the signed session, never from what the browser claims.
+    const adminAccess = isStaffSession(readNotificationSession(req));
 
     // Fields the admin switched off for this form are dropped server-side too, not just hidden.
     if (!isStaffSession(readNotificationSession(req))) {
-      const { fieldVisibility = {} } = await getClientProfile(targetClientId);
+      const { fieldVisibility = {}, fields: profileFields = [] } = await getClientProfile(targetClientId);
+      const shipmentKeys = findShipmentFieldKeys(profileFields);
       Object.keys(values).forEach((key) => {
         if (fieldVisibility[key] && fieldVisibility[key][kind] === false) delete values[key];
+        if (shipmentKeys && (key === shipmentKeys.received || key === shipmentKeys.shipped)) delete values[key];
       });
     }
 
@@ -1378,7 +1403,7 @@ app.post('/api/inventory/create', async (req, res) => {
       const profile = await getClientProfile(targetClientId);
       const shipmentKeys = findShipmentFieldKeys(profile.fields);
       row = [
-        itemSku || itemTitle || 'N/A',
+        itemSku,
         itemTitle || itemSku || 'Untitled',
         ...profile.fields.map((field) => String(values[field.key] ?? '')),
         Number(qty) || 0,
@@ -1536,6 +1561,111 @@ app.put('/api/inventory/shipment', async (req, res) => {
   }
 });
 
+// Sheet columns a product's details can be edited in, matching how loadInventoryForClient reads each layout.
+// Received/shipped quantities are deliberately absent: only staff change them, through /api/inventory/shipment.
+async function getItemEditColumns(clientId, rows) {
+  const headers = (rows[0] || []).map((cell) => String(cell || '').trim().toLowerCase());
+  const find = (test, fallback) => {
+    const index = headers.findIndex((name) => (typeof test === 'function' ? test(name) : name.includes(test)));
+    return index >= 0 ? index : fallback;
+  };
+  if (clientId === 'CL-002') {
+    return {
+      locate: 'index',
+      titleKey: 'productDescription',
+      numeric: new Set(['quantityOrdered', 'bundleQty']),
+      columns: {
+        upc: find('upc', 0), productDescription: find('product description', 1), quantityOrdered: find('quantity ordered', 2),
+        expDate: find('exp date', 5), merchant: find('merchant', 6), asin: find('asin', 7),
+        fulfillment: find((name) => name.includes('fbm') || name.includes('fba'), 8), transparencyCode: find('transparency', 9),
+        bundled: find('bundled', 10), bundleQty: find('bundle quantity', 11), notes: find('notes', 12)
+      }
+    };
+  }
+  if (clientId === 'CL-003') {
+    const exact = (...names) => (name) => names.includes(name);
+    return {
+      locate: 'index',
+      titleKey: 'productName',
+      numeric: new Set(['quantityOrdered']),
+      columns: {
+        productName: find(exact('product description/name'), 0), quantityOrdered: find(exact('quantity ordered'), 1),
+        merchant: find(exact('merchant'), 4), carrier: find(exact('carrier'), 5),
+        trackingNumber: find(exact('tracking #', 'tracking number'), 6), notes: find(exact('notes'), 7)
+      }
+    };
+  }
+  if (clientId === 'CL-001') {
+    return { locate: 'sku', titleKey: 'title', numeric: new Set(), columns: { sku: 1, title: 2 } };
+  }
+  const { fields } = await getClientProfile(clientId);
+  const shipmentKeys = findShipmentFieldKeys(fields);
+  const columns = { sku: 0, title: 1 };
+  fields.forEach((field, index) => {
+    if (shipmentKeys && (field.key === shipmentKeys.received || field.key === shipmentKeys.shipped)) return;
+    columns[field.key] = 2 + index;
+  });
+  return { locate: 'index', titleKey: 'title', numeric: new Set(fields.filter((field) => field.type === 'number').map((field) => field.key)), columns };
+}
+
+app.put('/api/inventory/item', async (req, res) => {
+  const session = readNotificationSession(req);
+  if (!session) return res.status(401).json({ success: false, error: 'Sign in again to edit products.' });
+  try {
+    const staff = isStaffSession(session);
+    const clientId = normalizeClientId(req.body?.clientId);
+    if (!clientId || clientId === 'CL-000' || (!staff && normalizeClientId(session.clientId) !== clientId)) {
+      return res.status(400).json({ success: false, error: 'Invalid product update.' });
+    }
+    const profile = await getClientProfile(clientId);
+    if (!staff && profile.readOnly) return res.status(403).json({ success: false, error: 'This account is view-only.' });
+
+    const values = req.body?.values && typeof req.body.values === 'object' ? req.body.values : {};
+    const shipmentKeys = findShipmentFieldKeys(profile.fields || []);
+    if (shipmentKeys && (shipmentKeys.received in values || shipmentKeys.shipped in values)) {
+      return res.status(403).json({ success: false, error: 'Only ECL staff can change received and shipped quantities.' });
+    }
+
+    const sheet = await findSheetByTitle(clientId);
+    if (!sheet) return res.status(404).json({ success: false, error: 'Inventory sheet not found.' });
+    const rows = await loadSheetRows(clientId, LEGACY_CLIENT_IDS.includes(clientId) ? null : 500);
+    const layout = await getItemEditColumns(clientId, rows);
+
+    const updates = [];
+    for (const [key, raw] of Object.entries(values)) {
+      if (!(key in layout.columns)) return res.status(400).json({ success: false, error: `"${key}" can't be edited here.` });
+      const text = String(raw ?? '').trim().slice(0, 500);
+      if (key === layout.titleKey && !text) return res.status(400).json({ success: false, error: 'The product name cannot be blank.' });
+      if (layout.numeric.has(key) && text && !Number.isFinite(Number(text))) return res.status(400).json({ success: false, error: 'Quantities must be numbers.' });
+      updates.push([layout.columns[key], layout.numeric.has(key) && text ? Number(text) : text]);
+    }
+    if (!updates.length) return res.status(400).json({ success: false, error: 'Nothing to update.' });
+
+    let rowIndex = -1;
+    if (layout.locate === 'sku') {
+      const sku = String(req.body?.sku || '').trim();
+      rowIndex = sku ? rows.findIndex((row, index) => index > 0 && String(row[layout.columns.sku] || '').trim() === sku) : -1;
+    } else {
+      const match = String(req.body?.itemId || '').match(/-(\d+)$/);
+      rowIndex = match ? Number(match[1]) : -1;
+      // Row numbers shift if rows are inserted in the sheet, so confirm it is still the same product.
+      const rowTitle = String(rows[rowIndex]?.[layout.columns[layout.titleKey]] || '').trim();
+      if (rowIndex < 1 || !rowTitle || rowTitle !== String(req.body?.title || '').trim()) rowIndex = -1;
+    }
+    if (rowIndex < 1) return res.status(409).json({ success: false, error: 'This item moved in the sheet. Refresh and try again.' });
+
+    updates.forEach(([column, value]) => { sheet.getCell(rowIndex, column).value = value; });
+    await withRetry(() => sheet.saveUpdatedCells());
+    invalidateReadCache('inventory:');
+    const title = String(values[layout.titleKey] ?? req.body?.title ?? '').trim();
+    await recordInventoryEvent(clientId, `Edited details: ${title}`, session.username);
+    return res.json({ success: true });
+  } catch (error) {
+    console.error('Product update error:', error.message);
+    return res.status(error?.response?.status === 429 ? 429 : 500).json({ success: false, error: 'Unable to update product.' });
+  }
+});
+
 app.put('/api/inventory/quantity', async (req, res) => {
   try {
     const session = readNotificationSession(req);
@@ -1565,7 +1695,10 @@ app.put('/api/inventory/quantity', async (req, res) => {
     await withRetry(() => sheet.loadCells(`A1:${String.fromCharCode(64 + lastColumn)}${endRow}`));
     let rowIndex = -1;
     for (let index = startRow; index < endRow; index += 1) {
-      if (String(sheet.getCell(index, skuColumn).value || '').trim() === sku) {
+      const cellSku = String(sheet.getCell(index, skuColumn).value || '').trim();
+      // Items saved without a SKU are listed under their title, so match on the title column instead.
+      const titleMatch = !cellSku && skuColumn === 0 && clientId !== 'CL-003' && String(sheet.getCell(index, 1).value || '').trim() === sku;
+      if (cellSku === sku || titleMatch) {
         rowIndex = index;
         break;
       }
@@ -2064,6 +2197,42 @@ async function migrateClientSettings({ apply = false } = {}) {
   return report;
 }
 
+const CHAT_HEADERS = ['Timestamp', 'Sender', 'Message', 'ClientID', 'IsStaff', 'FileUrl', 'FileName'];
+const CHAT_ARCHIVE_SHEET = 'Chat_Archive';
+
+// Moves chat messages older than the cutoff from Chat_log into Chat_Archive so chat loads stay small.
+// Only the run of old messages at the top of Chat_log is moved, so newer rows are never touched.
+async function archiveOldChatMessages({ olderThanDays = 30, apply = false, now = new Date() } = {}) {
+  const sheet = await findSheetByTitle('Chat_log');
+  if (!sheet) return { archived: 0, kept: 0 };
+  const rows = await withRetry(() => sheet.getRows());
+  const cutoff = now.getTime() - olderThanDays * 24 * 60 * 60 * 1000;
+  let count = 0;
+  for (const row of rows) {
+    const time = Date.parse(row.get('Timestamp'));
+    if (!Number.isFinite(time) || time >= cutoff) break;
+    count += 1;
+  }
+  const report = { archived: count, kept: rows.length - count, cutoff: new Date(cutoff).toISOString() };
+  if (!apply || !count) return report;
+  if (rows[count - 1].rowNumber !== rows[0].rowNumber + count - 1) {
+    throw new Error('Chat_log rows are not contiguous; nothing was archived.');
+  }
+
+  // Copy first and delete second, so a failure part-way can never lose messages.
+  const archive = await getOrCreateSheet(CHAT_ARCHIVE_SHEET, CHAT_HEADERS);
+  const copies = rows.slice(0, count).map((row) => CHAT_HEADERS.map((header) => row.get(header) ?? ''));
+  for (let index = 0; index < copies.length; index += 500) {
+    await withRetry(() => archive.addRows(copies.slice(index, index + 500)));
+  }
+  const startIndex = rows[0].rowNumber - 1;
+  await withRetry(() => sheet._makeSingleUpdateRequest('deleteDimension', {
+    range: { sheetId: sheet.sheetId, dimension: 'ROWS', startIndex, endIndex: startIndex + count }
+  }));
+  invalidateReadCache('rows:Chat_log');
+  return report;
+}
+
 app.get('*', (req, res) => {
   res.sendFile(path.join(__dirname, '../frontend/index.html'));
 });
@@ -2088,5 +2257,6 @@ module.exports = {
   cachedRead,
   invalidateReadCache,
   attachActivityDates,
-  migrateClientSettings
+  migrateClientSettings,
+  archiveOldChatMessages
 };

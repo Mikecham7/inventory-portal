@@ -21,6 +21,14 @@ test('server read cache shares in-flight reads, invalidates by prefix, and never
   await assert.rejects(cachedRead('t:fail', 1000, () => Promise.reject(new Error('429'))));
   assert.equal(await cachedRead('t:fail', 1000, () => Promise.resolve('ok')), 'ok');
   invalidateReadCache('t:');
+
+  // When Google rate-limits, the last good copy is served instead of an error; other failures still surface.
+  const rateLimited = Object.assign(new Error('quota'), { response: { status: 429 } });
+  assert.equal(await cachedRead('t:stale', 0, () => Promise.resolve('fresh')), 'fresh');
+  assert.equal(await cachedRead('t:stale', 0, () => Promise.reject(rateLimited)), 'fresh');
+  await assert.rejects(cachedRead('t:stale', 0, () => Promise.reject(new Error('boom'))));
+  await assert.rejects(cachedRead('t:never-loaded', 0, () => Promise.reject(rateLimited)));
+  invalidateReadCache('t:');
 });
 
 test('account endpoints use bcrypt, hashed single-use recovery codes, admin-only resets, a private client list, and login rate limits', async () => {
@@ -324,30 +332,30 @@ test('background sync refreshes changed data, backs off on 429, and ignores old 
     json: async () => data
   });
 
-  const firstChat = fire(10000);
+  const firstChat = fire(12000);
   assert.match(pending[0].url, /api\/chat\?clientId=CL-001/);
   respond(pending.shift(), 200, [{ sender: 'Staff', isStaff: true, message: 'New chat' }]);
   await firstChat;
   assert.match(msgBox.innerHTML, /New chat/);
 
-  const firstInventory = fire(15000);
+  const firstInventory = fire(30000);
   respond(pending.shift(), 200, [{ id: 'sku-1', title: 'New item', qty: 5 }]);
   await firstInventory;
   assert.match(inventoryBody.innerHTML, /New item/);
 
-  const unchangedChat = fire(10000);
+  const unchangedChat = fire(12000);
   msgBox.scrollTop = 42;
   respond(pending.shift(), 200, [{ sender: 'Staff', isStaff: true, message: 'New chat' }]);
   await unchangedChat;
   assert.equal(msgBox.scrollTop, 42);
 
-  const failedChat = fire(10000);
+  const failedChat = fire(12000);
   respond(pending.shift(), 429);
   await failedChat;
   assert.match(msgBox.innerHTML, /New chat/);
   assert.ok([...timers.values()].some(({ delay }) => delay >= 30000));
 
-  const oldInventory = fire(15000);
+  const oldInventory = fire(30000);
   vm.runInContext("state.activeClientId = 'CL-002'; inventoryRequestId += 1;", context);
   respond(pending.shift(), 200, [{ id: 'old', title: 'Wrong client', qty: 1 }]);
   await oldInventory;
@@ -362,6 +370,14 @@ test('background sync refreshes changed data, backs off on 429, and ignores old 
   assert.ok([...timers.values()].some(({ delay }) => delay === 0));
   assert.ok([...timers.values()].some(({ delay }) => delay === 1500));
   assert.equal(timers.size, 2);
+
+  vm.runInContext('lastInteractionAt = Date.now() - 6 * 60 * 1000;', context);
+  const requestsBeforeIdle = pending.length;
+  await fire(0);
+  assert.equal(pending.length, requestsBeforeIdle, 'an idle tab must not poll Google Sheets');
+  assert.equal(timers.size, 1);
+  listeners.pointerdown();
+  assert.ok([...timers.values()].some(({ delay }) => delay === 0), 'activity resumes syncing right away');
 
   vm.runInContext('executePortalLogout()', context);
   assert.equal(timers.size, 0);
@@ -643,6 +659,13 @@ test('field toggles, quick-edit PIN protection, and legacy settings edits are en
     assert.equal(cl002.profile.attributeMap.bundled, null);
     assert.equal(cl002.profile.quickEditMode, 'disabled');
     assert.equal(credentialRows[0].values.Fields_JSON, undefined);
+    assert.ok(!cl002.profile.dashboardColumns.includes('QTY'));
+    assert.equal(cl002.profile.dashboardColumns.at(-1), 'STATUS');
+
+    assert.equal((await call('PUT', '/admin/clients/CL-002', { email: 'not-an-email' }, adminToken)).status, 400);
+    const withEmail = await (await call('PUT', '/admin/clients/CL-002', { email: 'ecom@example.com' }, adminToken)).json();
+    assert.equal(credentialRows[0].values.Email, 'ecom@example.com');
+    assert.equal(withEmail.profile.hasEmail, true);
 
     assert.equal((await call('PUT', '/admin/clients/CL-003', { quickEditMode: 'password' }, adminToken)).status, 200);
     assert.equal((await (await call('PUT', '/inventory/quantity', { clientId: 'CL-003', sku: 'A', qty: 1 }, cjaToken, { 'X-Quick-Edit-Token': unlock.token })).json()).code, 'QUICK_EDIT_PIN_REQUIRED');
@@ -789,6 +812,19 @@ test('staff update received then shipped quantities and the status follows the w
       assert.equal(result.status, status);
       assert.deepEqual([grid[1][2], grid[1][3], grid[1][5]], [received, shipped, status]);
     }
+
+    const editItem = (body, token) => fetch(`http://127.0.0.1:${server.address().port}/api/inventory/item`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ clientId: 'CL-004', itemId: 'CL-004-1', title: 'Widget', ...body })
+    });
+    const client = signNotificationSession('Acme', 'CL-004', 'client');
+    assert.equal((await editItem({ values: { title: 'Widget Pro' } }, signNotificationSession('Other', 'CL-005', 'client'))).status, 400);
+    assert.equal((await editItem({ values: { quantityReceived: 99 } }, client)).status, 403);
+    assert.equal((await editItem({ values: { title: '' } }, client)).status, 400);
+    assert.equal((await editItem({ values: { title: 'Widget Pro' }, title: 'Someone else' }, client)).status, 409);
+    assert.equal((await editItem({ values: { sku: '', title: 'Widget Pro' } }, client)).status, 200);
+    assert.deepEqual([grid[1][0], grid[1][1], grid[1][2]], ['', 'Widget Pro', 10]);
   } finally {
     await new Promise((resolve) => server.close(resolve));
     GoogleSpreadsheet.prototype.loadInfo = oldLoadInfo;
@@ -970,6 +1006,157 @@ test('billing API keeps rate cards and daily entries admin-only, editable, delet
     assert.equal(historyRows.length, 0);
   } finally {
     await new Promise((resolve) => server.close(resolve));
+    GoogleSpreadsheet.prototype.loadInfo = oldLoadInfo;
+    Object.defineProperty(GoogleSpreadsheet.prototype, 'sheetsByTitle', titleDescriptor);
+    Object.defineProperty(GoogleSpreadsheet.prototype, 'sheetsByIndex', indexDescriptor);
+  }
+});
+
+test('a saved session survives a page refresh, and expired or rejected sessions return to sign-in', async () => {
+  const makeElement = () => ({
+    style: {}, dataset: {}, hidden: false, innerHTML: '', textContent: '', value: '',
+    classList: { add() {}, remove() {}, toggle() {}, contains: () => false },
+    setAttribute() {}, removeAttribute() {}, getAttribute: () => null, addEventListener() {},
+    querySelector: () => null, querySelectorAll: () => [], focus() {}, replaceChildren() {}, append() {}
+  });
+  const token = (expires) => `${Buffer.from(JSON.stringify({ username: 'EcomElite', clientId: 'CL-002', role: 'client', expires })).toString('base64url')}.sig`;
+  const boot = (savedSession, notificationStatus = 200) => {
+    const elements = {};
+    const storage = new Map(savedSession ? [['eclPortalSession', JSON.stringify(savedSession)]] : []);
+    const context = vm.createContext({
+      document: {
+        hidden: false,
+        getElementById: (id) => { elements[id] = elements[id] || makeElement(); return elements[id]; },
+        querySelector: () => null,
+        querySelectorAll: () => [],
+        addEventListener() {}
+      },
+      window: { location: { hostname: 'localhost' }, addEventListener() {} },
+      localStorage: { getItem: (key) => storage.get(key) ?? null, setItem: (key, value) => storage.set(key, value), removeItem: (key) => storage.delete(key) },
+      atob: (value) => Buffer.from(value, 'base64').toString('binary'),
+      AbortController,
+      URL,
+      console: { error() {}, log() {} },
+      setTimeout: () => 0,
+      clearTimeout() {},
+      fetch: async (url) => {
+        const status = url.includes('/notifications') ? notificationStatus : url.includes('/billing') ? 403 : 200;
+        const body = url.includes('/notifications') ? { chat: 0, inventory: 0, total: 0, items: [] } : url.includes('/client-profile') ? { clientId: 'CL-002', fields: [] } : [];
+        return { ok: status === 200, status, json: async () => body };
+      }
+    });
+    vm.runInContext(fs.readFileSync(require.resolve('../frontend/app.js'), 'utf8'), context);
+    return { context, elements, storage };
+  };
+  const settle = async () => { for (let i = 0; i < 20; i += 1) await new Promise((resolve) => setImmediate(resolve)); };
+  const session = { success: true, clientId: 'CL-002', clientName: 'Ecom Elite 2.0', role: 'client' };
+
+  const restored = boot({ session: { ...session, notificationToken: token(Date.now() + 3600000) }, page: 'page-chat' });
+  assert.equal(restored.elements.portalLoginWindow.style.display, 'none');
+  await settle();
+  assert.equal(vm.runInContext('state.auth', restored.context), true);
+  assert.equal(vm.runInContext('state.activeClientId', restored.context), 'CL-002');
+  assert.ok(restored.storage.has('eclPortalSession'));
+  vm.runInContext('executePortalLogout()', restored.context);
+  assert.equal(restored.storage.has('eclPortalSession'), false);
+
+  const expired = boot({ session: { ...session, notificationToken: token(Date.now() - 1000) } });
+  await settle();
+  assert.equal(vm.runInContext('state.auth', expired.context), false);
+  assert.equal(expired.elements.portalLoginWindow.style.display, 'flex');
+  assert.equal(expired.storage.has('eclPortalSession'), false);
+
+  const rejected = boot({ session: { ...session, notificationToken: token(Date.now() + 3600000) } }, 401);
+  await settle();
+  assert.equal(vm.runInContext('state.auth', rejected.context), false);
+  assert.equal(rejected.elements.portalLoginWindow.style.display, 'flex');
+  assert.match(rejected.elements.loginErrorMsg.textContent, /session expired/);
+  assert.equal(rejected.storage.has('eclPortalSession'), false);
+});
+
+test('chat messages appear instantly, show failures with retry, and never block the input', async () => {
+  const msgBox = { innerHTML: '', scrollTop: 0, scrollHeight: 0, clientHeight: 0 };
+  const msgInput = { value: '', addEventListener() {} };
+  const requests = [];
+  const context = vm.createContext({
+    document: {
+      hidden: false,
+      getElementById: (id) => ({ msgBox, msgInput }[id] || null),
+      querySelector: () => null,
+      querySelectorAll: () => [],
+      addEventListener() {}
+    },
+    window: { location: { hostname: 'localhost' }, addEventListener() {} },
+    AbortController,
+    URL,
+    setTimeout: () => 0,
+    clearTimeout() {},
+    fetch: (url, options = {}) => new Promise((resolve) => requests.push({ url, options, resolve }))
+  });
+  vm.runInContext(fs.readFileSync(require.resolve('../frontend/app.js'), 'utf8'), context);
+  vm.runInContext("state.auth = true; state.session = { clientId: 'CL-002', clientName: 'Ecom', role: 'client', notificationToken: 't' }; state.activeClientId = 'CL-002'; state.messages = [];", context);
+  const respond = (status, body) => requests.shift().resolve({ ok: status === 200, status, json: async () => body });
+  const settle = async () => { for (let i = 0; i < 10; i += 1) await new Promise((resolve) => setImmediate(resolve)); };
+
+  msgInput.value = 'Hello there';
+  vm.runInContext('submitMessage()', context);
+  assert.equal(msgInput.value, '', 'the box clears before the server answers');
+  assert.match(msgBox.innerHTML, /Hello there/);
+  assert.match(msgBox.innerHTML, /Sending/);
+  assert.equal(requests[0].options.method, 'POST');
+
+  respond(500, { success: false, error: 'Unable to send message.' });
+  await settle();
+  assert.match(msgBox.innerHTML, /Not sent/);
+  const localId = vm.runInContext('state.pendingMessages[0].localId', context);
+
+  vm.runInContext(`retryPendingMessage('${localId}')`, context);
+  assert.match(msgBox.innerHTML, /Sending/);
+  respond(200, { success: true });
+  await settle();
+  assert.match(requests[0].url, /api\/chat\?clientId=CL-002/);
+  respond(200, [{ sender: 'Ecom', message: 'Hello there', clientId: 'CL-002', isStaff: false }]);
+  await settle();
+  assert.equal(vm.runInContext('state.pendingMessages.length', context), 0);
+  assert.equal((msgBox.innerHTML.match(/Hello there/g) || []).length, 1);
+  assert.doesNotMatch(msgBox.innerHTML, /Sending|Not sent/);
+});
+
+test('old chat messages are archived to Chat_Archive and removed from Chat_log in one block', async () => {
+  const { archiveOldChatMessages, invalidateReadCache: clearCache } = require('../api/server.js');
+  clearCache('');
+  const now = new Date('2026-10-01T12:00:00Z');
+  const daysAgo = (days) => new Date(now.getTime() - days * 86400000).toISOString();
+  const makeRow = (values, rowNumber) => ({ rowNumber, get: (key) => values[key] ?? '' });
+  const chatRows = [
+    { Timestamp: daysAgo(60), Sender: 'A', Message: 'old 1', ClientID: 'CL-002', IsStaff: '0' },
+    { Timestamp: daysAgo(45), Sender: 'B', Message: 'old 2', ClientID: 'CL-002', IsStaff: '1' },
+    { Timestamp: daysAgo(31), Sender: 'A', Message: 'old 3', ClientID: 'CL-003', IsStaff: '0' },
+    { Timestamp: daysAgo(5), Sender: 'A', Message: 'recent', ClientID: 'CL-002', IsStaff: '0' },
+    { Timestamp: daysAgo(40), Sender: 'C', Message: 'out of order', ClientID: 'CL-002', IsStaff: '0' }
+  ].map((values, index) => makeRow(values, index + 2));
+  const deletes = [];
+  const archived = [];
+  const sheets = {
+    Chat_log: { sheetId: 7, getRows: async () => chatRows, _makeSingleUpdateRequest: async (type, body) => deletes.push([type, body]) },
+    Chat_Archive: { headerValues: [], loadHeaderRow: async () => {}, setHeaderRow: async () => {}, addRows: async (rows) => archived.push(...rows) }
+  };
+  const titleDescriptor = Object.getOwnPropertyDescriptor(GoogleSpreadsheet.prototype, 'sheetsByTitle');
+  const indexDescriptor = Object.getOwnPropertyDescriptor(GoogleSpreadsheet.prototype, 'sheetsByIndex');
+  const oldLoadInfo = GoogleSpreadsheet.prototype.loadInfo;
+  GoogleSpreadsheet.prototype.loadInfo = async () => {};
+  Object.defineProperty(GoogleSpreadsheet.prototype, 'sheetsByTitle', { configurable: true, get: () => sheets });
+  Object.defineProperty(GoogleSpreadsheet.prototype, 'sheetsByIndex', { configurable: true, get: () => Object.values(sheets) });
+  try {
+    const dryRun = await archiveOldChatMessages({ now });
+    assert.deepEqual([dryRun.archived, dryRun.kept], [3, 2]);
+    assert.equal(archived.length + deletes.length, 0);
+
+    const result = await archiveOldChatMessages({ now, apply: true });
+    assert.equal(result.archived, 3);
+    assert.deepEqual(archived.map((row) => row[2]), ['old 1', 'old 2', 'old 3']);
+    assert.deepEqual(deletes, [['deleteDimension', { range: { sheetId: 7, dimension: 'ROWS', startIndex: 1, endIndex: 4 } }]]);
+  } finally {
     GoogleSpreadsheet.prototype.loadInfo = oldLoadInfo;
     Object.defineProperty(GoogleSpreadsheet.prototype, 'sheetsByTitle', titleDescriptor);
     Object.defineProperty(GoogleSpreadsheet.prototype, 'sheetsByIndex', indexDescriptor);

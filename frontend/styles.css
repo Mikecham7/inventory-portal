@@ -56,7 +56,9 @@ button { cursor: pointer; }
   .header p { display: block; }
   .header-logo { height: 46px; }
 }
-.header-right { display: flex; align-items: center; gap: 5px; flex-shrink: 0; }
+.header-right { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+.header-divider { width: 1px; height: 24px; background: rgba(255,255,255,.25); margin: 0 4px; }
+@media (min-width: 480px) { .header-right { gap: 10px; } .header-divider { margin: 0 8px; } }
 .client-tag { background: var(--yellow); color: var(--navy); font-size: 8px; font-weight: bold; padding: 3px 6px; border-radius: 20px; white-space: nowrap; max-width: 80px; overflow: hidden; text-overflow: ellipsis; }
 @media (min-width: 480px) { .client-tag { font-size: 10px; max-width: none; padding: 3px 8px; } }
 .logout-btn { background: #dc3545; color: white; border: none; padding: 5px 8px; font-size: 10px; font-weight: bold; border-radius: 4px; cursor: pointer; white-space: nowrap; }
@@ -67,7 +69,7 @@ button { cursor: pointer; }
 .notification-button { width: 32px; height: 32px; position: relative; background: transparent; border: 1px solid #7a96ae; border-radius: 4px; color: white; font-size: 16px; }
 .notification-button:focus-visible, .notification-row:focus-visible { outline: 2px solid var(--yellow); outline-offset: 2px; }
 .notification-badge { position: absolute; top: -7px; right: -7px; min-width: 18px; height: 18px; padding: 1px 3px; background: #c83232; color: white; border-radius: 9px; font-size: 10px; font-weight: bold; line-height: 16px; }
-.notification-panel { position: absolute; top: 38px; right: -58px; width: min(340px, calc(100vw - 20px)); max-height: min(420px, 70vh); overflow-y: auto; background: white; color: var(--navy); border: 1px solid var(--border); border-radius: 6px; box-shadow: 0 10px 24px rgba(0,0,0,.2); z-index: 120; }
+.notification-panel { position: fixed; top: 56px; right: 10px; width: min(340px, calc(100vw - 20px)); max-height: min(420px, 70vh); overflow-y: auto; background: white; color: var(--navy); border: 1px solid var(--border); border-radius: 6px; box-shadow: 0 10px 24px rgba(0,0,0,.2); z-index: 120; }
 .notification-heading { display: flex; align-items: center; justify-content: space-between; padding: 12px; border-bottom: 1px solid var(--border); }
 .notification-heading button { border: none; background: transparent; color: var(--mid); font-size: 12px; font-weight: bold; }
 .notification-list { padding: 8px 12px; font-size: 12px; }
@@ -301,7 +303,10 @@ label { display: block; font-size: 11px; font-weight: bold; color: var(--mid); m
 .badge-awaiting { background: #e8eef5; color: #475569; }
 .shipment-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 .shipment-preview { margin: 12px 0; font-size: 12px; color: #64748b; display: flex; align-items: center; gap: 8px; }
-#shipmentEditor[hidden], #stockEditor[hidden] { display: none; }
+#shipmentEditor[hidden], #stockEditor[hidden], #detailsEditor[hidden] { display: none; }
+.detail-grid { margin-top: 0; }
+.detail-grid .detail-wide { grid-column: 1 / -1; }
+.detail-grid textarea { resize: vertical; font-family: inherit; }
 @media (max-width: 699px) {
   .billing-totals { grid-template-columns: 1fr 1fr; }
   .billing-total.primary { grid-column: 1 / -1; }
@@ -359,6 +364,10 @@ label { display: block; font-size: 11px; font-weight: bold; color: var(--mid); m
 .msg-wrap.them { align-self:flex-start; }
 .msg-meta { font-size:10px; color:#718096; margin-bottom:3px; padding:0 3px; display:flex; align-items:center; gap:4px; }
 .msg-wrap.me .msg-meta { justify-content:flex-end; }
+.msg-wrap.pending .msg-bubble { opacity: .7; }
+.msg-status { font-style: italic; }
+.msg-status.failed { color: var(--red-fg); font-style: normal; font-weight: bold; }
+.msg-retry { border: none; background: none; color: var(--red-fg); font-size: 10px; font-weight: bold; text-decoration: underline; cursor: pointer; padding: 0; }
 .msg-bubble { padding:9px 13px; border-radius:14px; font-size:13px; line-height:1.4; word-break:break-word; }
 .msg-wrap.me .msg-bubble { background: var(--mid); color: white; border-bottom-right-radius: 4px; }
 .msg-wrap.them .msg-bubble { background: white; color: #2d3748; border-bottom-left-radius: 4px; border:1px solid var(--border); }
@@ -380,6 +389,14 @@ label { display: block; font-size: 11px; font-weight: bold; color: var(--mid); m
 .portal-login-form { text-align: left; margin-bottom: 14px; }
 .portal-login-form input { width: 100%; padding: 10px 12px; font-size: 14px; border: 1.5px solid var(--border); border-radius: 6px; margin-bottom: 10px; color: var(--navy); outline: none; }
 .portal-login-form input:focus { border-color: var(--mid); }
+.password-field { position: relative; }
+.password-field input { padding-right: 44px; }
+.password-toggle { position: absolute; top: 0; right: 0; width: 42px; height: 42px; display: flex; align-items: center; justify-content: center; border: none; background: none; color: #64748b; cursor: pointer; border-radius: 6px; }
+.password-toggle:hover { color: var(--navy); }
+.password-toggle:focus-visible { outline: 2px solid var(--yellow); outline-offset: -2px; }
+.password-toggle svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.password-toggle .eye-closed, .password-toggle[aria-pressed="true"] .eye-open { display: none; }
+.password-toggle[aria-pressed="true"] .eye-closed { display: block; }
 .portal-login-btn { width: 100%; padding: 12px; background: var(--mid); color: white; font-weight: bold; font-size: 15px; border: none; border-radius: 6px; cursor: pointer; }
 .portal-login-btn:active { background: var(--navy); }
 .login-error { color: #dc3545; font-size: 12px; font-weight: bold; margin-bottom: 8px; display: none; }

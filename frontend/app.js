@@ -47,6 +47,9 @@ const QUICK_EDIT_UNLOCK_URL = window.location.hostname === 'localhost' || window
 const UPDATE_SHIPMENT_URL = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
   ? 'http://localhost:3001/api/inventory/shipment'
   : '/api/inventory/shipment';
+const UPDATE_ITEM_URL = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
+  ? 'http://localhost:3001/api/inventory/item'
+  : '/api/inventory/item';
 const BILLING_URL = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
   ? 'http://localhost:3001/api/billing/summary'
   : '/api/billing/summary';
@@ -241,6 +244,7 @@ const state = {
   filters: { stock: [], stage: [], attr: [] },
   quickEditUnlock: null,
   billing: null,
+  pendingMessages: [],
   billingEditId: null,
   historyEditId: null,
   rateCardClientId: null,
@@ -291,7 +295,22 @@ function cacheClientView(clientId, values) {
 }
 const syncTimers = { chat: null, inventory: null, notifications: null, billing: null };
 const syncFailures = { chat: 0, inventory: 0, notifications: 0, billing: 0 };
-const syncIntervals = { chat: 10000, inventory: 15000, notifications: 30000, billing: 15000 };
+const syncIntervals = { chat: 12000, inventory: 30000, notifications: 60000, billing: 30000 };
+// Every open tab shares the same Google Sheets read allowance, so idle tabs stop polling until used again.
+const IDLE_PAUSE_MS = 5 * 60 * 1000;
+let lastInteractionAt = Date.now();
+let idlePaused = false;
+
+function noteInteraction() {
+  lastInteractionAt = Date.now();
+  if (!idlePaused) return;
+  idlePaused = false;
+  startBackgroundSync(true);
+}
+
+['pointerdown', 'keydown', 'touchstart', 'wheel'].forEach((eventName) => {
+  document.addEventListener(eventName, noteInteraction, { passive: true });
+});
 
 function isPageActive(pageId) {
   return Boolean(document.getElementById(pageId)?.classList.contains('active'));
@@ -310,13 +329,27 @@ function scheduleBackgroundSync(kind, delay, generation = syncGeneration) {
   if (!state.auth || document.hidden) return;
   syncTimers[kind] = setTimeout(async () => {
     if (generation !== syncGeneration || !state.auth || document.hidden) return;
+    if (Date.now() - lastInteractionAt > IDLE_PAUSE_MS) {
+      idlePaused = true;
+      return;
+    }
     if (kind === 'chat' && !document.getElementById('page-chat')?.classList.contains('active')) return;
     if (kind === 'billing' && !isPageActive('page-billing')) return;
 
     const clientId = state.activeClientId;
-    const status = kind === 'chat' ? await loadChatMessages(clientId)
-      : kind === 'billing' ? await loadBillingSummary(clientId)
-        : kind === 'inventory' ? await fetchInventory(clientId) : await fetchNotifications(clientId);
+    let status = 0;
+    // A rendering bug in one refresh must never stop future refreshes or sign the user out.
+    try {
+      status = kind === 'chat' ? await loadChatMessages(clientId)
+        : kind === 'billing' ? await loadBillingSummary(clientId)
+          : kind === 'inventory' ? await fetchInventory(clientId) : await fetchNotifications(clientId);
+    } catch (error) {
+      console.error(`Background ${kind} refresh failed:`, error);
+    }
+    if (status === 401 && kind !== 'inventory') {
+      handleExpiredSession();
+      return;
+    }
     if (generation !== syncGeneration || !state.auth || document.hidden || clientId !== state.activeClientId) return;
 
     syncFailures[kind] = status === 200 ? 0 : syncFailures[kind] + 1;
@@ -341,7 +374,11 @@ function startBackgroundSync(immediate = false) {
 
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) stopBackgroundSync();
-  else startBackgroundSync(true);
+  else {
+    lastInteractionAt = Date.now();
+    idlePaused = false;
+    startBackgroundSync(true);
+  }
 });
 
 function renderNotifications() {
@@ -376,12 +413,46 @@ function renderNotifications() {
   });
 }
 
+function setNotificationsOpen(open) {
+  const panel = document.getElementById('notificationPanel');
+  if (!panel) return;
+  if (open) {
+    // Fixed positioning keeps the panel on screen at any header height or width.
+    const rect = document.getElementById('notificationButton')?.getBoundingClientRect?.();
+    if (rect) panel.style.top = `${Math.round(rect.bottom + 6)}px`;
+  }
+  panel.style.display = open ? 'block' : 'none';
+  document.getElementById('notificationButton')?.setAttribute('aria-expanded', String(open));
+}
+
 function toggleNotifications() {
   const panel = document.getElementById('notificationPanel');
   if (!panel) return;
-  const open = panel.style.display === 'none';
-  panel.style.display = open ? 'block' : 'none';
-  document.getElementById('notificationButton')?.setAttribute('aria-expanded', String(open));
+  setNotificationsOpen(panel.style.display === 'none');
+}
+
+// Capture phase sees the click before row handlers re-render the list.
+document.addEventListener('click', (event) => {
+  const panel = document.getElementById('notificationPanel');
+  if (!panel || panel.style.display === 'none') return;
+  if (!event.target?.closest?.('#notificationAnchor')) setNotificationsOpen(false);
+}, true);
+
+document.addEventListener('keydown', (event) => {
+  const panel = document.getElementById('notificationPanel');
+  if (event.key !== 'Escape' || !panel || panel.style.display === 'none') return;
+  setNotificationsOpen(false);
+  document.getElementById('notificationButton')?.focus();
+});
+
+function togglePasswordVisibility(button) {
+  const input = document.getElementById(button.dataset.target);
+  if (!input) return;
+  const show = input.type === 'password';
+  input.type = show ? 'text' : 'password';
+  button.setAttribute('aria-pressed', String(show));
+  button.setAttribute('aria-label', show ? 'Hide password' : 'Show password');
+  button.title = show ? 'Hide password' : 'Show password';
 }
 
 async function fetchNotifications(clientId = state.activeClientId) {
@@ -501,6 +572,7 @@ function setPage(pageId) {
       syncTimers.billing = null;
     }
   }
+  saveSession();
 }
 
 function showPage(pageName, markChatRead = true) {
@@ -930,7 +1002,9 @@ function renderTable() {
 
 function renderChatMessages() {
   if (!msgBox) return;
-  const messages = Array.isArray(state.messages) ? state.messages : [];
+  // Messages still being sent are shown right away from local state, then replaced by the saved copy.
+  const pending = (state.pendingMessages || []).filter((entry) => entry.clientId === state.activeClientId);
+  const messages = [...(Array.isArray(state.messages) ? state.messages : []), ...pending];
   const atBottom = msgBox.scrollHeight - msgBox.scrollTop - msgBox.clientHeight < 60;
   const typingIndicator = document.getElementById('typingIndicator');
   if (typingIndicator) {
@@ -953,9 +1027,14 @@ function renderChatMessages() {
     const fileMarkup = isGoogleDriveUrl(fileUrl)
       ? `<div class="msg-file"><a href="${escapeHtml(fileUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(fileName || 'Open shared file')}</a></div>`
       : '';
+    const statusMarkup = message.localId
+      ? (message.status === 'failed'
+        ? `<span class="msg-status failed">Not sent · <button type="button" class="msg-retry" data-action="chat-retry" data-id="${escapeHtml(message.localId)}">Retry</button></span>`
+        : '<span class="msg-status">Sending…</span>')
+      : '';
     return `
-      <div class="msg-wrap ${isMine ? 'me' : 'them'}">
-        <div class="msg-meta"><span>${senderLabel}</span></div>
+      <div class="msg-wrap ${isMine ? 'me' : 'them'}${message.localId ? ' pending' : ''}">
+        <div class="msg-meta"><span>${senderLabel}</span>${statusMarkup}</div>
         <div class="msg-bubble">${escapeHtml(message.message)}${fileMarkup}</div>
       </div>
     `;
@@ -1266,11 +1345,14 @@ const ITEM_FORMS = {
   inventory: { prefix: 'newProduct', fieldPrefix: 'customField_', fieldsHost: 'customProductFields', submit: 'createProductSubmit', notice: 'createProductReadOnlyNotice' }
 };
 
-// Custom fields for one form, minus any the admin switched off for this client and form.
+// Custom fields for one form, minus any the admin switched off and, for clients, the staff-only received/shipped counts.
 function getFormFields(clientId, kind) {
   const profile = state.clientProfile && state.clientProfile.clientId === clientId ? state.clientProfile : null;
   const visibility = (profile && profile.fieldVisibility) || {};
-  return getVisibleClientFields(clientId, state.isAdmin).filter((field) => !visibility[field.key] || visibility[field.key][kind] !== false);
+  const shipment = state.isAdmin ? null : getShipmentFieldKeys(clientId);
+  return getVisibleClientFields(clientId, state.isAdmin)
+    .filter((field) => !visibility[field.key] || visibility[field.key][kind] !== false)
+    .filter((field) => !shipment || (field.key !== shipment.received && field.key !== shipment.shipped));
 }
 
 function syncCreateFormLayout() {
@@ -1423,6 +1505,7 @@ function switchClientView(clientId) {
 
   clearTimeout(switchTimer);
   const sequence = ++switchSequence;
+  saveSession();
   // Rapid clicks through several clients only hit Google Sheets for the one the admin lands on.
   return new Promise((resolve) => {
     switchTimer = setTimeout(async () => {
@@ -1473,43 +1556,7 @@ async function executePortalAuth() {
       throw new Error(result.error || 'Login failed');
     }
 
-    state.session = result;
-    state.auth = true;
-    state.isAdmin = String(result.role || '').toLowerCase() === 'admin' || String(result.clientId || '').toUpperCase() === 'CL-000';
-    state.activeClientId = String(result.clientId || '').trim().toUpperCase() || 'CL-001';
-    state.roster = [];
-    state.pinUnlocked = false;
-
-    renderClientHeader();
-
-    if (portalLoginWindow) portalLoginWindow.style.display = 'none';
-    setPage('page-dashboard');
-
-    const tabClients = document.getElementById('tabClients');
-    if (tabClients) tabClients.style.display = state.isAdmin ? 'block' : 'none';
-
-    if (state.isAdmin) {
-      const roster = await fetchClientRoster();
-      if (roster.length) {
-        const first = roster[0];
-        state.activeClientId = String(first.clientId || '').trim().toUpperCase();
-        if (document.getElementById('activeClientHeader')) {
-          document.getElementById('activeClientHeader').textContent = `CLIENT: ${String(first.clientName || first.clientId || 'CLIENT').toUpperCase()}`;
-        }
-      }
-    }
-
-    const firstClientId = state.activeClientId;
-    await Promise.all([
-      fetchClientProfile(firstClientId),
-      fetchInventory(firstClientId),
-      fetchNotifications(firstClientId)
-    ]);
-    renderDriveFolderLink();
-    renderProductForm();
-    renderTable();
-    startBackgroundSync();
-    syncBillingTab();
+    await startSession(result);
     showToast('Signed in successfully', 'success');
   } catch (error) {
     if (loginErrorMsg) {
@@ -1519,7 +1566,117 @@ async function executePortalAuth() {
   }
 }
 
-function executePortalLogout() {
+const SAVED_SESSION_KEY = 'eclPortalSession';
+const RESTORABLE_PAGES = ['page-dashboard', 'page-logs', 'page-chat', 'page-billing', 'page-clients'];
+
+function readTokenExpiry(token) {
+  try {
+    const payload = String(token || '').split('.')[0].replace(/-/g, '+').replace(/_/g, '/');
+    return Number(JSON.parse(atob(payload)).expires) || 0;
+  } catch (error) {
+    return 0;
+  }
+}
+
+// Storage can be unavailable (private mode, blocked cookies); the portal still works, it just won't remember the sign-in.
+function saveSession() {
+  if (!state.auth || !state.session) return;
+  try {
+    const page = document.querySelector('.page.active')?.id || 'page-dashboard';
+    localStorage.setItem(SAVED_SESSION_KEY, JSON.stringify({ session: state.session, activeClientId: state.activeClientId, page }));
+  } catch (error) {
+    // Ignore storage failures.
+  }
+}
+
+function loadSavedSession() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(SAVED_SESSION_KEY) || 'null');
+    if (saved?.session?.notificationToken && readTokenExpiry(saved.session.notificationToken) > Date.now()) return saved;
+  } catch (error) {
+    // Fall through and clear anything unreadable.
+  }
+  clearSavedSession();
+  return null;
+}
+
+function clearSavedSession() {
+  try {
+    localStorage.removeItem(SAVED_SESSION_KEY);
+  } catch (error) {
+    // Ignore storage failures.
+  }
+}
+
+function handleExpiredSession() {
+  if (!state.auth) return;
+  executePortalLogout('Your session expired. Please sign in again.');
+}
+
+async function startSession(result, saved = null) {
+  state.session = result;
+  state.auth = true;
+  state.isAdmin = String(result.role || '').toLowerCase() === 'admin' || String(result.clientId || '').toUpperCase() === 'CL-000';
+  state.activeClientId = String(result.clientId || '').trim().toUpperCase() || 'CL-001';
+  state.roster = [];
+  state.pinUnlocked = false;
+  lastInteractionAt = Date.now();
+  idlePaused = false;
+
+  renderClientHeader();
+
+  if (portalLoginWindow) portalLoginWindow.style.display = 'none';
+  setPage('page-dashboard');
+
+  const tabClients = document.getElementById('tabClients');
+  if (tabClients) tabClients.style.display = state.isAdmin ? 'block' : 'none';
+
+  if (state.isAdmin) {
+    const roster = await fetchClientRoster();
+    if (roster.length) {
+      const preferred = roster.find((client) => String(client.clientId || '').toUpperCase() === saved?.activeClientId) || roster[0];
+      state.activeClientId = String(preferred.clientId || '').trim().toUpperCase();
+      renderClientHeader();
+    }
+  }
+
+  const firstClientId = state.activeClientId;
+  const [, , notificationStatus] = await Promise.all([
+    fetchClientProfile(firstClientId),
+    fetchInventory(firstClientId),
+    fetchNotifications(firstClientId)
+  ]);
+  if (notificationStatus === 401) {
+    handleExpiredSession();
+    return;
+  }
+  renderDriveFolderLink();
+  renderProductForm();
+  renderTable();
+  startBackgroundSync();
+  await syncBillingTab();
+
+  const page = saved?.page;
+  const billingTab = document.getElementById('tabBilling');
+  const allowed = RESTORABLE_PAGES.includes(page)
+    && (page !== 'page-clients' || state.isAdmin)
+    && (page !== 'page-billing' || billingTab?.style.display !== 'none');
+  if (allowed && page !== 'page-dashboard') showPage(page.replace('page-', ''));
+  saveSession();
+}
+
+async function restoreSavedSession() {
+  const saved = loadSavedSession();
+  if (!saved) return;
+  try {
+    await startSession(saved.session, saved);
+  } catch (error) {
+    console.error('Could not restore session:', error);
+  }
+}
+
+function executePortalLogout(message = '') {
+  clearSavedSession();
   stopBackgroundSync();
   resetViewRequests();
   clearTimeout(switchTimer);
@@ -1539,6 +1696,7 @@ function executePortalLogout() {
   state.pinUnlocked = false;
   state.quickEditUnlock = null;
   state.filters = emptyFilters();
+  state.pendingMessages = [];
   state.billing = null;
   state.billingEditId = null;
   state.historyEditId = null;
@@ -1570,10 +1728,15 @@ function executePortalLogout() {
   clearLoginError();
   if (portalUser) portalUser.value = '';
   if (portalPass) portalPass.value = '';
+  document.querySelectorAll('[data-action="toggle-password"][aria-pressed="true"]').forEach(togglePasswordVisibility);
   setPage('page-dashboard');
   updateSummary();
   renderTable();
-  showToast('Signed out', 'success');
+  if (message && loginErrorMsg) {
+    loginErrorMsg.textContent = message;
+    loginErrorMsg.style.display = 'block';
+  }
+  showToast(message || 'Signed out', message ? 'error' : 'success');
 }
 
 function openPinPrompt(cb, mode = 'page') {
@@ -1738,7 +1901,9 @@ async function submitMessage() {
   const fileName = fileUrl ? (fileUrl.split('/').pop() || 'Shared file') : '';
 
   const isStaff = Boolean(state.session && (String(state.session.role || '').toLowerCase() === 'admin' || String(state.session.clientId || '').toUpperCase() === 'CL-000'));
-  const payload = {
+  const entry = {
+    localId: `local-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    status: 'sending',
     clientId: state.activeClientId || state.session?.clientId || 'CL-001',
     sender: state.session?.clientName || state.session?.clientId || 'User',
     message: text,
@@ -1747,34 +1912,50 @@ async function submitMessage() {
     fileName
   };
 
+  // Show the message and clear the box immediately; saving to the sheet happens in the background.
+  state.pendingMessages.push(entry);
+  msgInput.value = '';
+  if (fileInput) fileInput.value = '';
+  renderChatMessages();
+  msgBox.scrollTop = msgBox.scrollHeight;
+  sendPendingMessage(entry);
+}
+
+async function sendPendingMessage(entry) {
+  entry.status = 'sending';
+  renderChatMessages();
+  const session = state.session;
   try {
     const response = await fetch(CHAT_URL, {
       method: 'POST',
       headers: adminHeaders({ 'Content-Type': 'application/json' }),
-      body: JSON.stringify(payload)
+      body: JSON.stringify({
+        clientId: entry.clientId, sender: entry.sender, message: entry.message, isStaff: entry.isStaff, fileUrl: entry.fileUrl, fileName: entry.fileName
+      })
     });
-
-    const result = await response.json().catch(() => ({ success: true }));
-    if (!response.ok || !result.success) {
-      throw new Error(result.error || 'Message failed to send');
-    }
-
-    state.messages.push({
-      sender: payload.sender,
-      message: text,
-      clientId: payload.clientId,
-      isStaff,
-      fileUrl,
-      fileName
-    });
-    chatRequestId += 1;
-    chatSignature = null;
-    renderChatMessages();
-    msgInput.value = '';
-    if (fileInput) fileInput.value = '';
+    const result = await response.json().catch(() => ({ success: response.ok }));
+    if (!response.ok || !result.success) throw new Error(result.error || 'Message failed to send');
   } catch (error) {
-    showToast('Message failed to send', 'error');
+    if (state.session !== session) return;
+    entry.status = 'failed';
+    renderChatMessages();
+    showToast(error.message || 'Message failed to send', 'error');
+    return;
   }
+
+  if (state.session !== session) return;
+  chatSignature = null;
+  const refreshed = entry.clientId === state.activeClientId ? await loadChatMessages(entry.clientId) : 0;
+  if (refreshed !== 200 && entry.clientId === state.activeClientId) {
+    state.messages.push({ sender: entry.sender, message: entry.message, clientId: entry.clientId, isStaff: entry.isStaff, fileUrl: entry.fileUrl, fileName: entry.fileName });
+  }
+  state.pendingMessages = state.pendingMessages.filter((item) => item !== entry);
+  renderChatMessages();
+}
+
+function retryPendingMessage(localId) {
+  const entry = state.pendingMessages.find((item) => item.localId === localId);
+  if (entry && entry.status === 'failed') sendPendingMessage(entry);
 }
 
 function filterSearch() {
@@ -1827,6 +2008,7 @@ function selectItem(id) {
     searchResults.style.display = 'none';
   }
 
+  renderItemDetails(item);
   const keys = getShipmentFieldKeys(item.clientId || state.activeClientId);
   const shipmentEditor = document.getElementById('shipmentEditor');
   const stockEditor = document.getElementById('stockEditor');
@@ -1854,6 +2036,94 @@ function selectItem(id) {
       : 'Your ECL team updates these as items arrive at the warehouse and ship out.';
   }
   previewShipment();
+}
+
+// The product columns anyone on the account may edit. Received/shipped quantities are excluded here
+// because only ECL staff change them, in the Received & Shipped section.
+function getEditableItemFields(clientId) {
+  const safeClientId = String(clientId || '').trim().toUpperCase();
+  const profile = state.clientProfile && state.clientProfile.clientId === safeClientId ? state.clientProfile : null;
+  const fields = (profile ? profile.fields : CLIENT_INVENTORY_FIELDS[safeClientId]?.fields) || [];
+  const shipment = getShipmentFieldKeys(safeClientId);
+  const custom = fields.filter((field) => !shipment || (field.key !== shipment.received && field.key !== shipment.shipped));
+  if (safeClientId === 'CL-002' || safeClientId === 'CL-003') return custom;
+  const base = [
+    { key: 'sku', label: 'SKU (optional)', type: 'text' },
+    { key: 'title', label: profile?.titleField?.label || 'Product Title', type: 'text' }
+  ];
+  return safeClientId === 'CL-001' ? base : [...base, ...custom];
+}
+
+function itemFieldValue(item, key) {
+  if (key === 'sku') return item.rawSku ?? item.sku ?? '';
+  return item[key] ?? '';
+}
+
+function renderItemDetails(item) {
+  const section = document.getElementById('detailsEditor');
+  const host = document.getElementById('detailFields');
+  if (!section || !host) return;
+  const clientId = item.clientId || state.activeClientId;
+  const viewOnly = !state.isAdmin && Boolean(state.clientProfile?.readOnly);
+  const fields = getEditableItemFields(clientId);
+  section.hidden = viewOnly || !fields.length;
+  if (section.hidden) return;
+  host.innerHTML = fields.map((field) => {
+    const id = escapeHtml(`detail_${field.key}`);
+    const value = escapeHtml(itemFieldValue(item, field.key));
+    const label = `<label class="ac-label" for="${id}">${escapeHtml(field.label)}</label>`;
+    const common = `id="${id}" class="ac-input detail-input" data-key="${escapeHtml(field.key)}"`;
+    if (field.type === 'select') {
+      const current = String(itemFieldValue(item, field.key));
+      // Keep a sheet value that isn't one of the listed options, so saving other fields doesn't overwrite it.
+      const choices = (field.options || []).map((option) => String(option || ''));
+      if (!choices.includes(current)) choices.unshift(current);
+      const options = choices.map((option) => {
+        const text = escapeHtml(option);
+        return `<option value="${text}" ${option === current ? 'selected' : ''}>${text || '—'}</option>`;
+      }).join('');
+      return `<div>${label}<select ${common}>${options}</select></div>`;
+    }
+    if (field.type === 'textarea') return `<div class="detail-wide">${label}<textarea ${common} rows="3">${value}</textarea></div>`;
+    // A number box can't hold sheet text like "10 units"; it would show blank and saving would erase it.
+    const raw = String(itemFieldValue(item, field.key)).trim();
+    const numeric = field.type === 'number' && (raw === '' || Number.isFinite(Number(raw)));
+    return `<div>${label}<input type="${numeric ? 'number' : 'text'}" ${common} value="${value}" /></div>`;
+  }).join('');
+}
+
+async function saveItemDetails() {
+  const item = state.items.find((entry) => String(entry.id) === String(state.selectedItemId));
+  if (!item) {
+    showToast('Select an item first', 'error');
+    return;
+  }
+  const clientId = state.activeClientId;
+  const values = {};
+  document.querySelectorAll('#detailFields .detail-input').forEach((input) => {
+    const key = input.dataset.key;
+    if (String(input.value).trim() !== String(itemFieldValue(item, key)).trim()) values[key] = input.value;
+  });
+  if (!Object.keys(values).length) {
+    showToast('No changes to save', 'error');
+    return;
+  }
+  try {
+    const response = await fetch(UPDATE_ITEM_URL, {
+      method: 'PUT',
+      headers: adminHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ clientId, itemId: item.id, title: item.title, sku: item.sku, values })
+    });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok || !result.success) throw new Error(result.error || 'Unable to update product.');
+    showToast('Product updated', 'success');
+    inventorySignature = null;
+    await fetchInventory(clientId);
+    if (clientId !== state.activeClientId) return;
+    if (state.items.some((entry) => String(entry.id) === String(item.id))) selectItem(item.id);
+  } catch (error) {
+    showToast(error.message || 'Unable to update product', 'error');
+  }
 }
 
 function previewShipment() {
@@ -1983,8 +2253,8 @@ async function createProduct() {
     if (value) extraFields[field.key] = value;
   });
 
-  if ((!isCardClient && !sku) || !title) {
-    showToast(isCardClient ? 'Card name / product is required' : 'SKU and product title are required', 'error');
+  if (!title) {
+    showToast(isCardClient ? 'Card name / product is required' : 'A product name is required', 'error');
     return;
   }
 
@@ -1992,7 +2262,7 @@ async function createProduct() {
     const response = await fetch(CREATE_ITEM_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${state.session?.notificationToken || ''}` },
-      body: JSON.stringify({ clientId, sku: sku || title, title, qty, status: qty <= 5 ? 'Low Stock' : 'In Stock', extraFields, isAdmin: state.isAdmin, role: state.session?.role || (state.isAdmin ? 'admin' : 'client') })
+      body: JSON.stringify({ clientId, sku, title, qty, status: qty <= 5 ? 'Low Stock' : 'In Stock', extraFields, isAdmin: state.isAdmin, role: state.session?.role || (state.isAdmin ? 'admin' : 'client') })
     });
 
     const result = await response.json().catch(() => ({ success: false, error: 'Create failed' }));
@@ -2057,6 +2327,8 @@ document.addEventListener('click', (event) => {
   }
 
   if (action === 'billing-edit') startBillingEdit(element.dataset.id);
+  if (action === 'toggle-password') togglePasswordVisibility(element);
+  if (action === 'chat-retry') retryPendingMessage(element.dataset.id);
   if (action === 'billing-cancel') cancelBillingEdit();
   if (action === 'billing-save') saveBillingEdit(element.dataset.id);
   if (action === 'billing-delete') deleteBillingEntry(element.dataset.id);
@@ -2308,6 +2580,8 @@ async function loadClientForEdit(clientId) {
     if (el) el.style.display = show ? '' : 'none';
   });
   document.getElementById('ecClientName').value = profile.clientName || '';
+  const rosterEntry = state.roster.find((client) => String(client.clientId || '').toUpperCase() === state.editClientId);
+  document.getElementById('ecEmail').value = rosterEntry?.email || '';
   document.getElementById('ecDriveFolderUrl').value = profile.driveFolderUrl || '';
   document.getElementById('ecPortalTitle').value = profile.portalTitle || '';
   document.getElementById('ecAccentColor').value = profile.accentColor || '';
@@ -2426,6 +2700,7 @@ async function submitClientEdit() {
       oversized: attributeValue('ecAttrOversized')
     },
     clientName: document.getElementById('ecClientName')?.value || '',
+    email: document.getElementById('ecEmail')?.value || '',
     driveFolderUrl: document.getElementById('ecDriveFolderUrl')?.value || '',
     portalTitle: document.getElementById('ecPortalTitle')?.value || '',
     accentColor: document.getElementById('ecAccentColor')?.value || '',
@@ -3015,8 +3290,32 @@ function initializeApp() {
   updateSummary();
   renderTable();
   if (logTableWrap) logTableWrap.innerHTML = '<div class="no-results" style="padding:30px;">Loading log...</div>';
-  if (portalLoginWindow) portalLoginWindow.style.display = 'flex';
   if (pinOverlay) pinOverlay.style.display = 'none';
+  const saved = loadSavedSession();
+  // Keep the login screen hidden while a saved session is restored so a refresh doesn't flash it.
+  if (portalLoginWindow) portalLoginWindow.style.display = saved ? 'none' : 'flex';
+  if (saved) {
+    restoreSavedSession().finally(() => {
+      if (!state.auth && portalLoginWindow) portalLoginWindow.style.display = 'flex';
+    });
+  }
 }
 
-initializeApp();
+// Last-resort safety net: an unexpected error is logged and reported, but the page and sign-in stay intact.
+window.addEventListener('error', (event) => {
+  console.error('Unexpected error:', event.error || event.message);
+  showToast('Something went wrong. Your data is safe — try that again.', 'error');
+});
+window.addEventListener('unhandledrejection', (event) => {
+  if (event.reason?.name === 'AbortError') return;
+  console.error('Unhandled request error:', event.reason);
+  event.preventDefault();
+  showToast('A request failed. Retrying automatically.', 'error');
+});
+
+try {
+  initializeApp();
+} catch (error) {
+  console.error('Portal failed to start:', error);
+  if (portalLoginWindow) portalLoginWindow.style.display = 'flex';
+}
