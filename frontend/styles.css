@@ -259,6 +259,8 @@ label { display: block; font-size: 11px; font-weight: bold; color: var(--mid); m
 .billing-total.primary { background: var(--navy); }
 .billing-total.primary span { color: var(--yellow); }
 .billing-total.primary strong { color: white; font-size: 26px; }
+.billing-total.primary small { color: #cbd5e1; font-size: 11px; line-height: 1.3; }
+.history-form { grid-template-columns: 150px 120px 120px 150px; }
 .billing-progress { height: 6px; background: #e8eef5; border-radius: 3px; margin-top: 12px; overflow: hidden; }
 .billing-progress div { height: 100%; background: var(--yellow); }
 .billing-progress-label { font-size: 11px; color: #64748b; margin-top: 4px; }

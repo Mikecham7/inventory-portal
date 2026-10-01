@@ -862,6 +862,24 @@ test('billing builds invoice lines that match real client invoices', () => {
   assert.equal(sanitizeEntry({ date: '2026-08-01', serviceKey: 'ghost', quantity: 1 }, cardA).error, 'Choose a service from the rate card.');
   assert.equal(sanitizeEntry({ date: '2026-08-01', serviceKey: mgmt, quantity: 0 }, cardA).error, 'Quantity must be a positive number.');
   assert.equal(sanitizeEntry({ date: '2026-08-01', serviceKey: mgmt, quantity: 2, unitPrice: '0.80' }, cardA).entry.unitPrice, 0.8);
+
+  // Ecom Elite's real past invoices (by service month); only the latest 6 months count.
+  const history = [['2025-09', 106.8], ['2026-03', 316.95], ['2026-04', 61], ['2026-05', 91.9], ['2026-06', 87], ['2026-07', 185.25], ['2026-08', 78.2]]
+    .map(([month, amount]) => ({ month, amount }));
+  const dayOne = [{ ...entry('2026-10-01', fba, 10, 1.5), name: 'FBA Fullfillment (Per Unit)' }];
+  const early = summarizeBilling({ rateCard: cardA, entries: dayOne, history, month: '2026-10', now: new Date('2026-10-01T12:00:00Z') });
+  const average = Math.round((316.95 + 61 + 91.9 + 87 + 185.25 + 78.2) / 6 * 100) / 100;
+  assert.deepEqual(early.estimate, { basis: 'history', historyAverage: average, historyMonths: 6 });
+  const expected = 15 + ((30 / 31) * (average / 31) + (1 / 31) * 15) * 30;
+  assert.equal(early.totals.projected, Math.round(expected * 100) / 100);
+  assert.ok(early.totals.projected < 200, `day-one estimate ${early.totals.projected} should stay near the usual monthly bill`);
+
+  const noHistoryDayOne = summarizeBilling({ rateCard: cardA, entries: dayOne, month: '2026-10', now: new Date('2026-10-01T12:00:00Z') });
+  assert.deepEqual([noHistoryDayOne.estimate.basis, noHistoryDayOne.totals.projected], ['none', 15]);
+  const noHistoryLater = summarizeBilling({ rateCard: cardA, entries: dayOne, month: '2026-10', now: new Date('2026-10-10T12:00:00Z') });
+  assert.deepEqual([noHistoryLater.estimate.basis, noHistoryLater.totals.projected], ['pace', Math.round((15 + 1.5 * 21) * 100) / 100]);
+  const pastMonth = summarizeBilling({ rateCard: cardA, entries: dayOne, history, month: '2026-10', now: new Date('2026-11-02T00:00:00Z') });
+  assert.deepEqual([pastMonth.estimate.basis, pastMonth.totals.projected], ['final', 15]);
 });
 
 test('billing API keeps rate cards and daily entries admin-only, editable, deletable, and respects client visibility', async () => {
@@ -870,13 +888,15 @@ test('billing API keeps rate cards and daily entries admin-only, editable, delet
   clearCache('');
   const rateRows = [];
   const entryRows = [];
+  const historyRows = [];
   const makeRow = (values, list) => {
     const row = { values, get: (key) => values[key] ?? '', set: (key, value) => { values[key] = value; }, save: async () => {}, delete: async () => { list.splice(list.indexOf(row), 1); } };
     return row;
   };
   const sheets = {
     Billing_Rate_Cards: { headerValues: [], loadHeaderRow: async () => {}, setHeaderRow: async (h) => { sheets.Billing_Rate_Cards.headerValues = h; }, getRows: async () => rateRows, addRow: async (row) => rateRows.push(makeRow(row, rateRows)) },
-    Billing_Line_Items: { headerValues: [], loadHeaderRow: async () => {}, setHeaderRow: async (h) => { sheets.Billing_Line_Items.headerValues = h; }, getRows: async () => entryRows, addRow: async (row) => entryRows.push(makeRow(row, entryRows)) }
+    Billing_Line_Items: { headerValues: [], loadHeaderRow: async () => {}, setHeaderRow: async (h) => { sheets.Billing_Line_Items.headerValues = h; }, getRows: async () => entryRows, addRow: async (row) => entryRows.push(makeRow(row, entryRows)) },
+    Billing_History: { headerValues: [], loadHeaderRow: async () => {}, setHeaderRow: async (h) => { sheets.Billing_History.headerValues = h; }, getRows: async () => historyRows, addRow: async (row) => historyRows.push(makeRow(row, historyRows)) }
   };
   const titleDescriptor = Object.getOwnPropertyDescriptor(GoogleSpreadsheet.prototype, 'sheetsByTitle');
   const indexDescriptor = Object.getOwnPropertyDescriptor(GoogleSpreadsheet.prototype, 'sheetsByIndex');
@@ -936,6 +956,18 @@ test('billing API keeps rate cards and daily entries admin-only, editable, delet
     assert.equal(clientView.clientId, 'CL-004');
     assert.equal(clientView.totals.total, 24.2);
     assert.equal(clientView.entries, undefined);
+
+    assert.equal((await call('POST', '/admin/billing/history', { clientId: 'CL-004', month: '2026-08', amount: 78.2 }, acme)).status, 401);
+    assert.equal((await call('POST', '/admin/billing/history', { clientId: 'CL-004', month: 'August', amount: 78.2 }, admin)).status, 400);
+    const past = await (await call('POST', '/admin/billing/history', { clientId: 'CL-004', month: '2020-08', amount: 78.2, invoiceNumber: '000061', invoiceDate: '2020-09-03' }, admin)).json();
+    assert.ok(past.success);
+    assert.equal(historyRows[0].get('Invoice_Number'), '000061');
+    assert.equal((await call('PUT', `/admin/billing/history/${past.record.id}`, { amount: 80 }, admin)).status, 200);
+    adminView = await (await call('GET', '/billing/summary?clientId=CL-004', null, admin)).json();
+    assert.deepEqual(adminView.history.map((record) => [record.month, record.amount]), [['2020-08', 80]]);
+    assert.equal(adminView.estimate.historyMonths, 1);
+    assert.equal((await call('DELETE', `/admin/billing/history/${past.record.id}`, null, admin)).status, 200);
+    assert.equal(historyRows.length, 0);
   } finally {
     await new Promise((resolve) => server.close(resolve));
     GoogleSpreadsheet.prototype.loadInfo = oldLoadInfo;

@@ -125,8 +125,7 @@ function monthProgress(month, now = new Date()) {
   return { daysInMonth, daysElapsed, fraction: daysElapsed / daysInMonth };
 }
 
-function summarizeBilling({ rateCard, entries = [], month, now = new Date() }) {
-  const card = sanitizeRateCard(rateCard);
+function buildInvoice(card, entries, month) {
   const monthEntries = entries.filter((entry) => String(entry.date || '').startsWith(`${month}-`));
   const serviceOrder = new Map(card.services.map((service, index) => [service.key, index]));
 
@@ -152,27 +151,103 @@ function summarizeBilling({ rateCard, entries = [], month, now = new Date() }) {
   const flatTotal = money(flatLines.reduce((sum, line) => sum + line.amount, 0));
   const subtotal = money(serviceTotal + flatTotal);
   const tax = money(subtotal * card.taxRate / 100);
-  const progress = monthProgress(month, now);
-  // Only per-unit work is extrapolated; one-off charges like external shipping are added as-is.
-  const projectedSubtotal = progress.fraction > 0 ? money(serviceTotal / progress.fraction + flatTotal) : subtotal;
-  const [year, monthIndex] = month.split('-').map(Number);
+  return { lines, serviceTotal, subtotal, tax, total: money(subtotal + tax) };
+}
 
+const HISTORY_MONTHS = 6;
+
+// Monthly totals before `month`: recorded past invoices win over totals rebuilt from portal entries.
+function pastMonthTotals(card, entries, history, month) {
+  const totals = new Map();
+  const portalMonths = new Set(entries.map((entry) => String(entry.date || '').slice(0, 7)).filter((value) => MONTH_PATTERN.test(value) && value < month));
+  portalMonths.forEach((pastMonth) => totals.set(pastMonth, buildInvoice(card, entries, pastMonth).total));
+  const invoiced = new Map();
+  history.filter((record) => record.month < month).forEach((record) => {
+    invoiced.set(record.month, money((invoiced.get(record.month) || 0) + record.amount));
+  });
+  invoiced.forEach((amount, pastMonth) => totals.set(pastMonth, amount));
+  return [...totals.entries()].sort((a, b) => b[0].localeCompare(a[0])).map(([pastMonth, total]) => ({ month: pastMonth, total }));
+}
+
+function summarizeBilling({ rateCard, entries = [], history = [], month, now = new Date() }) {
+  const card = sanitizeRateCard(rateCard);
+  const { lines, serviceTotal, subtotal, tax, total } = buildInvoice(card, entries, month);
+  const progress = monthProgress(month, now);
+  const recentMonths = pastMonthTotals(card, entries, history, month).slice(0, HISTORY_MONTHS);
+  const historyAverage = recentMonths.length ? money(recentMonths.reduce((sum, item) => sum + item.total, 0) / recentMonths.length) : null;
+
+  // Remaining days are priced at a blend of the client's usual daily spend and this month's pace,
+  // leaning on history early in the month and on actual activity later. One-off charges are not repeated.
+  let projected = total;
+  let basis = 'final';
+  if (progress.fraction === 0) {
+    projected = Math.max(total, historyAverage ?? 0);
+    basis = historyAverage === null ? 'none' : 'history';
+  } else if (progress.fraction < 1) {
+    const daysRemaining = progress.daysInMonth - progress.daysElapsed;
+    const paceDaily = (serviceTotal * (1 + card.taxRate / 100)) / progress.daysElapsed;
+    let daily = 0;
+    if (historyAverage !== null) {
+      daily = (1 - progress.fraction) * (historyAverage / progress.daysInMonth) + progress.fraction * paceDaily;
+      basis = 'history';
+    } else if (progress.daysElapsed >= 7) {
+      daily = paceDaily;
+      basis = 'pace';
+    } else {
+      basis = 'none';
+    }
+    projected = money(total + daily * daysRemaining);
+  }
+
+  const [year, monthIndex] = month.split('-').map(Number);
   return {
     month,
     period: { start: `${monthIndex}/1/${year}`, end: `${monthIndex}/${progress.daysInMonth}/${year}` },
     rateCard: card,
     lines,
-    totals: {
-      subtotal,
-      tax,
-      total: money(subtotal + tax),
-      projected: money(projectedSubtotal + projectedSubtotal * card.taxRate / 100)
-    },
+    totals: { subtotal, tax, total, projected },
+    estimate: { basis, historyAverage, historyMonths: recentMonths.length },
     progress
   };
 }
 
+const HISTORY_SHEET = 'Billing_History';
+const BILLING_HISTORY_HEADERS = ['History_ID', 'Client_ID', 'Service_Month', 'Invoice_Date', 'Invoice_Number', 'Description', 'Amount', 'Updated_At'];
+
+function historyFromRow(row) {
+  return {
+    id: String(row.get('History_ID') || ''),
+    month: String(row.get('Service_Month') || '').trim(),
+    invoiceDate: String(row.get('Invoice_Date') || '').trim(),
+    invoiceNumber: String(row.get('Invoice_Number') || '').trim(),
+    description: String(row.get('Description') || '').trim(),
+    amount: money(row.get('Amount'))
+  };
+}
+
+function sanitizeHistory(input = {}, existing = null) {
+  const month = String(input.month ?? existing?.month ?? '').trim();
+  if (!MONTH_PATTERN.test(month)) return { error: 'Choose the month the services were for.' };
+  const amount = Number(input.amount ?? existing?.amount);
+  if (isBlank(input.amount ?? existing?.amount) || !Number.isFinite(amount) || amount < 0 || amount > MAX_AMOUNT) return { error: 'Enter the invoice amount.' };
+  const invoiceDate = String(input.invoiceDate ?? existing?.invoiceDate ?? '').trim();
+  if (invoiceDate && !isValidDate(invoiceDate)) return { error: 'Invoice date is not valid.' };
+  return {
+    record: {
+      month,
+      amount: money(amount),
+      invoiceDate,
+      invoiceNumber: String(input.invoiceNumber ?? existing?.invoiceNumber ?? '').trim().slice(0, 30),
+      description: String(input.description ?? existing?.description ?? '').trim().slice(0, 120)
+    }
+  };
+}
+
 module.exports = {
+  HISTORY_SHEET,
+  BILLING_HISTORY_HEADERS,
+  historyFromRow,
+  sanitizeHistory,
   RATE_SHEET,
   ENTRY_SHEET,
   BILLING_RATE_HEADERS,

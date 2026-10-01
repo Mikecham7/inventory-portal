@@ -242,6 +242,7 @@ const state = {
   quickEditUnlock: null,
   billing: null,
   billingEditId: null,
+  historyEditId: null,
   rateCardClientId: null,
   rateServices: [],
   query: '',
@@ -1391,6 +1392,7 @@ function switchClientView(clientId) {
   state.quickEditUnlock = null;
   state.billing = null;
   state.billingEditId = null;
+  state.historyEditId = null;
   state.rateCardClientId = null;
   // A product picked on the Update page belongs to the previous client; never adjust it under the new one.
   state.selectedItemId = null;
@@ -1539,6 +1541,7 @@ function executePortalLogout() {
   state.filters = emptyFilters();
   state.billing = null;
   state.billingEditId = null;
+  state.historyEditId = null;
   state.rateCardClientId = null;
   syncBillingTab();
   renderBilling();
@@ -2057,6 +2060,16 @@ document.addEventListener('click', (event) => {
   if (action === 'billing-cancel') cancelBillingEdit();
   if (action === 'billing-save') saveBillingEdit(element.dataset.id);
   if (action === 'billing-delete') deleteBillingEntry(element.dataset.id);
+  if (action === 'history-edit') {
+    state.historyEditId = element.dataset.id;
+    renderBillingHistory({ force: true });
+  }
+  if (action === 'history-cancel') {
+    state.historyEditId = null;
+    renderBillingHistory({ force: true });
+  }
+  if (action === 'history-save') saveBillingHistoryEdit(element.dataset.id);
+  if (action === 'history-delete') deleteBillingHistory(element.dataset.id);
 
   if (action === 'adjust') {
     const direction = Number(element.dataset.direction || 1);
@@ -2570,7 +2583,7 @@ function renderBilling(message = '') {
     messageEl.hidden = !message;
     messageEl.textContent = message;
   }
-  ['billingAdminEntry', 'billingAdminRates'].forEach((id) => {
+  ['billingAdminEntry', 'billingAdminRates', 'billingAdminHistory'].forEach((id) => {
     const el = document.getElementById(id);
     if (el) el.hidden = !(state.isAdmin && summary);
   });
@@ -2581,8 +2594,12 @@ function renderBilling(message = '') {
     return;
   }
 
-  const { totals, lines, progress, period, rateCard } = summary;
+  const { totals, lines, progress, period, rateCard, estimate = {} } = summary;
   const finalMonth = progress.fraction >= 1;
+  const estimateNote = finalMonth ? ''
+    : estimate.basis === 'history' ? `Based on the ${estimate.historyMonths}-month average of ${formatMoney(estimate.historyAverage)}, adjusted for this month's activity`
+      : estimate.basis === 'pace' ? "Based on this month's pace so far"
+        : 'Not enough history yet — showing what has been billed so far';
   const lineRows = lines.length ? lines.map((line) => `
     <tr>
       <td>
@@ -2597,7 +2614,7 @@ function renderBilling(message = '') {
   host.innerHTML = `
     ${summary.configured ? '' : `<div class="ac-note">No rate card saved yet${state.isAdmin ? ' — add this client\'s services below.' : '.'}</div>`}
     <div class="billing-totals">
-      <div class="billing-total primary"><span>${finalMonth ? 'Month total' : 'Estimated end of month'}</span><strong>${formatMoney(finalMonth ? totals.total : totals.projected)}</strong></div>
+      <div class="billing-total primary"><span>${finalMonth ? 'Month total' : 'Estimated end of month'}</span><strong>${formatMoney(finalMonth ? totals.total : totals.projected)}</strong>${estimateNote ? `<small>${escapeHtml(estimateNote)}</small>` : ''}</div>
       <div class="billing-total"><span>Billed so far</span><strong>${formatMoney(totals.total)}</strong></div>
     </div>
     <div class="billing-progress" role="progressbar" aria-label="Month progress" aria-valuemin="0" aria-valuemax="${progress.daysInMonth}" aria-valuenow="${progress.daysElapsed}">
@@ -2620,6 +2637,118 @@ function renderBilling(message = '') {
 
   renderBillingServiceOptions();
   renderBillingEntries();
+  renderBillingHistory();
+}
+
+function formatServiceMonth(month) {
+  const [year, monthIndex] = String(month).split('-').map(Number);
+  return year && monthIndex ? new Date(year, monthIndex - 1, 1).toLocaleDateString([], { month: 'short', year: 'numeric' }) : month;
+}
+
+function renderBillingHistory({ force = false } = {}) {
+  const host = document.getElementById('billingHistory');
+  if (!host || (state.historyEditId && !force)) return;
+  const history = state.billing?.history || [];
+  if (!history.length) {
+    host.innerHTML = '<div class="no-results" style="padding:12px;">No past invoices yet.</div>';
+    return;
+  }
+  host.innerHTML = history.map((record) => {
+    const id = escapeHtml(record.id);
+    if (record.id === state.historyEditId) {
+      return `
+        <div class="billing-entry editing">
+          <div class="billing-edit-grid">
+            <label>Services for month<input type="month" class="ac-input he-month" value="${escapeHtml(record.month)}" /></label>
+            <label>Amount ($)<input type="number" class="ac-input he-amount" min="0" step="0.01" value="${escapeHtml(record.amount)}" /></label>
+            <label>Invoice #<input type="text" class="ac-input he-number" maxlength="30" value="${escapeHtml(record.invoiceNumber)}" /></label>
+            <label>Invoice date<input type="date" class="ac-input he-date" value="${escapeHtml(record.invoiceDate)}" /></label>
+            <label class="billing-edit-note">Description<input type="text" class="ac-input he-description" maxlength="120" value="${escapeHtml(record.description)}" /></label>
+          </div>
+          <div class="billing-entry-actions">
+            <button type="button" class="btn-set" data-action="history-save" data-id="${id}">Save</button>
+            <button type="button" class="billing-link" data-action="history-cancel">Cancel</button>
+          </div>
+        </div>
+      `;
+    }
+    const meta = [record.invoiceNumber && `#${record.invoiceNumber}`, record.invoiceDate && `sent ${record.invoiceDate}`, record.description].filter(Boolean).join(' · ');
+    return `
+      <div class="billing-entry">
+        <div class="billing-entry-main">
+          <strong>${escapeHtml(formatServiceMonth(record.month))}</strong>
+          ${meta ? `<div class="billing-entry-meta">${escapeHtml(meta)}</div>` : ''}
+        </div>
+        <div class="billing-entry-amount">${formatMoney(record.amount)}</div>
+        <div class="billing-entry-actions">
+          <button type="button" class="billing-link" data-action="history-edit" data-id="${id}">Edit</button>
+          <button type="button" class="billing-link danger" data-action="history-delete" data-id="${id}">Delete</button>
+        </div>
+      </div>
+    `;
+  }).join('');
+}
+
+async function sendBillingHistory(method, path, body) {
+  const response = await fetch(`${ADMIN_BILLING_URL}/history${path}`, {
+    method,
+    headers: adminHeaders({ 'Content-Type': 'application/json' }),
+    ...(body ? { body: JSON.stringify(body) } : {})
+  });
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok || !result.success) throw new Error(result.error || 'Unable to save past invoice.');
+  return result;
+}
+
+async function submitBillingHistory() {
+  const value = (id) => document.getElementById(id)?.value ?? '';
+  try {
+    await sendBillingHistory('POST', '', {
+      clientId: state.activeClientId,
+      month: value('histMonth'),
+      amount: value('histAmount'),
+      invoiceNumber: value('histNumber'),
+      invoiceDate: value('histDate'),
+      description: value('histDescription')
+    });
+    ['histMonth', 'histAmount', 'histNumber', 'histDate', 'histDescription'].forEach((id) => {
+      const input = document.getElementById(id);
+      if (input) input.value = '';
+    });
+    showToast('Past invoice added', 'success');
+    await loadBillingSummary(state.activeClientId);
+  } catch (error) {
+    showToast(error.message, 'error');
+  }
+}
+
+async function saveBillingHistoryEdit(id) {
+  const form = document.querySelector('#billingHistory .billing-entry.editing');
+  if (!form) return;
+  const read = (selector) => form.querySelector(selector)?.value ?? '';
+  try {
+    await sendBillingHistory('PUT', `/${encodeURIComponent(id)}`, {
+      month: read('.he-month'), amount: read('.he-amount'), invoiceNumber: read('.he-number'), invoiceDate: read('.he-date'), description: read('.he-description')
+    });
+    state.historyEditId = null;
+    showToast('Past invoice updated', 'success');
+    await loadBillingSummary(state.activeClientId);
+  } catch (error) {
+    showToast(error.message, 'error');
+  }
+}
+
+async function deleteBillingHistory(id) {
+  const record = (state.billing?.history || []).find((item) => item.id === id);
+  if (!record || !window.confirm(`Delete the ${formatServiceMonth(record.month)} invoice for ${formatMoney(record.amount)}?`)) return;
+  try {
+    await sendBillingHistory('DELETE', `/${encodeURIComponent(id)}`);
+    if (state.historyEditId === id) state.historyEditId = null;
+    showToast('Past invoice deleted', 'success');
+    await loadBillingSummary(state.activeClientId);
+  } catch (error) {
+    showToast(error.message, 'error');
+  }
 }
 
 function renderBillingServiceOptions() {
@@ -2654,6 +2783,7 @@ function onBillingServiceChange() {
 
 function onBillingMonthChange() {
   state.billingEditId = null;
+  state.historyEditId = null;
   const month = getBillingMonth();
   const date = document.getElementById('billingDate');
   const today = new Date().toISOString().slice(0, 10);

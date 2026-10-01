@@ -351,6 +351,35 @@
         <div id="billingEntries"></div>
       </div>
 
+      <div class="update-card" id="billingAdminHistory" hidden>
+        <h2>🗂️ Past Invoices</h2>
+        <p class="billing-hint">Totals from invoices you've already sent this client. The month-end estimate uses their last 6 months. Saved in the Billing_History sheet tab.</p>
+        <div class="billing-entry-form history-form">
+          <div>
+            <label class="ac-label" for="histMonth">Services for month</label>
+            <input type="month" id="histMonth" class="ac-input" />
+          </div>
+          <div>
+            <label class="ac-label" for="histAmount">Amount ($)</label>
+            <input type="number" id="histAmount" class="ac-input" min="0" step="0.01" />
+          </div>
+          <div>
+            <label class="ac-label" for="histNumber">Invoice #</label>
+            <input type="text" id="histNumber" class="ac-input" maxlength="30" placeholder="000062" />
+          </div>
+          <div>
+            <label class="ac-label" for="histDate">Invoice date</label>
+            <input type="date" id="histDate" class="ac-input" />
+          </div>
+          <div class="billing-entry-note">
+            <label class="ac-label" for="histDescription">Description (optional)</label>
+            <input type="text" id="histDescription" class="ac-input" maxlength="120" placeholder="e.g. FBA/FBM Services" />
+          </div>
+        </div>
+        <button type="button" class="btn-set" style="margin-top:10px;" onclick="submitBillingHistory()">Add past invoice</button>
+        <div id="billingHistory" style="margin-top:12px;"></div>
+      </div>
+
       <div class="update-card" id="billingAdminRates" hidden>
         <h2>⚙️ Rate Card</h2>
         <p class="billing-hint">The services you bill this client for and their price each. Add the same service twice with a different description for a second rate (e.g. Bundling / Oversized Bundle). Saved in the Billing_Rate_Cards sheet tab.</p>

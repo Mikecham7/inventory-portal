@@ -7,7 +7,7 @@ const { GoogleSpreadsheet } = require('google-spreadsheet');
 const { JWT } = require('google-auth-library');
 const { normalizeInventoryRow, getSheetNameForClient, isAdminClient, getChatSenderRole, getClientInventoryFields, getDashboardColumns, getCreateFormTitleConfig, getChatDriveFolderForClient, isGoogleDriveUrl, normalizeDriveFolderUrl, getShipmentStage, findShipmentFieldKeys, SHIPMENT_STATUS_TEXT } = require('./portalLogic');
 const { mapClientSettings, settingsFromInput, isValidQuickEditPin, planClientSettingsMigration } = require('./clientSchema');
-const { RATE_SHEET, ENTRY_SHEET, BILLING_RATE_HEADERS, BILLING_ENTRY_HEADERS, MONTH_PATTERN, sanitizeRateCard, rateCardFromRow, entryFromRow, sanitizeEntry, currentMonth, summarizeBilling } = require('./billing');
+const { RATE_SHEET, ENTRY_SHEET, HISTORY_SHEET, BILLING_RATE_HEADERS, BILLING_ENTRY_HEADERS, BILLING_HISTORY_HEADERS, MONTH_PATTERN, sanitizeRateCard, rateCardFromRow, entryFromRow, sanitizeEntry, historyFromRow, sanitizeHistory, currentMonth, summarizeBilling } = require('./billing');
 
 dotenv.config();
 
@@ -1790,6 +1790,11 @@ async function loadBillingEntries(clientId) {
   return rows.filter((row) => normalizeClientId(row.get('Client_ID')) === clientId).map(entryFromRow);
 }
 
+async function loadBillingHistory(clientId) {
+  const rows = await loadNotificationRows(HISTORY_SHEET);
+  return rows.filter((row) => normalizeClientId(row.get('Client_ID')) === clientId).map(historyFromRow);
+}
+
 function isBillableClient(clientId) {
   return /^CL-\d{3,}$/.test(clientId) && clientId !== 'CL-000';
 }
@@ -1804,12 +1809,12 @@ app.get('/api/billing/summary', async (req, res) => {
     if (!isBillableClient(clientId) || !MONTH_PATTERN.test(month)) {
       return res.status(400).json({ message: 'Choose a client and a valid month.' });
     }
-    const [rateRow, entries] = await Promise.all([loadBillingRateRow(clientId), loadBillingEntries(clientId)]);
+    const [rateRow, entries, history] = await Promise.all([loadBillingRateRow(clientId), loadBillingEntries(clientId), loadBillingHistory(clientId)]);
     const rateCard = rateCardFromRow(rateRow);
     if (!staff && !rateCard.clientVisible) {
       return res.status(403).json({ message: 'Billing is not shared for this account.' });
     }
-    const summary = summarizeBilling({ rateCard, entries, month });
+    const summary = summarizeBilling({ rateCard, entries, history, month });
     return res.json({
       clientId,
       configured: Boolean(rateRow),
@@ -1817,7 +1822,8 @@ app.get('/api/billing/summary', async (req, res) => {
       ...(staff ? {
         entries: entries
           .filter((entry) => entry.date.startsWith(`${month}-`))
-          .sort((a, b) => b.date.localeCompare(a.date) || b.updatedAt.localeCompare(a.updatedAt))
+          .sort((a, b) => b.date.localeCompare(a.date) || b.updatedAt.localeCompare(a.updatedAt)),
+        history: history.sort((a, b) => b.month.localeCompare(a.month) || b.invoiceDate.localeCompare(a.invoiceDate))
       } : {})
     });
   } catch (error) {
@@ -1925,6 +1931,70 @@ app.delete('/api/admin/billing/entries/:entryId', async (req, res) => {
   } catch (error) {
     console.error('Billing entry delete error:', error.message);
     return res.status(error?.response?.status === 429 ? 429 : 500).json({ success: false, error: 'Unable to delete billing entry.' });
+  }
+});
+
+function billingHistoryValues(record, clientId) {
+  return {
+    Client_ID: clientId,
+    Service_Month: record.month,
+    Invoice_Date: record.invoiceDate,
+    Invoice_Number: record.invoiceNumber,
+    Description: record.description,
+    Amount: record.amount,
+    Updated_At: new Date().toISOString()
+  };
+}
+
+async function findBillingHistoryRow(historyId) {
+  const sheet = await getOrCreateSheet(HISTORY_SHEET, BILLING_HISTORY_HEADERS);
+  const rows = await withRetry(() => sheet.getRows());
+  return rows.find((row) => String(row.get('History_ID')) === historyId) || null;
+}
+
+app.post('/api/admin/billing/history', async (req, res) => {
+  try {
+    const clientId = normalizeClientId(req.body?.clientId);
+    if (!isBillableClient(clientId)) return res.status(400).json({ success: false, error: 'Choose a client.' });
+    const { record, error } = sanitizeHistory(req.body || {});
+    if (error) return res.status(400).json({ success: false, error });
+    const sheet = await getOrCreateSheet(HISTORY_SHEET, BILLING_HISTORY_HEADERS);
+    const id = crypto.randomUUID();
+    await withRetry(() => sheet.addRow({ History_ID: id, ...billingHistoryValues(record, clientId) }));
+    invalidateReadCache(`rows:${HISTORY_SHEET}`);
+    return res.json({ success: true, record: { id, ...record } });
+  } catch (error) {
+    console.error('Billing history error:', error.message);
+    return res.status(error?.response?.status === 429 ? 429 : 500).json({ success: false, error: 'Unable to save past invoice.' });
+  }
+});
+
+app.put('/api/admin/billing/history/:historyId', async (req, res) => {
+  try {
+    const row = await findBillingHistoryRow(String(req.params.historyId));
+    if (!row) return res.status(404).json({ success: false, error: 'That invoice no longer exists.' });
+    const { record, error } = sanitizeHistory(req.body || {}, historyFromRow(row));
+    if (error) return res.status(400).json({ success: false, error });
+    Object.entries(billingHistoryValues(record, normalizeClientId(row.get('Client_ID')))).forEach(([key, value]) => row.set(key, value));
+    await withRetry(() => row.save());
+    invalidateReadCache(`rows:${HISTORY_SHEET}`);
+    return res.json({ success: true, record: { id: req.params.historyId, ...record } });
+  } catch (error) {
+    console.error('Billing history update error:', error.message);
+    return res.status(error?.response?.status === 429 ? 429 : 500).json({ success: false, error: 'Unable to update past invoice.' });
+  }
+});
+
+app.delete('/api/admin/billing/history/:historyId', async (req, res) => {
+  try {
+    const row = await findBillingHistoryRow(String(req.params.historyId));
+    if (!row) return res.status(404).json({ success: false, error: 'That invoice no longer exists.' });
+    await withRetry(() => row.delete());
+    invalidateReadCache(`rows:${HISTORY_SHEET}`);
+    return res.json({ success: true });
+  } catch (error) {
+    console.error('Billing history delete error:', error.message);
+    return res.status(error?.response?.status === 429 ? 429 : 500).json({ success: false, error: 'Unable to delete past invoice.' });
   }
 });
 
