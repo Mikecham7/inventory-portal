@@ -44,6 +44,9 @@ const UPDATE_QUANTITY_URL = window.location.hostname === 'localhost' || window.l
 const QUICK_EDIT_UNLOCK_URL = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
   ? 'http://localhost:3001/api/quick-edit/unlock'
   : '/api/quick-edit/unlock';
+const UPDATE_SHIPMENT_URL = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
+  ? 'http://localhost:3001/api/inventory/shipment'
+  : '/api/inventory/shipment';
 const BILLING_URL = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
   ? 'http://localhost:3001/api/billing/summary'
   : '/api/billing/summary';
@@ -238,8 +241,9 @@ const state = {
   filters: { stock: [], stage: [], attr: [] },
   quickEditUnlock: null,
   billing: null,
+  billingEditId: null,
   rateCardClientId: null,
-  rateMaterials: [],
+  rateServices: [],
   query: '',
   selectedItemId: null,
   auth: false,
@@ -530,25 +534,34 @@ function showPage(pageName, markChatRead = true) {
   }
 }
 
+// Clients whose fields include a received and a shipped quantity follow the warehouse shipment workflow.
+function getShipmentFieldKeys(clientId) {
+  const safeClientId = String(clientId || '').trim().toUpperCase();
+  const profile = state.clientProfile && state.clientProfile.clientId === safeClientId ? state.clientProfile : null;
+  const fields = (profile ? profile.fields : CLIENT_INVENTORY_FIELDS[safeClientId]?.fields) || [];
+  const find = (pattern) => fields.find((field) => pattern.test(`${field.key} ${field.label}`))?.key || null;
+  const received = find(/received/i);
+  const shipped = find(/shipped/i);
+  return received && shipped ? { received, shipped } : null;
+}
+
+function getShipmentStage(received, shipped) {
+  const receivedCount = toNumber(received);
+  const shippedCount = toNumber(shipped);
+  if (shippedCount > 0 && shippedCount >= receivedCount) return 'fully';
+  if (shippedCount > 0) return 'partial';
+  return receivedCount > 0 ? 'not' : 'awaiting';
+}
+
 function getShippingStatus(item = {}) {
   const clientId = String(item.clientId || state.activeClientId || state.session?.clientId || 'CL-001').trim().toUpperCase();
-  if (!['CL-002', 'CL-003'].includes(clientId)) {
-    return 'in';
-  }
-
-  const ordered = Number(String(item.quantityOrdered ?? item.ordered ?? item.quantity ?? '').replace(/[^0-9.-]/g, '')) || 0;
-  const shipped = Number(String(item.quantityShipped ?? item.shipped ?? '').replace(/[^0-9.-]/g, '')) || 0;
-
-  if (shipped <= 0) return 'not';
-  if (ordered > 0 && shipped < ordered) return 'partial';
-  return 'fully';
+  const keys = getShipmentFieldKeys(clientId);
+  return keys ? getShipmentStage(item[keys.received], item[keys.shipped]) : null;
 }
 
 function getItemStatus(item) {
-  const clientId = String(item.clientId || state.activeClientId || state.session?.clientId || 'CL-001').trim().toUpperCase();
-  if (clientId === 'CL-002' || clientId === 'CL-003') {
-    return getShippingStatus(item);
-  }
+  const shipping = getShippingStatus(item);
+  if (shipping) return shipping;
 
   const qty = Number(item.qty ?? item.quantity ?? 0);
   if (!Number.isFinite(qty) || qty <= 0) return 'out';
@@ -560,6 +573,7 @@ function getStatusText(status) {
   if (status === 'fully') return 'Fully Shipped';
   if (status === 'partial') return 'Partially Shipped';
   if (status === 'not') return 'Not Shipped';
+  if (status === 'awaiting') return 'Not Received';
   if (status === 'out') return 'Out of Stock';
   if (status === 'low') return 'Low Stock';
   return 'In Stock';
@@ -569,6 +583,7 @@ function getStatusBadgeClass(status) {
   if (status === 'fully') return 'badge-fully';
   if (status === 'partial') return 'badge-partial';
   if (status === 'not') return 'badge-not';
+  if (status === 'awaiting') return 'badge-awaiting';
   if (status === 'out') return 'badge-out';
   if (status === 'low') return 'badge-low';
   return 'badge-in';
@@ -593,7 +608,7 @@ async function fetchClientProfile(clientId = state.activeClientId || state.sessi
 
 function getFilterConfig(clientId = state.activeClientId || state.session?.clientId || 'CL-001') {
   const safeClientId = String(clientId || '').trim().toUpperCase();
-  const shippingClient = safeClientId === 'CL-002' || safeClientId === 'CL-003';
+  const shippingClient = Boolean(getShipmentFieldKeys(safeClientId));
   if (shippingClient) {
     return {
       mode: 'shipping',
@@ -619,7 +634,7 @@ function getFilterConfig(clientId = state.activeClientId || state.session?.clien
 
 const FILTER_GROUPS = [
   { key: 'stock', label: 'Stock Levels', options: [['in', 'In Stock'], ['low', 'Low Stock'], ['out', 'Out of Stock'], ['over', 'Overstock'], ['negative', 'Negative Inventory']] },
-  { key: 'stage', label: 'Fulfillment Stages', options: [['not', 'Not Shipped'], ['partial', 'Partially Shipped'], ['fully', 'Fully Shipped'], ['label', 'Ready for Label'], ['exception', 'Exception / Delivery Issue']] },
+  { key: 'stage', label: 'Fulfillment Stages', options: [['awaiting', 'Not Received'], ['not', 'Not Shipped'], ['partial', 'Partially Shipped'], ['fully', 'Fully Shipped'], ['label', 'Ready for Label'], ['exception', 'Exception / Delivery Issue']] },
   { key: 'attr', label: 'Attributes & Time', options: [['bundled', 'Bundled'], ['unbundled', 'Non-Bundled'], ['fragile', 'Fragile'], ['oversized', 'Oversized'], ['aged', 'Aged Orders (>48h)'], ['dead', 'Dead Stock']] }
 ];
 const AGED_ORDER_MS = 48 * 60 * 60 * 1000;
@@ -653,17 +668,12 @@ function getFulfillmentStage(item) {
   const text = `${item.status || ''} ${item.notes || ''} ${item.fulfillment || ''}`.toLowerCase();
   if (/exception|delivery issue|lost|damaged|returned to sender/.test(text)) return 'exception';
   if (/ready for label/.test(text)) return 'label';
-  const hasShipmentNumbers = String(item.quantityOrdered ?? '').trim() !== '' || String(item.quantityShipped ?? '').trim() !== '';
-  if (hasShipmentNumbers) {
-    const ordered = toNumber(item.quantityOrdered);
-    const shipped = toNumber(item.quantityShipped);
-    if (shipped <= 0) return 'not';
-    if (ordered > 0 && shipped < ordered) return 'partial';
-    return 'fully';
-  }
+  const shipping = getShippingStatus(item);
+  if (shipping) return shipping;
   if (/fully shipped|delivered/.test(text)) return 'fully';
   if (/partially shipped/.test(text)) return 'partial';
   if (/not shipped/.test(text)) return 'not';
+  if (/not received/.test(text)) return 'awaiting';
   return null;
 }
 
@@ -867,6 +877,7 @@ function scrollInventoryTable(direction) {
 function renderTable() {
   const items = getFilteredItems();
   renderFilterControls(items.length);
+  if (isPageActive('page-logs')) renderLogs();
   if (!inventoryBody) return;
 
   syncDashboardColumns();
@@ -1251,8 +1262,7 @@ function syncAddTabVisibility() {
 }
 
 const ITEM_FORMS = {
-  inventory: { prefix: 'newProduct', fieldPrefix: 'customField_', fieldsHost: 'customProductFields', submit: 'createProductSubmit', notice: 'createProductReadOnlyNotice' },
-  order: { prefix: 'newOrder', fieldPrefix: 'orderField_', fieldsHost: 'orderProductFields', submit: 'createOrderSubmit', notice: 'createOrderReadOnlyNotice' }
+  inventory: { prefix: 'newProduct', fieldPrefix: 'customField_', fieldsHost: 'customProductFields', submit: 'createProductSubmit', notice: 'createProductReadOnlyNotice' }
 };
 
 // Custom fields for one form, minus any the admin switched off for this client and form.
@@ -1380,7 +1390,16 @@ function switchClientView(clientId) {
   state.filters = emptyFilters();
   state.quickEditUnlock = null;
   state.billing = null;
+  state.billingEditId = null;
   state.rateCardClientId = null;
+  // A product picked on the Update page belongs to the previous client; never adjust it under the new one.
+  state.selectedItemId = null;
+  if (selectedItem) selectedItem.style.display = 'none';
+  if (searchInput) searchInput.value = '';
+  if (searchResults) {
+    searchResults.style.display = 'none';
+    searchResults.innerHTML = '';
+  }
   state.query = '';
   state.clientProfile = cached.profile || null;
   state.items = cached.items || [];
@@ -1519,6 +1538,7 @@ function executePortalLogout() {
   state.quickEditUnlock = null;
   state.filters = emptyFilters();
   state.billing = null;
+  state.billingEditId = null;
   state.rateCardClientId = null;
   syncBillingTab();
   renderBilling();
@@ -1670,19 +1690,24 @@ function goToDashboard() {
 
 function goToLogs() {
   setPage('page-logs');
-  if (logTableWrap) {
-    const rows = getFilteredItems();
-    logTableWrap.innerHTML = rows.length
-      ? rows.map((item) => `
-          <div class="log-entry">
-            <span class="log-ts">${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
-            <span class="log-sku">${item.sku || 'N/A'}</span>
-            <span class="log-desc">${item.title || 'Inventory update'}</span>
-            <span class="log-change ${getItemStatus(item) === 'out' ? 'rem' : 'add'}">${getStatusText(getItemStatus(item))}</span>
-          </div>
-        `).join('')
-      : '<div class="no-results" style="padding:30px;">No activity to display.</div>';
-  }
+  renderLogs();
+}
+
+// Re-run from renderTable so the log always reflects the client currently selected.
+function renderLogs() {
+  if (!logTableWrap) return;
+  const value = (document.getElementById('logSearch')?.value || '').trim().toLowerCase();
+  const rows = getFilteredItems().filter((item) => !value || `${item.sku} ${item.title}`.toLowerCase().includes(value));
+  logTableWrap.innerHTML = rows.length
+    ? rows.map((item) => `
+        <div class="log-entry">
+          <span class="log-ts">${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
+          <span class="log-sku">${escapeHtml(item.sku || 'N/A')}</span>
+          <span class="log-desc">${escapeHtml(item.title || 'Inventory update')}</span>
+          <span class="log-change ${getItemStatus(item) === 'out' ? 'rem' : 'add'}">${getStatusText(getItemStatus(item))}</span>
+        </div>
+      `).join('')
+    : `<div class="no-results" style="padding:30px;">${value ? 'No matching log entries.' : 'No activity to display.'}</div>`;
 }
 
 function insertEmoji(emoji) {
@@ -1772,9 +1797,9 @@ function filterSearch() {
   }
 
   searchResults.innerHTML = matches.slice(0, 6).map((item) => `
-    <div class="sri" data-id="${item.id}" data-action="select-item">
-      <div class="sc">${item.sku || 'N/A'}</div>
-      <div class="st">${item.title || 'Inventory item'}</div>
+    <div class="sri" data-id="${escapeHtml(item.id)}" data-action="select-item">
+      <div class="sc">${escapeHtml(item.sku || 'N/A')}</div>
+      <div class="st">${escapeHtml(item.title || 'Inventory item')}</div>
     </div>
   `).join('');
   searchResults.style.display = 'block';
@@ -1792,11 +1817,84 @@ function selectItem(id) {
   if (selTitle) selTitle.textContent = item.title || 'Inventory item';
   if (selQty) selQty.textContent = item.qty ?? item.quantity ?? 0;
   if (selBadge) {
-    selBadge.className = `badge ${status === 'out' ? 'badge-out' : status === 'low' ? 'badge-low' : 'badge-in'}`;
+    selBadge.className = `badge ${getStatusBadgeClass(status)}`;
     selBadge.textContent = statusText;
   }
   if (searchResults) {
     searchResults.style.display = 'none';
+  }
+
+  const keys = getShipmentFieldKeys(item.clientId || state.activeClientId);
+  const shipmentEditor = document.getElementById('shipmentEditor');
+  const stockEditor = document.getElementById('stockEditor');
+  if (shipmentEditor) shipmentEditor.hidden = !keys;
+  if (stockEditor) stockEditor.hidden = Boolean(keys);
+  if (!keys) return;
+
+  const current = document.getElementById('shipCurrent');
+  if (current) {
+    current.className = `badge ${getStatusBadgeClass(status)}`;
+    current.textContent = statusText;
+  }
+  const received = document.getElementById('shipReceived');
+  const shipped = document.getElementById('shipShipped');
+  if (received) received.value = toNumber(item[keys.received]);
+  if (shipped) shipped.value = toNumber(item[keys.shipped]);
+  // Received and shipped counts are recorded by ECL staff, so clients only see them.
+  [received, shipped].forEach((input) => { if (input) input.disabled = !state.isAdmin; });
+  const save = document.getElementById('shipSave');
+  if (save) save.hidden = !state.isAdmin;
+  const hint = document.getElementById('shipmentHint');
+  if (hint) {
+    hint.textContent = state.isAdmin
+      ? 'Enter how many have arrived at the warehouse, then how many have shipped out.'
+      : 'Your ECL team updates these as items arrive at the warehouse and ship out.';
+  }
+  previewShipment();
+}
+
+function previewShipment() {
+  const preview = document.getElementById('shipPreview');
+  if (!preview) return;
+  const received = toNumber(document.getElementById('shipReceived')?.value);
+  const shipped = toNumber(document.getElementById('shipShipped')?.value);
+  const stage = getShipmentStage(received, shipped);
+  preview.className = `badge ${getStatusBadgeClass(stage)}`;
+  preview.textContent = shipped > received ? 'Shipped is more than received' : getStatusText(stage);
+}
+
+async function saveShipment() {
+  const item = state.items.find((entry) => String(entry.id) === String(state.selectedItemId));
+  if (!item) {
+    showToast('Select an item first', 'error');
+    return;
+  }
+  const clientId = state.activeClientId;
+  const received = Number(document.getElementById('shipReceived')?.value || 0);
+  const shipped = Number(document.getElementById('shipShipped')?.value || 0);
+  try {
+    const response = await fetch(UPDATE_SHIPMENT_URL, {
+      method: 'PUT',
+      headers: adminHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ clientId, itemId: item.id, title: item.title, received, shipped })
+    });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok || !result.success) throw new Error(result.error || 'Unable to update shipment.');
+    if (clientId !== state.activeClientId) return;
+    const keys = getShipmentFieldKeys(clientId);
+    if (keys) {
+      item[keys.received] = String(received);
+      item[keys.shipped] = String(shipped);
+    }
+    item.status = result.status;
+    inventorySignature = null;
+    updateSummary();
+    renderTable();
+    selectItem(item.id);
+    showToast(`Saved — ${result.status}`, 'success');
+    await fetchInventory(clientId);
+  } catch (error) {
+    showToast(error.message || 'Unable to update shipment', 'error');
   }
 }
 
@@ -1856,9 +1954,8 @@ async function setExactQty() {
   await saveQuantity(item, Math.max(0, val));
 }
 
-async function createProduct(kind = 'inventory') {
-  const form = ITEM_FORMS[kind] || ITEM_FORMS.inventory;
-  const isOrder = form === ITEM_FORMS.order;
+async function createProduct() {
+  const form = ITEM_FORMS.inventory;
   const clientId = state.activeClientId || state.session?.clientId || 'CL-001';
   const config = getClientInventoryFields(clientId);
   const isCardClient = clientId === 'CL-003';
@@ -1875,7 +1972,7 @@ async function createProduct(kind = 'inventory') {
   const title = (titleInput?.value?.trim() || productNameInput?.value?.trim() || '');
   const qty = Number(document.getElementById(`${form.prefix}Qty`)?.value ?? 0);
   const extraFields = {};
-  const allowedFields = getFormFields(clientId, isOrder ? 'order' : 'inventory');
+  const allowedFields = getFormFields(clientId, 'inventory');
 
   allowedFields.forEach((field) => {
     if ((field.key === 'quantityReceived' || field.key === 'quantityShipped') && !state.isAdmin) return;
@@ -1892,7 +1989,7 @@ async function createProduct(kind = 'inventory') {
     const response = await fetch(CREATE_ITEM_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${state.session?.notificationToken || ''}` },
-      body: JSON.stringify({ clientId, kind: isOrder ? 'order' : 'inventory', sku: sku || title, title, qty, status: isOrder ? 'Not Shipped' : (qty <= 5 ? 'Low Stock' : 'In Stock'), extraFields, isAdmin: state.isAdmin, role: state.session?.role || (state.isAdmin ? 'admin' : 'client') })
+      body: JSON.stringify({ clientId, sku: sku || title, title, qty, status: qty <= 5 ? 'Low Stock' : 'In Stock', extraFields, isAdmin: state.isAdmin, role: state.session?.role || (state.isAdmin ? 'admin' : 'client') })
     });
 
     const result = await response.json().catch(() => ({ success: false, error: 'Create failed' }));
@@ -1911,26 +2008,14 @@ async function createProduct(kind = 'inventory') {
       if (input) input.value = '';
     });
     await fetchInventory(clientId);
-    showToast(isOrder ? 'Order added successfully' : 'Product added successfully', 'success');
+    showToast('Item added successfully', 'success');
   } catch (error) {
     showToast(error.message || 'Unable to add product', 'error');
   }
 }
 
 function filterLogs() {
-  if (!logTableWrap) return;
-  const value = (document.getElementById('logSearch')?.value || '').trim().toLowerCase();
-  const rows = getFilteredItems().filter((item) => `${item.sku} ${item.title}`.toLowerCase().includes(value));
-  logTableWrap.innerHTML = rows.length
-    ? rows.map((item) => `
-        <div class="log-entry">
-          <span class="log-ts">Now</span>
-          <span class="log-sku">${item.sku || 'N/A'}</span>
-          <span class="log-desc">${item.title || 'Inventory changed'}</span>
-          <span class="log-change ${getItemStatus(item) === 'out' ? 'rem' : 'add'}">${getStatusText(getItemStatus(item))}</span>
-        </div>
-      `).join('')
-    : '<div class="no-results" style="padding:30px;">No matching log entries.</div>';
+  renderLogs();
 }
 
 window.addEventListener('resize', scheduleTableScrollUpdate);
@@ -1967,6 +2052,11 @@ document.addEventListener('click', (event) => {
   if (action === 'close-filter-panel') {
     setFilterPanelOpen(false);
   }
+
+  if (action === 'billing-edit') startBillingEdit(element.dataset.id);
+  if (action === 'billing-cancel') cancelBillingEdit();
+  if (action === 'billing-save') saveBillingEdit(element.dataset.id);
+  if (action === 'billing-delete') deleteBillingEntry(element.dataset.id);
 
   if (action === 'adjust') {
     const direction = Number(element.dataset.direction || 1);
@@ -2053,8 +2143,7 @@ function fieldRowHtml(field, index, handlers, locked = false) {
       <input type="text" placeholder="Dropdown options, comma separated" aria-label="Dropdown options" value="${escapeHtml(field.options || '')}" ${lock} style="${field.type === 'select' ? '' : 'visibility:hidden;'}" oninput="${handlers.update}(${index}, 'options', this.value)" />
       ${locked ? '<span></span>' : `<button type="button" class="ac-field-remove" aria-label="Remove field" onclick="${handlers.remove}(${index})">✕</button>`}
       <div class="ac-field-toggles">
-        <label class="ac-check"><input type="checkbox" ${field.showInInventory !== false ? 'checked' : ''} onchange="${handlers.update}(${index}, 'showInInventory', this.checked)" /> Add Inventory</label>
-        <label class="ac-check"><input type="checkbox" ${field.showInOrder !== false ? 'checked' : ''} onchange="${handlers.update}(${index}, 'showInOrder', this.checked)" /> Add Order</label>
+        <label class="ac-check"><input type="checkbox" ${field.showInInventory !== false ? 'checked' : ''} onchange="${handlers.update}(${index}, 'showInInventory', this.checked)" /> Show on Add New form</label>
       </div>
     </div>
   `;
@@ -2440,6 +2529,11 @@ function getBillingMonth() {
 async function loadBillingSummary(clientId = state.activeClientId) {
   if (!state.auth) return 401;
   const month = getBillingMonth();
+  const dateInput = document.getElementById('billingDate');
+  if (dateInput && !dateInput.value.startsWith(month)) {
+    const today = new Date().toISOString().slice(0, 10);
+    dateInput.value = today.startsWith(month) ? today : `${month}-01`;
+  }
   if (state.isAdmin && (!clientId || clientId === 'CL-000')) {
     state.billing = null;
     renderBilling('Choose a client in the switcher above to see their bill.');
@@ -2487,84 +2581,230 @@ function renderBilling(message = '') {
     return;
   }
 
-  const { totals, lines, progress } = summary;
+  const { totals, lines, progress, period, rateCard } = summary;
   const finalMonth = progress.fraction >= 1;
-  const lineRows = lines.map((line) => `
-    <tr><td>${escapeHtml(line.label)}</td><td class="billing-detail">${escapeHtml(line.detail)}</td><td class="num">${formatMoney(line.total)}</td></tr>
-  `).join('');
+  const lineRows = lines.length ? lines.map((line) => `
+    <tr>
+      <td>
+        <div class="billing-line-name">${escapeHtml(line.name)}</div>
+        ${line.flat ? '' : `<div class="billing-line-rate">(${formatMoney(line.unitPrice)} ea.) × ${line.quantity}</div>`}
+        ${line.description ? `<div class="billing-line-desc">${escapeHtml(line.description)}</div>` : ''}
+      </td>
+      <td class="num">${formatMoney(line.amount)}</td>
+    </tr>
+  `).join('') : '<tr><td colspan="2" class="billing-empty">Nothing billed for this month yet.</td></tr>';
+
   host.innerHTML = `
-    ${summary.configured ? '' : `<div class="ac-note">No rate card saved yet${state.isAdmin ? ' — set one up below.' : '.'}</div>`}
+    ${summary.configured ? '' : `<div class="ac-note">No rate card saved yet${state.isAdmin ? ' — add this client\'s services below.' : '.'}</div>`}
     <div class="billing-totals">
-      <div class="billing-total primary"><span>${finalMonth ? 'Month total' : 'Projected end of month'}</span><strong>${formatMoney(totals.projected)}</strong></div>
-      <div class="billing-total"><span>Month to date</span><strong>${formatMoney(totals.monthToDate)}</strong></div>
-      <div class="billing-total"><span>Orders fulfilled</span><strong>${summary.orders}</strong></div>
+      <div class="billing-total primary"><span>${finalMonth ? 'Month total' : 'Estimated end of month'}</span><strong>${formatMoney(finalMonth ? totals.total : totals.projected)}</strong></div>
+      <div class="billing-total"><span>Billed so far</span><strong>${formatMoney(totals.total)}</strong></div>
     </div>
     <div class="billing-progress" role="progressbar" aria-label="Month progress" aria-valuemin="0" aria-valuemax="${progress.daysInMonth}" aria-valuenow="${progress.daysElapsed}">
       <div style="width:${Math.round(progress.fraction * 100)}%"></div>
     </div>
     <div class="billing-progress-label">Day ${progress.daysElapsed} of ${progress.daysInMonth}</div>
-    <table class="billing-lines">
-      <thead><tr><th>Item</th><th>Detail</th><th class="num">Amount</th></tr></thead>
-      <tbody>
-        ${lineRows}
-        ${totals.minimumAdjustment ? `<tr><td>Minimum charge adjustment</td><td></td><td class="num">${formatMoney(totals.minimumAdjustment)}</td></tr>` : ''}
-        <tr class="billing-sum"><td colspan="2">Month to date</td><td class="num">${formatMoney(totals.monthToDate)}</td></tr>
-      </tbody>
-    </table>
+    <div class="billing-invoice">
+      <div class="billing-invoice-head">Services ${escapeHtml(period.start)} – ${escapeHtml(period.end)}</div>
+      <table class="billing-lines">
+        <tbody>${lineRows}</tbody>
+        <tfoot>
+          <tr><td>Subtotal</td><td class="num">${formatMoney(totals.subtotal)}</td></tr>
+          <tr><td>Tax${rateCard.taxRate ? ` (${rateCard.taxRate}%)` : ''}</td><td class="num">${formatMoney(totals.tax)}</td></tr>
+          <tr class="billing-sum"><td>Total</td><td class="num">${formatMoney(totals.total)}</td></tr>
+        </tfoot>
+      </table>
+    </div>
     <p class="billing-updated">Updated ${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })} · refreshes automatically</p>
   `;
 
-  const materialHost = document.getElementById('billingMaterialInputs');
-  if (materialHost) {
-    const typed = Object.fromEntries([...materialHost.querySelectorAll('input')].map((input) => [input.dataset.key, input.value]));
-    materialHost.innerHTML = summary.rateCard.materials.map((material) => `
-      <div>
-        <label class="ac-label" for="billingMat_${escapeHtml(material.key)}">${escapeHtml(material.label)} used</label>
-        <input type="number" step="1" id="billingMat_${escapeHtml(material.key)}" data-key="${escapeHtml(material.key)}" class="ac-input" placeholder="0" value="${escapeHtml(typed[material.key] || '')}" />
-      </div>
-    `).join('');
-  }
+  renderBillingServiceOptions();
+  renderBillingEntries();
+}
 
-  const recentHost = document.getElementById('billingRecent');
-  if (recentHost) {
-    const labels = Object.fromEntries(summary.rateCard.materials.map((material) => [material.key, material.label]));
-    const recent = summary.recentEntries || [];
-    recentHost.innerHTML = recent.length ? `
-      <h3 class="billing-subhead">Recent entries this month</h3>
-      <ul class="billing-entries">
-        ${recent.map((entry) => `
-          <li>
-            <span>${escapeHtml(new Date(entry.timestamp).toLocaleDateString())}</span>
-            <strong>${entry.quantity > 0 ? '+' : ''}${entry.quantity} ${escapeHtml(entry.type === 'orders' ? 'orders' : (labels[entry.itemKey] || entry.itemKey))}</strong>
-            <span>${escapeHtml(entry.note)}</span>
-          </li>
-        `).join('')}
-      </ul>
-    ` : '';
+function renderBillingServiceOptions() {
+  const select = document.getElementById('billingService');
+  if (!select || !state.billing) return;
+  const services = state.billing.rateCard.services || [];
+  const signature = JSON.stringify(services);
+  if (select.dataset.signature === signature) return;
+  const previous = select.value;
+  select.dataset.signature = signature;
+  select.replaceChildren(
+    ...services.map((service) => new Option(`${service.name}${service.description ? ` – ${service.description}` : ''} (${formatMoney(service.unitPrice)} ea.)`, service.key)),
+    new Option('Other charge (flat amount, e.g. shipping)', '__flat')
+  );
+  select.value = [...select.options].some((option) => option.value === previous) ? previous : select.options[0].value;
+  onBillingServiceChange();
+}
+
+function onBillingServiceChange() {
+  const select = document.getElementById('billingService');
+  const flat = select?.value === '__flat';
+  const service = (state.billing?.rateCard.services || []).find((entry) => entry.key === select?.value);
+  const flatWrap = document.getElementById('billingFlatNameWrap');
+  const qtyWrap = document.getElementById('billingQtyWrap');
+  const priceLabel = document.getElementById('billingPriceLabel');
+  const price = document.getElementById('billingPrice');
+  if (flatWrap) flatWrap.hidden = !flat;
+  if (qtyWrap) qtyWrap.hidden = flat;
+  if (priceLabel) priceLabel.textContent = flat ? 'Amount ($)' : 'Price each ($)';
+  if (price) price.value = service ? service.unitPrice : '';
+}
+
+function onBillingMonthChange() {
+  state.billingEditId = null;
+  const month = getBillingMonth();
+  const date = document.getElementById('billingDate');
+  const today = new Date().toISOString().slice(0, 10);
+  if (date) date.value = today.startsWith(month) ? today : `${month}-01`;
+  loadBillingSummary();
+}
+
+function billingEntryAmount(entry) {
+  return Math.round(entry.quantity * entry.unitPrice * 100) / 100;
+}
+
+function formatBillingDay(date) {
+  const [year, month, day] = String(date).split('-').map(Number);
+  return new Date(year, month - 1, day).toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' });
+}
+
+// While an entry is being edited, polling must not re-render the list and wipe the inputs.
+function renderBillingEntries({ force = false } = {}) {
+  const host = document.getElementById('billingEntries');
+  if (!host || (state.billingEditId && !force)) return;
+  const entries = state.billing?.entries || [];
+  if (!entries.length) {
+    host.innerHTML = '<div class="no-results" style="padding:12px;">No entries for this month yet.</div>';
+    return;
+  }
+  const days = new Map();
+  entries.forEach((entry) => {
+    if (!days.has(entry.date)) days.set(entry.date, []);
+    days.get(entry.date).push(entry);
+  });
+  host.innerHTML = [...days.entries()].map(([date, items]) => `
+    <div class="billing-day">
+      <div class="billing-day-head"><span>${escapeHtml(formatBillingDay(date))}</span><span>${formatMoney(items.reduce((sum, entry) => sum + billingEntryAmount(entry), 0))}</span></div>
+      ${items.map((entry) => (entry.id === state.billingEditId ? billingEditHtml(entry) : billingEntryHtml(entry))).join('')}
+    </div>
+  `).join('');
+}
+
+function billingEntryHtml(entry) {
+  const id = escapeHtml(entry.id);
+  return `
+    <div class="billing-entry">
+      <div class="billing-entry-main">
+        <strong>${escapeHtml(entry.name)}</strong>${entry.description ? ` <span class="billing-entry-desc">${escapeHtml(entry.description)}</span>` : ''}
+        <div class="billing-entry-meta">${entry.flat ? 'Flat charge' : `${entry.quantity} × ${formatMoney(entry.unitPrice)}`}${entry.note ? ` · ${escapeHtml(entry.note)}` : ''}</div>
+      </div>
+      <div class="billing-entry-amount">${formatMoney(billingEntryAmount(entry))}</div>
+      <div class="billing-entry-actions">
+        <button type="button" class="billing-link" data-action="billing-edit" data-id="${id}">Edit</button>
+        <button type="button" class="billing-link danger" data-action="billing-delete" data-id="${id}">Delete</button>
+      </div>
+    </div>
+  `;
+}
+
+function billingEditHtml(entry) {
+  const id = escapeHtml(entry.id);
+  return `
+    <div class="billing-entry editing">
+      <div class="billing-edit-grid">
+        <label>Date<input type="date" class="ac-input be-date" value="${escapeHtml(entry.date)}" /></label>
+        ${entry.flat
+          ? `<label>Charge name<input type="text" class="ac-input be-name" maxlength="80" value="${escapeHtml(entry.name)}" /></label>`
+          : `<label>Service<input type="text" class="ac-input" value="${escapeHtml(entry.name)}" disabled /></label>
+             <label>Quantity<input type="number" class="ac-input be-qty" min="0" step="1" value="${escapeHtml(entry.quantity)}" /></label>`}
+        <label>${entry.flat ? 'Amount ($)' : 'Price each ($)'}<input type="number" class="ac-input be-price" step="0.01" value="${escapeHtml(entry.unitPrice)}" /></label>
+        <label class="billing-edit-note">Note<input type="text" class="ac-input be-note" maxlength="200" value="${escapeHtml(entry.note)}" /></label>
+      </div>
+      <div class="billing-entry-actions">
+        <button type="button" class="btn-set" data-action="billing-save" data-id="${id}">Save</button>
+        <button type="button" class="billing-link" data-action="billing-cancel">Cancel</button>
+      </div>
+    </div>
+  `;
+}
+
+function startBillingEdit(id) {
+  state.billingEditId = id;
+  renderBillingEntries({ force: true });
+  document.querySelector('#billingEntries .billing-entry.editing input:not([disabled])')?.focus();
+}
+
+function cancelBillingEdit() {
+  state.billingEditId = null;
+  renderBillingEntries({ force: true });
+}
+
+async function saveBillingEdit(id) {
+  const form = document.querySelector('#billingEntries .billing-entry.editing');
+  if (!form) return;
+  const read = (selector) => form.querySelector(selector)?.value;
+  const body = { date: read('.be-date'), unitPrice: read('.be-price'), note: read('.be-note') };
+  if (form.querySelector('.be-name')) body.name = read('.be-name');
+  if (form.querySelector('.be-qty')) body.quantity = read('.be-qty');
+  try {
+    const response = await fetch(`${ADMIN_BILLING_URL}/entries/${encodeURIComponent(id)}`, {
+      method: 'PUT',
+      headers: adminHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify(body)
+    });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok || !result.success) throw new Error(result.error || 'Unable to save entry.');
+    state.billingEditId = null;
+    showToast('Entry updated', 'success');
+    await loadBillingSummary(state.activeClientId);
+  } catch (error) {
+    showToast(error.message || 'Unable to save entry', 'error');
+  }
+}
+
+async function deleteBillingEntry(id) {
+  const entry = (state.billing?.entries || []).find((item) => item.id === id);
+  if (!entry || !window.confirm(`Delete "${entry.name}" (${formatMoney(billingEntryAmount(entry))}) from ${formatBillingDay(entry.date)}?`)) return;
+  try {
+    const response = await fetch(`${ADMIN_BILLING_URL}/entries/${encodeURIComponent(id)}`, { method: 'DELETE', headers: adminHeaders() });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok || !result.success) throw new Error(result.error || 'Unable to delete entry.');
+    if (state.billingEditId === id) state.billingEditId = null;
+    showToast('Entry deleted', 'success');
+    await loadBillingSummary(state.activeClientId);
+  } catch (error) {
+    showToast(error.message || 'Unable to delete entry', 'error');
   }
 }
 
 async function submitBillingEntry() {
   const clientId = state.activeClientId;
-  const materials = {};
-  document.querySelectorAll('#billingMaterialInputs input').forEach((input) => {
-    if (input.value.trim()) materials[input.dataset.key] = Number(input.value);
-  });
-  const ordersValue = document.getElementById('billingOrders')?.value.trim() || '';
+  const value = (id) => document.getElementById(id)?.value ?? '';
+  const serviceKey = value('billingService');
+  const flat = serviceKey === '__flat';
+  const payload = {
+    clientId,
+    date: value('billingDate'),
+    note: value('billingNote'),
+    unitPrice: value('billingPrice'),
+    ...(flat ? { flatCharge: true, name: value('billingFlatName') } : { serviceKey, quantity: value('billingQty') })
+  };
   try {
     const response = await fetch(`${ADMIN_BILLING_URL}/entries`, {
       method: 'POST',
       headers: adminHeaders({ 'Content-Type': 'application/json' }),
-      body: JSON.stringify({ clientId, month: getBillingMonth(), orders: ordersValue ? Number(ordersValue) : 0, materials, note: document.getElementById('billingNote')?.value || '' })
+      body: JSON.stringify(payload)
     });
     const result = await response.json().catch(() => ({}));
     if (!response.ok || !result.success) throw new Error(result.error || 'Unable to save entry.');
-    ['billingOrders', 'billingNote'].forEach((id) => {
+    ['billingQty', 'billingNote', 'billingFlatName'].forEach((id) => {
       const input = document.getElementById(id);
       if (input) input.value = '';
     });
-    document.querySelectorAll('#billingMaterialInputs input').forEach((input) => { input.value = ''; });
-    showToast('Billing updated', 'success');
+    if (flat) document.getElementById('billingPrice').value = '';
+    showToast('Entry added', 'success');
     await loadBillingSummary(clientId);
   } catch (error) {
     showToast(error.message || 'Unable to save entry', 'error');
@@ -2572,51 +2812,42 @@ async function submitBillingEntry() {
 }
 
 function fillRateCardForm(card = {}) {
-  const set = (id, value) => {
-    const input = document.getElementById(id);
-    if (input) input.value = value ?? '';
-  };
-  set('rcBaseFee', card.baseFee);
-  set('rcLaborRate', card.orderLaborRate);
-  set('rcMultiplier', card.packagingMultiplier ?? 1);
-  set('rcMinimum', card.minimumCharge);
+  const tax = document.getElementById('rcTaxRate');
+  if (tax) tax.value = card.taxRate || '';
   const visible = document.getElementById('rcClientVisible');
   if (visible) visible.checked = Boolean(card.clientVisible);
-  state.rateMaterials = (card.materials || []).map((material) => ({ ...material }));
-  renderRateMaterials();
+  state.rateServices = (card.services || []).map((service) => ({ ...service }));
+  renderRateServices();
 }
 
-function renderRateMaterials() {
-  const host = document.getElementById('rcMaterials');
+function renderRateServices() {
+  const host = document.getElementById('rcServices');
   if (!host) return;
-  host.innerHTML = state.rateMaterials.length ? state.rateMaterials.map((material, index) => `
-    <div class="rc-material-row">
-      <input type="text" class="ac-input" aria-label="Material name" placeholder="e.g. Small box" value="${escapeHtml(material.label)}" oninput="state.rateMaterials[${index}].label = this.value" />
-      <input type="number" class="ac-input" aria-label="Unit cost" min="0" step="0.01" placeholder="Unit cost" value="${escapeHtml(material.unitCost ?? '')}" oninput="state.rateMaterials[${index}].unitCost = this.value" />
-      <button type="button" class="ac-field-remove" aria-label="Remove material" onclick="state.rateMaterials.splice(${index}, 1); renderRateMaterials()">✕</button>
+  host.innerHTML = state.rateServices.length ? state.rateServices.map((service, index) => `
+    <div class="rc-service-row">
+      <input type="text" class="ac-input" aria-label="Service name" maxlength="80" placeholder="e.g. FBA Fulfillment (Per Unit)" value="${escapeHtml(service.name)}" oninput="state.rateServices[${index}].name = this.value" />
+      <input type="number" class="ac-input" aria-label="Price each" min="0" step="0.01" placeholder="0.00" value="${escapeHtml(service.unitPrice ?? '')}" oninput="state.rateServices[${index}].unitPrice = this.value" />
+      <input type="text" class="ac-input" aria-label="Description" maxlength="200" placeholder="e.g. Oversized Bundle" value="${escapeHtml(service.description || '')}" oninput="state.rateServices[${index}].description = this.value" />
+      <button type="button" class="ac-field-remove" aria-label="Remove service" onclick="state.rateServices.splice(${index}, 1); renderRateServices()">✕</button>
     </div>
-  `).join('') : '<div class="no-results" style="padding:10px;">No packaging materials yet.</div>';
+  `).join('') : '<div class="no-results" style="padding:10px;">No services yet — add the services on this client\'s invoice.</div>';
 }
 
-function addRateMaterial() {
-  state.rateMaterials.push({ label: '', unitCost: '' });
-  renderRateMaterials();
+function addRateService() {
+  state.rateServices.push({ name: '', unitPrice: '', description: '' });
+  renderRateServices();
 }
 
 async function saveRateCard() {
   const clientId = state.activeClientId;
-  const value = (id) => document.getElementById(id)?.value;
   try {
     const response = await fetch(`${ADMIN_BILLING_URL}/rates/${encodeURIComponent(clientId)}`, {
       method: 'PUT',
       headers: adminHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({
-        baseFee: value('rcBaseFee'),
-        orderLaborRate: value('rcLaborRate'),
-        packagingMultiplier: value('rcMultiplier') === '' ? 1 : value('rcMultiplier'),
-        minimumCharge: value('rcMinimum'),
-        clientVisible: Boolean(document.getElementById('rcClientVisible')?.checked),
-        materials: state.rateMaterials
+        services: state.rateServices,
+        taxRate: document.getElementById('rcTaxRate')?.value || 0,
+        clientVisible: Boolean(document.getElementById('rcClientVisible')?.checked)
       })
     });
     const result = await response.json().catch(() => ({}));

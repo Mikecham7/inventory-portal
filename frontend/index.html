@@ -123,7 +123,7 @@
     <div class="tabs" id="mainTabs">
       <div class="tab active" onclick="goToDashboard()">📊 Dashboard</div>
       <div class="tab" id="tabUpdate" onclick="requestUpdatePage()">✏️ Update</div>
-      <div class="tab" id="tabOrder" onclick="goToAddOrder()" style="display:none;">📦 Add Order</div>
+      <div class="tab" id="tabOrder" onclick="goToAddOrder()" style="display:none;">📦 Add New</div>
       <div class="tab" onclick="goToLogs()">📋 Logs</div>
       <div class="tab" onclick="showPage('chat')">💬 Chat</div>
       <div class="tab" id="tabBilling" onclick="showPage('billing')" style="display:none;">💵 Billing</div>
@@ -196,6 +196,28 @@
             <div class="ss" id="selSku"></div>
             <div class="st" id="selTitle"></div>
           </div>
+          <div id="shipmentEditor" hidden>
+            <div class="qty-display">
+              <div><div class="ql">CURRENT STATUS</div></div>
+              <span class="badge" id="shipCurrent"></span>
+            </div>
+            <hr class="divider" />
+            <h2>📦 Received &amp; Shipped</h2>
+            <p class="billing-hint" id="shipmentHint">Enter how many have arrived at the warehouse, then how many have shipped out.</p>
+            <div class="shipment-grid">
+              <div>
+                <label class="ac-label" for="shipReceived">Quantity received</label>
+                <input type="number" min="0" step="1" id="shipReceived" class="ac-input" oninput="previewShipment()" />
+              </div>
+              <div>
+                <label class="ac-label" for="shipShipped">Quantity shipped</label>
+                <input type="number" min="0" step="1" id="shipShipped" class="ac-input" oninput="previewShipment()" />
+              </div>
+            </div>
+            <div class="shipment-preview">Status after saving: <span class="badge" id="shipPreview"></span></div>
+            <button type="button" class="big-btn plus" id="shipSave" onclick="saveShipment()">Save</button>
+          </div>
+          <div id="stockEditor">
           <div class="qty-display">
             <div><div class="ql">CURRENT QTY ON HAND</div><div class="qv" id="selQty">—</div></div>
             <span class="badge" id="selBadge"></span>
@@ -216,52 +238,32 @@
             <button class="btn-set" onclick="setExactQty()">Set</button>
             <input type="number" id="setQtyVal" min="0" placeholder="Enter new qty..." />
           </div>
+          </div>
         </div>
-      </div>
-
-      <div class="update-card" style="margin-top:20px;">
-        <h2>➕ Create Product</h2>
-        <div id="createProductReadOnlyNotice" style="display:none; color:#b45309; background:#fff7ed; border:1px solid #fed7aa; padding:8px 10px; border-radius:8px; margin-bottom:12px; font-size:12px; font-weight:700;"></div>
-        <div class="set-row" style="display:grid;grid-template-columns:1fr 1fr 110px auto;gap:8px;align-items:end;">
-          <div id="newProductSkuWrap">
-            <label style="display:block;font-size:11px;font-weight:700;color:#475569;margin-bottom:6px;">SKU</label>
-            <input type="text" id="newProductSku" placeholder="A-25-Cu-01" style="width:100%;padding:10px 12px;border:1px solid #dfe7f1;border-radius:8px;" />
-          </div>
-          <div id="newProductTitleWrap">
-            <label id="newProductTitleLabel" style="display:block;font-size:11px;font-weight:700;color:#475569;margin-bottom:6px;">Product Title</label>
-            <input type="text" id="newProductTitle" placeholder="Copper Marker" style="width:100%;padding:10px 12px;border:1px solid #dfe7f1;border-radius:8px;" />
-          </div>
-          <div>
-            <label style="display:block;font-size:11px;font-weight:700;color:#475569;margin-bottom:6px;">Qty</label>
-            <input type="number" id="newProductQty" value="0" min="0" style="width:100%;padding:10px 12px;border:1px solid #dfe7f1;border-radius:8px;" />
-          </div>
-          <button id="createProductSubmit" class="btn-set" onclick="createProduct()">Add</button>
-        </div>
-        <div id="customProductFields" style="margin-top:12px; display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:10px;"></div>
       </div>
     </div>
 
     <div id="page-order" class="page content" style="display:none;">
-      <div class="update-card">
-        <h2>📦 Add Order</h2>
-        <p style="color:#666;font-size:12px;margin-bottom:12px;">New orders start as "Not Shipped".</p>
-        <div id="createOrderReadOnlyNotice" style="display:none; color:#b45309; background:#fff7ed; border:1px solid #fed7aa; padding:8px 10px; border-radius:8px; margin-bottom:12px; font-size:12px; font-weight:700;"></div>
+      <div class="update-card" id="addProductCard">
+        <h2>📦 Add New</h2>
+        <p style="color:#666;font-size:12px;margin-bottom:12px;">Adds a new item for this client. Items that track received and shipped quantities start as "Not Received" — update them from the Update tab as they arrive and ship.</p>
+        <div id="createProductReadOnlyNotice" style="display:none; color:#b45309; background:#fff7ed; border:1px solid #fed7aa; padding:8px 10px; border-radius:8px; margin-bottom:12px; font-size:12px; font-weight:700;"></div>
         <div class="set-row" style="display:grid;grid-template-columns:1fr 1fr 110px auto;gap:8px;align-items:end;">
-          <div id="newOrderSkuWrap">
-            <label class="ac-label" for="newOrderSku">SKU</label>
-            <input type="text" id="newOrderSku" class="ac-input" />
+          <div id="newProductSkuWrap">
+            <label class="ac-label" for="newProductSku">SKU</label>
+            <input type="text" id="newProductSku" class="ac-input" placeholder="A-25-Cu-01" />
           </div>
-          <div id="newOrderTitleWrap">
-            <label class="ac-label" id="newOrderTitleLabel" for="newOrderTitle">Product Title</label>
-            <input type="text" id="newOrderTitle" class="ac-input" />
+          <div id="newProductTitleWrap">
+            <label class="ac-label" id="newProductTitleLabel" for="newProductTitle">Product Title</label>
+            <input type="text" id="newProductTitle" class="ac-input" placeholder="Copper Marker" />
           </div>
           <div>
-            <label class="ac-label" for="newOrderQty">Qty</label>
-            <input type="number" id="newOrderQty" value="0" min="0" class="ac-input" />
+            <label class="ac-label" for="newProductQty">Qty</label>
+            <input type="number" id="newProductQty" class="ac-input" value="0" min="0" />
           </div>
-          <button id="createOrderSubmit" class="btn-set" onclick="createProduct('order')">Add</button>
+          <button id="createProductSubmit" class="btn-set" onclick="createProduct()">Add</button>
         </div>
-        <div id="orderProductFields" style="margin-top:12px; display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:10px;"></div>
+        <div id="customProductFields" style="margin-top:12px; display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:10px;"></div>
       </div>
     </div>
 
@@ -310,54 +312,57 @@
       <div class="update-card">
         <div class="billing-head">
           <h2>💵 Billing Estimate</h2>
-          <label class="billing-month" for="billingMonth">Month <input type="month" id="billingMonth" class="ac-input" onchange="loadBillingSummary()" /></label>
+          <label class="billing-month" for="billingMonth">Month <input type="month" id="billingMonth" class="ac-input" onchange="onBillingMonthChange()" /></label>
         </div>
         <div id="billingMsg" class="ac-note" hidden></div>
         <div id="billingSummary"></div>
       </div>
 
       <div class="update-card" id="billingAdminEntry" hidden>
-        <h2>🧾 Log Fulfilled Orders &amp; Materials</h2>
-        <div class="ac-settings-grid">
+        <h2>🧾 Daily Billing Log</h2>
+        <div class="billing-entry-form">
           <div>
-            <label class="ac-label" for="billingOrders">Orders fulfilled</label>
-            <input type="number" step="1" id="billingOrders" class="ac-input" placeholder="0" />
+            <label class="ac-label" for="billingDate">Date</label>
+            <input type="date" id="billingDate" class="ac-input" />
+          </div>
+          <div class="billing-entry-service">
+            <label class="ac-label" for="billingService">Service</label>
+            <select id="billingService" class="ac-input" onchange="onBillingServiceChange()"></select>
+          </div>
+          <div id="billingFlatNameWrap" class="billing-entry-service" hidden>
+            <label class="ac-label" for="billingFlatName">Charge name</label>
+            <input type="text" id="billingFlatName" class="ac-input" maxlength="80" placeholder="e.g. Shipping External" />
+          </div>
+          <div id="billingQtyWrap">
+            <label class="ac-label" for="billingQty">Quantity</label>
+            <input type="number" id="billingQty" class="ac-input" min="0" step="1" placeholder="0" />
+          </div>
+          <div>
+            <label class="ac-label" for="billingPrice" id="billingPriceLabel">Price each ($)</label>
+            <input type="number" id="billingPrice" class="ac-input" step="0.01" />
+          </div>
+          <div class="billing-entry-note">
+            <label class="ac-label" for="billingNote">Note (optional)</label>
+            <input type="text" id="billingNote" class="ac-input" maxlength="200" placeholder="e.g. Shipping cost for order #109333" />
           </div>
         </div>
-        <div id="billingMaterialInputs" class="ac-settings-grid"></div>
-        <div style="margin-top:10px;">
-          <label class="ac-label" for="billingNote">Note (optional)</label>
-          <input type="text" id="billingNote" class="ac-input" maxlength="200" placeholder="e.g. Week 2 shipments" />
-        </div>
-        <p class="billing-hint">Entries add to the selected month. Use a negative number to correct a mistake.</p>
-        <button type="button" class="btn-set" onclick="submitBillingEntry()">Add to this month</button>
-        <div id="billingRecent"></div>
+        <button type="button" class="btn-set" style="margin-top:10px;" onclick="submitBillingEntry()">Add entry</button>
+        <h3 class="billing-subhead">Entries this month</h3>
+        <div id="billingEntries"></div>
       </div>
 
       <div class="update-card" id="billingAdminRates" hidden>
         <h2>⚙️ Rate Card</h2>
-        <p class="billing-hint">This client's contract rates, saved in the Billing_Rates sheet tab.</p>
+        <p class="billing-hint">The services you bill this client for and their price each. Add the same service twice with a different description for a second rate (e.g. Bundling / Oversized Bundle). Saved in the Billing_Rate_Cards sheet tab.</p>
+        <div class="rc-service-row rc-service-head" aria-hidden="true"><span>Service</span><span>Price each ($)</span><span>Description (optional)</span><span></span></div>
+        <div id="rcServices"></div>
+        <button type="button" class="btn-set" style="margin-top:8px;" onclick="addRateService()">+ Add Service</button>
         <div class="ac-settings-grid">
           <div>
-            <label class="ac-label" for="rcBaseFee">Monthly base fee ($)</label>
-            <input type="number" min="0" step="0.01" id="rcBaseFee" class="ac-input" />
-          </div>
-          <div>
-            <label class="ac-label" for="rcLaborRate">Labor rate per order ($)</label>
-            <input type="number" min="0" step="0.01" id="rcLaborRate" class="ac-input" />
-          </div>
-          <div>
-            <label class="ac-label" for="rcMultiplier">Packaging cost multiplier</label>
-            <input type="number" min="0" step="0.01" id="rcMultiplier" class="ac-input" placeholder="1" />
-          </div>
-          <div>
-            <label class="ac-label" for="rcMinimum">Monthly minimum ($)</label>
-            <input type="number" min="0" step="0.01" id="rcMinimum" class="ac-input" />
+            <label class="ac-label" for="rcTaxRate">Tax rate (%)</label>
+            <input type="number" min="0" max="100" step="0.01" id="rcTaxRate" class="ac-input" placeholder="0" />
           </div>
         </div>
-        <h3 class="billing-subhead">Packaging materials</h3>
-        <div id="rcMaterials"></div>
-        <button type="button" class="btn-set" style="margin-top:8px;" onclick="addRateMaterial()">+ Add Material</button>
         <label class="ac-check" style="margin-top:14px;"><input type="checkbox" id="rcClientVisible" /> Client can see their billing estimate</label>
         <div style="margin-top:14px;">
           <button type="button" class="big-btn plus" onclick="saveRateCard()">Save Rate Card</button>
@@ -431,7 +436,7 @@
 
         <hr class="divider" />
         <h2>📋 Dashboard / Add-Item Fields</h2>
-        <p style="color:#666;font-size:12px;margin-bottom:10px;">Every field you add here becomes a dashboard column. Untick "Add Inventory" or "Add Order" to hide it on that form.</p>
+        <p style="color:#666;font-size:12px;margin-bottom:10px;">Every field you add here becomes a dashboard column. Untick "Show on Add New form" to hide it on that form.</p>
         <div id="acFieldsList"></div>
         <button type="button" class="btn-set" style="margin-top:8px;" onclick="addClientFieldRow()">+ Add Field</button>
 
@@ -519,7 +524,7 @@
 
           <hr class="divider" />
           <h2>📋 Dashboard / Add-Item Fields</h2>
-          <p style="color:#666;font-size:12px;margin-bottom:10px;">Rename a field's label to rename its column, or remove it to delete the column (and its data) entirely. Untick "Add Inventory" or "Add Order" to hide a field on that form.</p>
+          <p style="color:#666;font-size:12px;margin-bottom:10px;">Rename a field's label to rename its column, or remove it to delete the column (and its data) entirely. Untick "Show on Add New form" to hide a field on that form.</p>
           <div id="ecFieldsList"></div>
           <button type="button" id="ecAddFieldBtn" class="btn-set" style="margin-top:8px;" onclick="addEditClientFieldRow()">+ Add Field</button>
 

@@ -108,12 +108,29 @@ function getShipmentStatus(item = {}) {
     return 'in';
   }
 
-  const ordered = Number(String(item.quantityOrdered ?? item.ordered ?? item.quantity ?? '').replace(/[^0-9.-]/g, '')) || 0;
-  const shipped = Number(String(item.quantityShipped ?? item.shipped ?? '').replace(/[^0-9.-]/g, '')) || 0;
+  return getShipmentStage(item.quantityReceived ?? item.received, item.quantityShipped ?? item.shipped);
+}
 
-  if (shipped <= 0) return 'not';
-  if (ordered > 0 && shipped < ordered) return 'partial';
-  return 'fully';
+function toCount(value) {
+  return Number(String(value ?? '').replace(/[^0-9.-]/g, '')) || 0;
+}
+
+// Not received yet -> received but not shipped -> partially shipped -> everything received has shipped.
+function getShipmentStage(received, shipped) {
+  const receivedCount = toCount(received);
+  const shippedCount = toCount(shipped);
+  if (shippedCount > 0 && shippedCount >= receivedCount) return 'fully';
+  if (shippedCount > 0) return 'partial';
+  return receivedCount > 0 ? 'not' : 'awaiting';
+}
+
+const SHIPMENT_STATUS_TEXT = { awaiting: 'Not Received', not: 'Not Shipped', partial: 'Partially Shipped', fully: 'Fully Shipped' };
+
+function findShipmentFieldKeys(fields = []) {
+  const find = (pattern) => (fields.find((field) => pattern.test(`${field.key} ${field.label}`)) || {}).key || null;
+  const received = find(/received/i);
+  const shipped = find(/shipped/i);
+  return received && shipped ? { received, shipped } : null;
 }
 
 function getDashboardColumns(clientId) {
@@ -251,6 +268,9 @@ module.exports = {
   getShipmentStatus,
   getCreateFormTitleConfig,
   getChatDriveFolderForClient,
+  getShipmentStage,
+  findShipmentFieldKeys,
+  SHIPMENT_STATUS_TEXT,
   isGoogleDriveUrl,
   normalizeDriveFolderUrl,
   getInventoryFieldSample,

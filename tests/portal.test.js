@@ -202,10 +202,11 @@ test('dashboard columns expose the Ecom Elite field set and keep the generic cli
   assert.deepEqual(getDashboardColumns('CL-003'), ['PRODUCT TITLE', 'QTY', 'STATUS', 'EDIT']);
 });
 
-test('shipment status follows the shipping workflow for Ecom Elite and CJA', () => {
-  assert.equal(getShipmentStatus({ clientId: 'CL-002', quantityOrdered: 10, quantityShipped: 10 }), 'fully');
-  assert.equal(getShipmentStatus({ clientId: 'CL-002', quantityOrdered: 10, quantityShipped: 4 }), 'partial');
-  assert.equal(getShipmentStatus({ clientId: 'CL-003', quantityOrdered: 5, quantityShipped: 0 }), 'not');
+test('shipment status follows received then shipped quantities for Ecom Elite and CJA', () => {
+  assert.equal(getShipmentStatus({ clientId: 'CL-002', quantityOrdered: 10, quantityReceived: '', quantityShipped: '' }), 'awaiting');
+  assert.equal(getShipmentStatus({ clientId: 'CL-002', quantityOrdered: 10, quantityReceived: 8, quantityShipped: 0 }), 'not');
+  assert.equal(getShipmentStatus({ clientId: 'CL-002', quantityOrdered: 10, quantityReceived: 8, quantityShipped: 4 }), 'partial');
+  assert.equal(getShipmentStatus({ clientId: 'CL-003', quantityOrdered: 10, quantityReceived: 8, quantityShipped: 8 }), 'fully');
   assert.equal(getShipmentStatus({ clientId: 'CL-001', status: 'Low Stock' }), 'in');
 });
 
@@ -740,43 +741,142 @@ test('drive folders and chat files stay inside the signed-in client account', as
   }
 });
 
-test('billing math applies per-client rates, packaging multiplier, minimums, and month-end projection', () => {
-  const { summarizeBilling, sanitizeRateCard } = require('../api/billing.js');
-  const rateCard = {
-    baseFee: 100, orderLaborRate: 1.5, packagingMultiplier: 1.2, minimumCharge: 0,
-    materials: [{ key: 'box', label: 'Small box', unitCost: 0.5 }, { key: 'tape', label: 'Tape', unitCost: 2 }]
-  };
-  const entries = [
-    { month: '2026-09', type: 'orders', quantity: 200 },
-    { month: '2026-09', type: 'orders', quantity: -10 },
-    { month: '2026-09', type: 'material', itemKey: 'box', quantity: 100 },
-    { month: '2026-08', type: 'orders', quantity: 999 }
+test('staff update received then shipped quantities and the status follows the warehouse workflow', async () => {
+  const { invalidateReadCache: clearCache } = require('../api/server.js');
+  clearCache('');
+  const makeRow = (values) => ({ values, get: (key) => values[key] ?? '', set: (key, value) => { values[key] = value; }, save: async () => {} });
+  const grid = [
+    ['SKU', 'Product Title', 'Quantity Received', 'Quantity Shipped', 'Qty', 'Status', 'Notes'],
+    ['A-1', 'Widget', '', '', 5, 'Not Received', '']
   ];
-  const mid = summarizeBilling({ rateCard, entries, month: '2026-09', now: new Date('2026-09-10T12:00:00Z') });
-  assert.equal(mid.orders, 190);
-  assert.equal(mid.totals.usage, 345);
-  assert.equal(mid.totals.monthToDate, 445);
-  assert.equal(mid.totals.projected, 1135);
-  assert.deepEqual(mid.lines.map((line) => line.total), [100, 285, 60, 0]);
+  const cell = (row, col) => {
+    grid[row] = grid[row] || [];
+    return {
+      get value() { return grid[row][col] ?? ''; },
+      set value(next) { grid[row][col] = next; }
+    };
+  };
+  const sheets = {
+    User_Credentials: {
+      headerValues: [], loadHeaderRow: async () => {}, setHeaderRow: async () => {},
+      getRows: async () => [makeRow({ Client_ID: 'CL-004', Username: 'Acme', Fields_JSON: JSON.stringify([{ key: 'quantityReceived', label: 'Quantity Received', type: 'number' }, { key: 'quantityShipped', label: 'Quantity Shipped', type: 'number' }]) })]
+    },
+    Inventory_Events: { headerValues: ['Timestamp', 'ClientID', 'Description', 'ActorUsername'], loadHeaderRow: async () => {}, getRows: async () => [], addRow: async () => {} },
+    'CL-004': { title: 'CL-004', rowCount: 2, columnCount: 7, loadCells: async () => {}, getCell: cell, saveUpdatedCells: async () => {} }
+  };
+  const titleDescriptor = Object.getOwnPropertyDescriptor(GoogleSpreadsheet.prototype, 'sheetsByTitle');
+  const indexDescriptor = Object.getOwnPropertyDescriptor(GoogleSpreadsheet.prototype, 'sheetsByIndex');
+  const oldLoadInfo = GoogleSpreadsheet.prototype.loadInfo;
+  GoogleSpreadsheet.prototype.loadInfo = async () => {};
+  Object.defineProperty(GoogleSpreadsheet.prototype, 'sheetsByTitle', { configurable: true, get: () => sheets });
+  Object.defineProperty(GoogleSpreadsheet.prototype, 'sheetsByIndex', { configurable: true, get: () => Object.values(sheets) });
+  const { app } = require('../api/server.js');
+  const server = app.listen(0);
+  const update = (body, token) => fetch(`http://127.0.0.1:${server.address().port}/api/inventory/shipment`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ clientId: 'CL-004', itemId: 'CL-004-1', title: 'Widget', ...body })
+  });
+  const admin = signNotificationSession('ADMIN', 'CL-000', 'admin');
+  try {
+    assert.equal((await update({ received: 10, shipped: 0 }, signNotificationSession('Acme', 'CL-004', 'client'))).status, 401);
+    assert.equal((await update({ received: 3, shipped: 5 }, admin)).status, 400);
+    assert.equal((await update({ received: 10, shipped: 0, title: 'Other' }, admin)).status, 409);
 
-  const past = summarizeBilling({ rateCard: { ...rateCard, minimumCharge: 2000 }, entries, month: '2026-09', now: new Date('2026-10-02T00:00:00Z') });
-  assert.equal(past.totals.projected, 2000);
-  assert.equal(past.totals.minimumAdjustment, 1555);
-
-  const cleaned = sanitizeRateCard({ baseFee: -5, orderLaborRate: 'abc', packagingMultiplier: '', materials: '[{"label":"Box","unitCost":-1},{"label":""}]', clientVisible: 'TRUE' });
-  assert.deepEqual(cleaned, { baseFee: 0, orderLaborRate: 0, packagingMultiplier: 1, minimumCharge: 0, materials: [{ key: 'box', label: 'Box', unitCost: 0 }], clientVisible: true });
+    const steps = [[10, 0, 'Not Shipped'], [10, 4, 'Partially Shipped'], [10, 10, 'Fully Shipped']];
+    for (const [received, shipped, status] of steps) {
+      const result = await (await update({ received, shipped }, admin)).json();
+      assert.equal(result.status, status);
+      assert.deepEqual([grid[1][2], grid[1][3], grid[1][5]], [received, shipped, status]);
+    }
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+    GoogleSpreadsheet.prototype.loadInfo = oldLoadInfo;
+    Object.defineProperty(GoogleSpreadsheet.prototype, 'sheetsByTitle', titleDescriptor);
+    Object.defineProperty(GoogleSpreadsheet.prototype, 'sheetsByIndex', indexDescriptor);
+  }
 });
 
-test('billing API keeps rate cards and usage entries admin-only and respects client visibility', async () => {
+test('billing builds invoice lines that match real client invoices', () => {
+  const { summarizeBilling, sanitizeRateCard, sanitizeEntry } = require('../api/billing.js');
+  const entry = (date, serviceKey, quantity, unitPrice, extra = {}) => ({ date, serviceKey, quantity, unitPrice, flat: false, ...extra });
+
+  const cardA = sanitizeRateCard({ services: [
+    { name: 'FBM Account And Shipping Management', unitPrice: 0.75 },
+    { name: 'FBA Fullfillment (Per Unit)', unitPrice: 1.15 },
+    { name: 'FBM Fullfillment (Per Unit)', unitPrice: 3 },
+    { name: 'Poly Bag', unitPrice: 0.3 }
+  ] });
+  const [mgmt, fba, fbm, poly] = cardA.services.map((service) => service.key);
+  const named = (key) => cardA.services.find((service) => service.key === key).name;
+  const invoiceA = summarizeBilling({
+    rateCard: cardA,
+    month: '2026-08',
+    now: new Date('2026-09-02T00:00:00Z'),
+    entries: [
+      entry('2026-08-01', mgmt, 15, 0.75), entry('2026-08-20', mgmt, 16, 0.75),
+      entry('2026-08-03', fba, 35, 1.15), entry('2026-08-04', fbm, 2, 3),
+      entry('2026-08-05', poly, 20, 0.3), entry('2026-08-25', poly, 9, 0.3),
+      entry('2026-07-31', fba, 999, 1.15)
+    ].map((item) => ({ ...item, name: named(item.serviceKey) }))
+  });
+  assert.deepEqual(invoiceA.lines.map((line) => [line.name, line.unitPrice, line.quantity, line.amount]), [
+    ['FBM Account And Shipping Management', 0.75, 31, 23.25],
+    ['FBA Fullfillment (Per Unit)', 1.15, 35, 40.25],
+    ['FBM Fullfillment (Per Unit)', 3, 2, 6],
+    ['Poly Bag', 0.3, 29, 8.7]
+  ]);
+  assert.deepEqual(invoiceA.totals, { subtotal: 78.2, tax: 0, total: 78.2, projected: 78.2 });
+  assert.deepEqual(invoiceA.period, { start: '8/1/2026', end: '8/31/2026' });
+
+  const cardB = sanitizeRateCard({ services: [
+    { name: 'Order Processing & Shipping Fulfillment', unitPrice: 3 },
+    { name: 'Inventory Restocking', unitPrice: 0.35 },
+    { name: 'Bundling', unitPrice: 0.3 },
+    { name: 'Bundling', unitPrice: 1.25, description: 'Oversized Bundle' },
+    { name: 'Poly Mailer', unitPrice: 0.6 },
+    { name: 'Box', unitPrice: 1.25 },
+    { name: 'Bagging', unitPrice: 0.3, description: 'Bagging is the combined cost of the material used for the bag and the labor required to place the product inside it.' }
+  ] });
+  assert.equal(new Set(cardB.services.map((service) => service.key)).size, 7);
+  const counts = [36, 322, 21, 9, 13, 5, 9];
+  const entriesB = cardB.services.map((service, index) => {
+    const { entry: valid } = sanitizeEntry({ date: '2026-08-15', serviceKey: service.key, quantity: counts[index] }, cardB);
+    return valid;
+  });
+  entriesB.push(sanitizeEntry({ date: '2026-08-20', flatCharge: true, name: 'Shipping External', unitPrice: 12.42, note: 'Shipping cost for order #109333' }, cardB).entry);
+  const invoiceB = summarizeBilling({ rateCard: cardB, entries: entriesB, month: '2026-08', now: new Date('2026-09-02T00:00:00Z') });
+  assert.deepEqual(invoiceB.lines.map((line) => line.amount), [108, 112.7, 6.3, 11.25, 7.8, 6.25, 2.7, 12.42]);
+  assert.equal(invoiceB.lines[3].description, 'Oversized Bundle');
+  assert.deepEqual(invoiceB.lines.at(-1), { name: 'Shipping External', description: 'Shipping cost for order #109333', flat: true, unitPrice: 12.42, quantity: 1, amount: 12.42 });
+  // The source invoice printed a $266.07 subtotal, but its own line items add up to $267.42.
+  assert.equal(invoiceB.totals.total, 267.42);
+
+  // Mid-month, per-unit work is projected forward but one-off charges are not.
+  const midMonth = summarizeBilling({ rateCard: { ...cardB, taxRate: 10 }, entries: entriesB.map((item) => ({ ...item, date: item.date.replace('2026-08', '2026-09') })), month: '2026-09', now: new Date('2026-09-15T12:00:00Z') });
+  assert.equal(midMonth.totals.subtotal, 267.42);
+  assert.equal(midMonth.totals.tax, 26.74);
+  assert.equal(midMonth.totals.projected, Math.round((255 * 2 + 12.42) * 1.1 * 100) / 100);
+
+  assert.equal(sanitizeEntry({ date: '2026-02-30', serviceKey: mgmt, quantity: 1 }, cardA).error, 'Choose a valid date.');
+  assert.equal(sanitizeEntry({ date: '2026-08-01', serviceKey: 'ghost', quantity: 1 }, cardA).error, 'Choose a service from the rate card.');
+  assert.equal(sanitizeEntry({ date: '2026-08-01', serviceKey: mgmt, quantity: 0 }, cardA).error, 'Quantity must be a positive number.');
+  assert.equal(sanitizeEntry({ date: '2026-08-01', serviceKey: mgmt, quantity: 2, unitPrice: '0.80' }, cardA).entry.unitPrice, 0.8);
+});
+
+test('billing API keeps rate cards and daily entries admin-only, editable, deletable, and respects client visibility', async () => {
   const { invalidateReadCache: clearCache } = require('../api/server.js');
   const { currentMonth } = require('../api/billing.js');
   clearCache('');
-  const makeRow = (values) => ({ values, get: (key) => values[key] ?? '', set: (key, value) => { values[key] = value; }, save: async () => {} });
   const rateRows = [];
   const entryRows = [];
+  const makeRow = (values, list) => {
+    const row = { values, get: (key) => values[key] ?? '', set: (key, value) => { values[key] = value; }, save: async () => {}, delete: async () => { list.splice(list.indexOf(row), 1); } };
+    return row;
+  };
   const sheets = {
-    Billing_Rates: { headerValues: [], loadHeaderRow: async () => {}, setHeaderRow: async (h) => { sheets.Billing_Rates.headerValues = h; }, getRows: async () => rateRows, addRow: async (row) => rateRows.push(makeRow(row)) },
-    Billing_Entries: { headerValues: [], loadHeaderRow: async () => {}, setHeaderRow: async (h) => { sheets.Billing_Entries.headerValues = h; }, getRows: async () => entryRows, addRows: async (rows) => rows.forEach((row) => entryRows.push(makeRow(row))) }
+    Billing_Rate_Cards: { headerValues: [], loadHeaderRow: async () => {}, setHeaderRow: async (h) => { sheets.Billing_Rate_Cards.headerValues = h; }, getRows: async () => rateRows, addRow: async (row) => rateRows.push(makeRow(row, rateRows)) },
+    Billing_Line_Items: { headerValues: [], loadHeaderRow: async () => {}, setHeaderRow: async (h) => { sheets.Billing_Line_Items.headerValues = h; }, getRows: async () => entryRows, addRow: async (row) => entryRows.push(makeRow(row, entryRows)) }
   };
   const titleDescriptor = Object.getOwnPropertyDescriptor(GoogleSpreadsheet.prototype, 'sheetsByTitle');
   const indexDescriptor = Object.getOwnPropertyDescriptor(GoogleSpreadsheet.prototype, 'sheetsByIndex');
@@ -797,31 +897,45 @@ test('billing API keeps rate cards and usage entries admin-only and respects cli
   try {
     assert.equal((await call('GET', '/billing/summary?clientId=CL-004')).status, 401);
     assert.equal((await call('GET', '/billing/summary', null, acme)).status, 403);
-    assert.equal((await call('PUT', '/admin/billing/rates/CL-004', { baseFee: 50 }, acme)).status, 401);
+    assert.equal((await call('PUT', '/admin/billing/rates/CL-004', { services: [] }, acme)).status, 401);
 
     const saved = await (await call('PUT', '/admin/billing/rates/CL-004', {
-      baseFee: 50, orderLaborRate: 2, packagingMultiplier: 1, minimumCharge: 0, clientVisible: true,
-      materials: [{ label: 'Bubble mailer', unitCost: 0.4 }]
+      clientVisible: true,
+      services: [{ name: 'FBA Fullfillment (Per Unit)', unitPrice: 1.15 }, { name: 'Poly Bag', unitPrice: 0.3 }]
     }, admin)).json();
     assert.ok(saved.success);
     assert.equal(rateRows[0].get('Client_ID'), 'CL-004');
+    const [fbaKey, polyKey] = saved.rateCard.services.map((service) => service.key);
+    const today = `${currentMonth()}-01`;
 
-    assert.equal((await call('POST', '/admin/billing/entries', { clientId: 'CL-004', orders: 1.5 }, admin)).status, 400);
-    assert.equal((await call('POST', '/admin/billing/entries', { clientId: 'CL-004', materials: { ghost: 3 } }, admin)).status, 400);
-    assert.equal((await call('POST', '/admin/billing/entries', { clientId: 'CL-004', orders: 10 }, acme)).status, 401);
-    const added = await (await call('POST', '/admin/billing/entries', { clientId: 'CL-004', orders: 10, materials: { 'bubble-mailer': 5 }, note: 'week 1' }, admin)).json();
-    assert.equal(added.added, 2);
+    assert.equal((await call('POST', '/admin/billing/entries', { clientId: 'CL-004', date: today, serviceKey: 'ghost', quantity: 1 }, admin)).status, 400);
+    assert.equal((await call('POST', '/admin/billing/entries', { clientId: 'CL-004', date: today, serviceKey: fbaKey, quantity: 10 }, acme)).status, 401);
+    const first = await (await call('POST', '/admin/billing/entries', { clientId: 'CL-004', date: today, serviceKey: fbaKey, quantity: 10 }, admin)).json();
+    await call('POST', '/admin/billing/entries', { clientId: 'CL-004', date: today, serviceKey: polyKey, quantity: 4 }, admin);
+    const shipping = await (await call('POST', '/admin/billing/entries', { clientId: 'CL-004', date: today, flatCharge: true, name: 'Shipping External', unitPrice: 12.42, note: 'order #1' }, admin)).json();
+    assert.equal(entryRows.length, 3);
     assert.equal(entryRows[0].get('Entered_By'), 'ADMIN');
+    assert.ok(first.entry.id);
 
-    const adminView = await (await call('GET', '/billing/summary?clientId=CL-004', null, admin)).json();
+    let adminView = await (await call('GET', '/billing/summary?clientId=CL-004', null, admin)).json();
     assert.equal(adminView.month, currentMonth());
-    assert.equal(adminView.totals.monthToDate, 72);
-    assert.equal(adminView.recentEntries.length, 2);
+    assert.equal(adminView.totals.total, 25.12);
+    assert.equal(adminView.entries.length, 3);
+
+    assert.equal((await call('PUT', `/admin/billing/entries/${first.entry.id}`, { quantity: 20 }, acme)).status, 401);
+    assert.equal((await call('PUT', `/admin/billing/entries/${first.entry.id}`, { quantity: -1 }, admin)).status, 400);
+    assert.equal((await call('PUT', `/admin/billing/entries/${first.entry.id}`, { quantity: 20, note: 'recount' }, admin)).status, 200);
+    assert.equal(entryRows[0].get('Quantity'), 20);
+    assert.equal((await call('DELETE', `/admin/billing/entries/${shipping.entry.id}`, null, admin)).status, 200);
+    assert.equal((await call('DELETE', `/admin/billing/entries/${shipping.entry.id}`, null, admin)).status, 404);
+
+    adminView = await (await call('GET', '/billing/summary?clientId=CL-004', null, admin)).json();
+    assert.equal(adminView.totals.total, 24.2);
 
     const clientView = await (await call('GET', '/billing/summary?clientId=CL-005', null, acme)).json();
     assert.equal(clientView.clientId, 'CL-004');
-    assert.equal(clientView.totals.monthToDate, 72);
-    assert.equal(clientView.recentEntries, undefined);
+    assert.equal(clientView.totals.total, 24.2);
+    assert.equal(clientView.entries, undefined);
   } finally {
     await new Promise((resolve) => server.close(resolve));
     GoogleSpreadsheet.prototype.loadInfo = oldLoadInfo;
@@ -848,11 +962,11 @@ test('dashboard filters combine stock, fulfillment, and attribute selections', (
     { id: 'c', title: 'Out', qty: 0, reorderLevel: 5, status: 'Exception - delivery issue' },
     { id: 'd', title: 'Over', qty: 500, reorderLevel: 5, lastActivityAt: new Date(now - 120 * day).toISOString() },
     { id: 'e', title: 'Negative', qty: -2, reorderLevel: 5 },
-    { id: 'f', title: 'Partial order', qty: 4, reorderLevel: 0, quantityOrdered: '10', quantityShipped: '4', addedAt: new Date(now - 3 * day).toISOString() },
-    { id: 'g', title: 'Shipped order', qty: 4, reorderLevel: 0, quantityOrdered: '4', quantityShipped: '4', addedAt: new Date(now - 3 * day).toISOString() },
+    { id: 'f', title: 'Partial order', qty: 4, reorderLevel: 0, quantityReceived: '10', quantityShipped: '4', addedAt: new Date(now - 3 * day).toISOString() },
+    { id: 'g', title: 'Shipped order', qty: 4, reorderLevel: 0, quantityReceived: '4', quantityShipped: '4', addedAt: new Date(now - 3 * day).toISOString() },
     { id: 'h', title: 'Label', qty: 1, reorderLevel: 0, status: 'Ready for Label' }
   ];
-  vm.runInContext("state.items = __items; state.clientProfile = { clientId: 'CL-004', overstockLevel: 100, attributeMap: { bundled: 'bundled', fragile: 'fragile', oversized: null } };", context);
+  vm.runInContext("state.items = __items; state.activeClientId = 'CL-004'; state.clientProfile = { clientId: 'CL-004', overstockLevel: 100, fields: [{ key: 'quantityReceived', label: 'Quantity Received' }, { key: 'quantityShipped', label: 'Quantity Shipped' }], attributeMap: { bundled: 'bundled', fragile: 'fragile', oversized: null } };", context);
   const pick = (filters) => {
     context.__filters = filters;
     return vm.runInContext("state.filters = Object.assign(emptyFilters(), __filters); getFilteredItems().map((item) => item.id).join(',')", context);
@@ -863,6 +977,7 @@ test('dashboard filters combine stock, fulfillment, and attribute selections', (
   assert.equal(pick({ stock: ['over'] }), 'd');
   assert.equal(pick({ stage: ['partial', 'exception', 'label'] }), 'c,f,h');
   assert.equal(pick({ stage: ['fully'] }), 'g');
+  assert.equal(pick({ stage: ['awaiting'] }), 'a,b,d,e');
   assert.equal(pick({ attr: ['bundled'] }), 'b');
   assert.equal(pick({ attr: ['unbundled', 'fragile'] }), 'a,c,d,e,f,g,h');
   assert.equal(pick({ attr: ['aged'] }), 'f');

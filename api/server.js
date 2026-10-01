@@ -5,9 +5,9 @@ const dotenv = require('dotenv');
 const bcrypt = require('bcryptjs');
 const { GoogleSpreadsheet } = require('google-spreadsheet');
 const { JWT } = require('google-auth-library');
-const { normalizeInventoryRow, getSheetNameForClient, isAdminClient, getChatSenderRole, getClientInventoryFields, getDashboardColumns, getCreateFormTitleConfig, getChatDriveFolderForClient, isGoogleDriveUrl, normalizeDriveFolderUrl } = require('./portalLogic');
+const { normalizeInventoryRow, getSheetNameForClient, isAdminClient, getChatSenderRole, getClientInventoryFields, getDashboardColumns, getCreateFormTitleConfig, getChatDriveFolderForClient, isGoogleDriveUrl, normalizeDriveFolderUrl, getShipmentStage, findShipmentFieldKeys, SHIPMENT_STATUS_TEXT } = require('./portalLogic');
 const { mapClientSettings, settingsFromInput, isValidQuickEditPin, planClientSettingsMigration } = require('./clientSchema');
-const { BILLING_RATE_HEADERS, BILLING_ENTRY_HEADERS, MONTH_PATTERN, sanitizeRateCard, rateCardFromRow, currentMonth, summarizeBilling } = require('./billing');
+const { RATE_SHEET, ENTRY_SHEET, BILLING_RATE_HEADERS, BILLING_ENTRY_HEADERS, MONTH_PATTERN, sanitizeRateCard, rateCardFromRow, entryFromRow, sanitizeEntry, currentMonth, summarizeBilling } = require('./billing');
 
 dotenv.config();
 
@@ -1376,12 +1376,15 @@ app.post('/api/inventory/create', async (req, res) => {
       // Generic clients (created through the admin "Add Client" flow) always use the
       // SKU | Title | ...custom fields... | Qty | Status | Notes column layout.
       const profile = await getClientProfile(targetClientId);
+      const shipmentKeys = findShipmentFieldKeys(profile.fields);
       row = [
         itemSku || itemTitle || 'N/A',
         itemTitle || itemSku || 'Untitled',
         ...profile.fields.map((field) => String(values[field.key] ?? '')),
         Number(qty) || 0,
-        String(status || (Number(qty) <= 5 ? 'Low Stock' : 'In Stock')),
+        shipmentKeys
+          ? SHIPMENT_STATUS_TEXT[getShipmentStage(values[shipmentKeys.received], values[shipmentKeys.shipped])]
+          : String(status || (Number(qty) <= 5 ? 'Low Stock' : 'In Stock')),
         String(notes || '')
       ];
     } else {
@@ -1464,6 +1467,72 @@ app.post('/api/quick-edit/unlock', (req, res, next) => {
   } catch (error) {
     console.error('Quick Edit unlock error:', error.message);
     return res.status(error?.response?.status === 429 ? 429 : 500).json({ success: false, error: 'Unable to unlock Quick Edit.' });
+  }
+});
+
+// Column positions for the received/shipped workflow, matching how loadInventoryForClient reads each sheet.
+async function getShipmentColumns(clientId, rows) {
+  const headers = (rows[0] || []).map((cell) => String(cell || '').trim().toLowerCase());
+  const find = (text, fallback) => {
+    const index = headers.findIndex((name) => name.includes(text));
+    return index >= 0 ? index : fallback;
+  };
+  if (clientId === 'CL-002') {
+    return { title: find('product description', 1), received: find('quantity received', 3), shipped: find('quantity shipped', 4), status: -1 };
+  }
+  if (clientId === 'CL-003') {
+    return { title: find('product description/name', 0), received: find('quantity received', 2), shipped: find('quantity shipped', 3), status: -1 };
+  }
+  if (LEGACY_CLIENT_IDS.includes(clientId)) return null;
+  const { fields } = await getClientProfile(clientId);
+  const keys = findShipmentFieldKeys(fields);
+  if (!keys) return null;
+  const indexOf = (key) => 2 + fields.findIndex((field) => field.key === key);
+  return { title: 1, received: indexOf(keys.received), shipped: indexOf(keys.shipped), status: 2 + fields.length + 1 };
+}
+
+app.put('/api/inventory/shipment', async (req, res) => {
+  const session = readNotificationSession(req);
+  if (!isStaffSession(session)) return res.status(401).json({ success: false, error: 'Only ECL staff can update received and shipped quantities.' });
+  try {
+    const clientId = normalizeClientId(req.body?.clientId);
+    const itemId = String(req.body?.itemId || '');
+    const received = Number(req.body?.received);
+    const shipped = Number(req.body?.shipped);
+    const match = itemId.match(/^(.+)-(\d+)$/);
+    if (!clientId || !match || normalizeClientId(match[1]) !== clientId) {
+      return res.status(400).json({ success: false, error: 'Invalid item.' });
+    }
+    if (![received, shipped].every((value) => Number.isSafeInteger(value) && value >= 0)) {
+      return res.status(400).json({ success: false, error: 'Quantities must be whole numbers of 0 or more.' });
+    }
+    if (shipped > received) {
+      return res.status(400).json({ success: false, error: 'Shipped cannot be more than received.' });
+    }
+
+    const sheet = await findSheetByTitle(clientId);
+    if (!sheet) return res.status(404).json({ success: false, error: 'Inventory sheet not found.' });
+    const rows = await loadSheetRows(clientId, LEGACY_CLIENT_IDS.includes(clientId) ? null : 500);
+    const columns = await getShipmentColumns(clientId, rows);
+    if (!columns) return res.status(400).json({ success: false, error: 'This client does not track received and shipped quantities.' });
+    const rowIndex = Number(match[2]);
+    const rowTitle = String(rows[rowIndex]?.[columns.title] || '').trim();
+    // Row numbers shift if someone inserts rows in the sheet, so confirm it is still the same product.
+    if (rowIndex < 1 || !rowTitle || rowTitle !== String(req.body?.title || '').trim()) {
+      return res.status(409).json({ success: false, error: 'This item moved in the sheet. Refresh and try again.' });
+    }
+
+    const stage = getShipmentStage(received, shipped);
+    sheet.getCell(rowIndex, columns.received).value = received;
+    sheet.getCell(rowIndex, columns.shipped).value = shipped;
+    if (columns.status >= 0) sheet.getCell(rowIndex, columns.status).value = SHIPMENT_STATUS_TEXT[stage];
+    await withRetry(() => sheet.saveUpdatedCells());
+    invalidateReadCache('inventory:');
+    await recordInventoryEvent(clientId, `Received ${received}, shipped ${shipped}: ${rowTitle}`, session.username);
+    return res.json({ success: true, received, shipped, stage, status: SHIPMENT_STATUS_TEXT[stage] });
+  } catch (error) {
+    console.error('Shipment update error:', error.message);
+    return res.status(error?.response?.status === 429 ? 429 : 500).json({ success: false, error: 'Unable to update shipment.' });
   }
 });
 
@@ -1712,23 +1781,13 @@ app.get('/api/inventory', async (req, res) => {
 });
 
 async function loadBillingRateRow(clientId) {
-  const rows = await loadNotificationRows('Billing_Rates');
+  const rows = await loadNotificationRows(RATE_SHEET);
   return rows.find((row) => normalizeClientId(row.get('Client_ID')) === clientId) || null;
 }
 
 async function loadBillingEntries(clientId) {
-  const rows = await loadNotificationRows('Billing_Entries');
-  return rows
-    .filter((row) => normalizeClientId(row.get('Client_ID')) === clientId)
-    .map((row) => ({
-      timestamp: row.get('Timestamp') || '',
-      month: String(row.get('Month') || '').trim(),
-      type: String(row.get('Type') || '').trim(),
-      itemKey: String(row.get('Item_Key') || '').trim(),
-      quantity: Number(row.get('Quantity')) || 0,
-      note: String(row.get('Note') || ''),
-      enteredBy: String(row.get('Entered_By') || '')
-    }));
+  const rows = await loadNotificationRows(ENTRY_SHEET);
+  return rows.filter((row) => normalizeClientId(row.get('Client_ID')) === clientId).map(entryFromRow);
 }
 
 function isBillableClient(clientId) {
@@ -1755,7 +1814,11 @@ app.get('/api/billing/summary', async (req, res) => {
       clientId,
       configured: Boolean(rateRow),
       ...summary,
-      ...(staff ? { recentEntries: entries.filter((entry) => entry.month === month).slice(-10).reverse() } : {})
+      ...(staff ? {
+        entries: entries
+          .filter((entry) => entry.date.startsWith(`${month}-`))
+          .sort((a, b) => b.date.localeCompare(a.date) || b.updatedAt.localeCompare(a.updatedAt))
+      } : {})
     });
   } catch (error) {
     console.error('Billing summary error:', error.message);
@@ -1770,15 +1833,12 @@ app.put('/api/admin/billing/rates/:clientId', async (req, res) => {
     const rateCard = sanitizeRateCard(req.body || {});
     const values = {
       Client_ID: clientId,
-      Base_Fee: rateCard.baseFee,
-      Order_Labor_Rate: rateCard.orderLaborRate,
-      Packaging_Multiplier: rateCard.packagingMultiplier,
-      Minimum_Charge: rateCard.minimumCharge,
-      Materials_JSON: JSON.stringify(rateCard.materials),
+      Services_JSON: JSON.stringify(rateCard.services),
+      Tax_Rate: rateCard.taxRate,
       Client_Visible: rateCard.clientVisible ? 'true' : 'false',
       Updated_At: new Date().toISOString()
     };
-    const sheet = await getOrCreateSheet('Billing_Rates', BILLING_RATE_HEADERS);
+    const sheet = await getOrCreateSheet(RATE_SHEET, BILLING_RATE_HEADERS);
     const rows = await withRetry(() => sheet.getRows());
     const row = rows.find((entry) => normalizeClientId(entry.get('Client_ID')) === clientId);
     if (row) {
@@ -1787,7 +1847,7 @@ app.put('/api/admin/billing/rates/:clientId', async (req, res) => {
     } else {
       await withRetry(() => sheet.addRow(values));
     }
-    invalidateReadCache('rows:Billing_Rates');
+    invalidateReadCache(`rows:${RATE_SHEET}`);
     return res.json({ success: true, rateCard });
   } catch (error) {
     console.error('Billing rate save error:', error.message);
@@ -1795,43 +1855,76 @@ app.put('/api/admin/billing/rates/:clientId', async (req, res) => {
   }
 });
 
+function billingEntryValues(entry, clientId, username) {
+  return {
+    Client_ID: clientId,
+    Date: entry.date,
+    Service_Key: entry.serviceKey,
+    Service_Name: entry.name,
+    Description: entry.description,
+    Unit_Price: entry.unitPrice,
+    Quantity: entry.quantity,
+    Flat_Charge: entry.flat ? 'true' : 'false',
+    Note: entry.note,
+    Entered_By: username,
+    Updated_At: new Date().toISOString()
+  };
+}
+
+async function findBillingEntryRow(entryId) {
+  const sheet = await getOrCreateSheet(ENTRY_SHEET, BILLING_ENTRY_HEADERS);
+  const rows = await withRetry(() => sheet.getRows());
+  return rows.find((row) => String(row.get('Entry_ID')) === entryId) || null;
+}
+
 app.post('/api/admin/billing/entries', async (req, res) => {
   try {
     const body = req.body || {};
     const clientId = normalizeClientId(body.clientId);
-    const month = String(body.month || currentMonth()).trim();
-    if (!isBillableClient(clientId) || !MONTH_PATTERN.test(month)) {
-      return res.status(400).json({ success: false, error: 'Choose a client and a valid month.' });
-    }
+    if (!isBillableClient(clientId)) return res.status(400).json({ success: false, error: 'Choose a client.' });
     const rateCard = rateCardFromRow(await loadBillingRateRow(clientId));
-    const materialKeys = new Set(rateCard.materials.map((material) => material.key));
-    const isCount = (value) => Number.isSafeInteger(value) && Math.abs(value) <= 1000000;
+    const { entry, error } = sanitizeEntry(body, rateCard);
+    if (error) return res.status(400).json({ success: false, error });
 
-    // Negative quantities are allowed so mistakes can be corrected with an offsetting entry.
-    const pending = [];
-    const orders = Number(body.orders || 0);
-    if (!isCount(orders)) return res.status(400).json({ success: false, error: 'Orders must be a whole number.' });
-    if (orders) pending.push({ type: 'orders', key: '', quantity: orders });
-    for (const [key, raw] of Object.entries(body.materials && typeof body.materials === 'object' ? body.materials : {})) {
-      const quantity = Number(raw || 0);
-      if (!materialKeys.has(key)) return res.status(400).json({ success: false, error: `Unknown material "${key}".` });
-      if (!isCount(quantity)) return res.status(400).json({ success: false, error: 'Material quantities must be whole numbers.' });
-      if (quantity) pending.push({ type: 'material', key, quantity });
-    }
-    if (!pending.length) return res.status(400).json({ success: false, error: 'Enter at least one order count or material quantity.' });
-
-    const timestamp = new Date().toISOString();
-    const note = String(body.note || '').trim().slice(0, 200);
-    const sheet = await getOrCreateSheet('Billing_Entries', BILLING_ENTRY_HEADERS);
-    await withRetry(() => sheet.addRows(pending.map((entry) => ({
-      Timestamp: timestamp, Client_ID: clientId, Month: month, Type: entry.type, Item_Key: entry.key,
-      Quantity: entry.quantity, Note: note, Entered_By: req.adminSession.username
-    }))));
-    invalidateReadCache('rows:Billing_Entries');
-    return res.json({ success: true, added: pending.length });
+    const sheet = await getOrCreateSheet(ENTRY_SHEET, BILLING_ENTRY_HEADERS);
+    const id = crypto.randomUUID();
+    await withRetry(() => sheet.addRow({ Entry_ID: id, ...billingEntryValues(entry, clientId, req.adminSession.username) }));
+    invalidateReadCache(`rows:${ENTRY_SHEET}`);
+    return res.json({ success: true, entry: { id, ...entry } });
   } catch (error) {
     console.error('Billing entry error:', error.message);
     return res.status(error?.response?.status === 429 ? 429 : 500).json({ success: false, error: 'Unable to save billing entry.' });
+  }
+});
+
+app.put('/api/admin/billing/entries/:entryId', async (req, res) => {
+  try {
+    const row = await findBillingEntryRow(String(req.params.entryId));
+    if (!row) return res.status(404).json({ success: false, error: 'That entry no longer exists.' });
+    const clientId = normalizeClientId(row.get('Client_ID'));
+    const rateCard = rateCardFromRow(await loadBillingRateRow(clientId));
+    const { entry, error } = sanitizeEntry(req.body || {}, rateCard, entryFromRow(row));
+    if (error) return res.status(400).json({ success: false, error });
+    Object.entries(billingEntryValues(entry, clientId, req.adminSession.username)).forEach(([key, value]) => row.set(key, value));
+    await withRetry(() => row.save());
+    invalidateReadCache(`rows:${ENTRY_SHEET}`);
+    return res.json({ success: true, entry: { id: req.params.entryId, ...entry } });
+  } catch (error) {
+    console.error('Billing entry update error:', error.message);
+    return res.status(error?.response?.status === 429 ? 429 : 500).json({ success: false, error: 'Unable to update billing entry.' });
+  }
+});
+
+app.delete('/api/admin/billing/entries/:entryId', async (req, res) => {
+  try {
+    const row = await findBillingEntryRow(String(req.params.entryId));
+    if (!row) return res.status(404).json({ success: false, error: 'That entry no longer exists.' });
+    await withRetry(() => row.delete());
+    invalidateReadCache(`rows:${ENTRY_SHEET}`);
+    return res.json({ success: true });
+  } catch (error) {
+    console.error('Billing entry delete error:', error.message);
+    return res.status(error?.response?.status === 429 ? 429 : 500).json({ success: false, error: 'Unable to delete billing entry.' });
   }
 });
 

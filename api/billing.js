@@ -1,25 +1,33 @@
-// Pure billing math and rate-card mapping; sheet access lives in server.js.
+// Pure billing logic: invoice-style line items built from per-client service rate cards.
 
-const BILLING_RATE_HEADERS = ['Client_ID', 'Base_Fee', 'Order_Labor_Rate', 'Packaging_Multiplier', 'Minimum_Charge', 'Materials_JSON', 'Client_Visible', 'Updated_At'];
-const BILLING_ENTRY_HEADERS = ['Timestamp', 'Client_ID', 'Month', 'Type', 'Item_Key', 'Quantity', 'Note', 'Entered_By'];
+const RATE_SHEET = 'Billing_Rate_Cards';
+const ENTRY_SHEET = 'Billing_Line_Items';
+const BILLING_RATE_HEADERS = ['Client_ID', 'Services_JSON', 'Tax_Rate', 'Client_Visible', 'Updated_At'];
+const BILLING_ENTRY_HEADERS = ['Entry_ID', 'Client_ID', 'Date', 'Service_Key', 'Service_Name', 'Description', 'Unit_Price', 'Quantity', 'Flat_Charge', 'Note', 'Entered_By', 'Updated_At'];
 const MONTH_PATTERN = /^\d{4}-(0[1-9]|1[0-2])$/;
+const MAX_AMOUNT = 1000000;
 
 function money(value) {
   return Math.round((Number(value) || 0) * 100) / 100;
 }
 
-function nonNegative(value, fallback = 0) {
-  if (value === null || value === undefined || String(value).trim() === '') return fallback;
-  const number = Number(value);
-  return Number.isFinite(number) && number >= 0 ? number : fallback;
+function isBlank(value) {
+  return value === null || value === undefined || String(value).trim() === '';
 }
 
-function slugify(label, index) {
-  const key = String(label || '').trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
-  return key || `material-${index + 1}`;
+function isValidDate(value) {
+  const text = String(value || '');
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(text)) return false;
+  const date = new Date(`${text}T00:00:00Z`);
+  return !Number.isNaN(date.getTime()) && date.toISOString().slice(0, 10) === text;
 }
 
-function sanitizeMaterials(raw) {
+function slugify(text, index) {
+  const key = String(text || '').trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+  return key || `service-${index + 1}`;
+}
+
+function sanitizeServices(raw) {
   let list = raw;
   if (typeof raw === 'string') {
     try {
@@ -31,45 +39,82 @@ function sanitizeMaterials(raw) {
   if (!Array.isArray(list)) return [];
   const seen = new Set();
   return list
-    .map((material, index) => {
-      const label = String(material?.label || '').trim().slice(0, 60);
-      if (!label) return null;
-      let key = String(material?.key || '').trim() || slugify(label, index);
+    .map((service, index) => {
+      const name = String(service?.name || '').trim().slice(0, 80);
+      if (!name) return null;
+      const unitPrice = Number(service?.unitPrice);
+      const description = String(service?.description || '').trim().slice(0, 200);
+      // Same service name can carry different rates (e.g. "Bundling" vs oversized bundling), so the key includes the description.
+      let key = String(service?.key || '').trim() || slugify(`${name} ${description}`, index);
       while (seen.has(key)) key = `${key}-${index + 1}`;
       seen.add(key);
-      return { key, label, unitCost: money(nonNegative(material?.unitCost)) };
+      return { key, name, unitPrice: Number.isFinite(unitPrice) && unitPrice >= 0 ? money(unitPrice) : 0, description };
     })
     .filter(Boolean);
 }
 
 function sanitizeRateCard(input = {}) {
+  const taxRate = Number(input.taxRate);
   return {
-    baseFee: money(nonNegative(input.baseFee)),
-    orderLaborRate: money(nonNegative(input.orderLaborRate)),
-    packagingMultiplier: nonNegative(input.packagingMultiplier, 1),
-    minimumCharge: money(nonNegative(input.minimumCharge)),
-    materials: sanitizeMaterials(input.materials),
+    services: sanitizeServices(input.services),
+    taxRate: !isBlank(input.taxRate) && Number.isFinite(taxRate) && taxRate >= 0 && taxRate <= 100 ? taxRate : 0,
     clientVisible: input.clientVisible === true || ['true', 'yes', '1'].includes(String(input.clientVisible).trim().toLowerCase())
   };
 }
 
 function rateCardFromRow(row) {
   if (!row) return sanitizeRateCard({});
-  return sanitizeRateCard({
-    baseFee: row.get('Base_Fee'),
-    orderLaborRate: row.get('Order_Labor_Rate'),
-    packagingMultiplier: String(row.get('Packaging_Multiplier') ?? '').trim() === '' ? 1 : row.get('Packaging_Multiplier'),
-    minimumCharge: row.get('Minimum_Charge'),
-    materials: row.get('Materials_JSON'),
-    clientVisible: row.get('Client_Visible')
-  });
+  return sanitizeRateCard({ services: row.get('Services_JSON'), taxRate: row.get('Tax_Rate'), clientVisible: row.get('Client_Visible') });
+}
+
+function entryFromRow(row) {
+  return {
+    id: String(row.get('Entry_ID') || ''),
+    date: String(row.get('Date') || ''),
+    serviceKey: String(row.get('Service_Key') || ''),
+    name: String(row.get('Service_Name') || ''),
+    description: String(row.get('Description') || ''),
+    unitPrice: money(row.get('Unit_Price')),
+    quantity: Number(row.get('Quantity')) || 0,
+    flat: String(row.get('Flat_Charge')).trim().toLowerCase() === 'true',
+    note: String(row.get('Note') || ''),
+    enteredBy: String(row.get('Entered_By') || ''),
+    updatedAt: String(row.get('Updated_At') || '')
+  };
+}
+
+// Validates one day's line item. `existing` lets edits keep a service that was later removed from the rate card.
+function sanitizeEntry(input = {}, rateCard = { services: [] }, existing = null) {
+  const date = String(input.date ?? existing?.date ?? '').trim();
+  if (!isValidDate(date)) return { error: 'Choose a valid date.' };
+  const note = String(input.note ?? existing?.note ?? '').trim().slice(0, 200);
+  const flat = existing ? existing.flat : input.flatCharge === true;
+
+  if (flat) {
+    const name = String(input.name ?? existing?.name ?? '').trim().slice(0, 80);
+    const amount = Number(input.unitPrice ?? existing?.unitPrice);
+    if (!name) return { error: 'Give the charge a name.' };
+    if (!Number.isFinite(amount) || amount === 0 || Math.abs(amount) > MAX_AMOUNT) return { error: 'Enter a non-zero amount.' };
+    return { entry: { date, serviceKey: '', name, description: '', unitPrice: money(amount), quantity: 1, flat: true, note } };
+  }
+
+  const serviceKey = String(input.serviceKey ?? existing?.serviceKey ?? '').trim();
+  const service = rateCard.services.find((entry) => entry.key === serviceKey)
+    || (existing && existing.serviceKey === serviceKey ? { key: serviceKey, name: existing.name, description: existing.description, unitPrice: existing.unitPrice } : null);
+  if (!service) return { error: 'Choose a service from the rate card.' };
+  const quantity = Number(input.quantity ?? existing?.quantity);
+  if (!Number.isFinite(quantity) || quantity <= 0 || quantity > MAX_AMOUNT || money(quantity) !== quantity) {
+    return { error: 'Quantity must be a positive number.' };
+  }
+  const unitPrice = isBlank(input.unitPrice) ? (existing && existing.serviceKey === serviceKey ? existing.unitPrice : service.unitPrice) : Number(input.unitPrice);
+  if (!Number.isFinite(unitPrice) || unitPrice < 0 || unitPrice > MAX_AMOUNT) return { error: 'Unit price must be zero or more.' };
+  return { entry: { date, serviceKey, name: service.name, description: service.description, unitPrice: money(unitPrice), quantity, flat: false, note } };
 }
 
 function currentMonth(now = new Date()) {
   return now.toISOString().slice(0, 7);
 }
 
-// Fraction of the month elapsed (UTC): 1 for past months, 0 for future months.
 function monthProgress(month, now = new Date()) {
   const [year, monthIndex] = month.split('-').map(Number);
   const daysInMonth = new Date(Date.UTC(year, monthIndex, 0)).getUTCDate();
@@ -82,53 +127,61 @@ function monthProgress(month, now = new Date()) {
 
 function summarizeBilling({ rateCard, entries = [], month, now = new Date() }) {
   const card = sanitizeRateCard(rateCard);
-  const monthEntries = entries.filter((entry) => entry.month === month);
-  const orders = monthEntries.filter((entry) => entry.type === 'orders').reduce((sum, entry) => sum + entry.quantity, 0);
-  const laborTotal = money(orders * card.orderLaborRate);
+  const monthEntries = entries.filter((entry) => String(entry.date || '').startsWith(`${month}-`));
+  const serviceOrder = new Map(card.services.map((service, index) => [service.key, index]));
 
-  const materialLines = card.materials.map((material) => {
-    const quantity = monthEntries
-      .filter((entry) => entry.type === 'material' && entry.itemKey === material.key)
-      .reduce((sum, entry) => sum + entry.quantity, 0);
-    return { key: material.key, label: material.label, quantity, unitCost: material.unitCost, total: money(quantity * material.unitCost * card.packagingMultiplier) };
+  // Invoice lines: per-unit services group by service + price; flat charges stay one line each.
+  const grouped = new Map();
+  const flatLines = [];
+  monthEntries.forEach((entry) => {
+    if (entry.flat) {
+      flatLines.push({ name: entry.name, description: entry.note, flat: true, unitPrice: entry.unitPrice, quantity: 1, amount: money(entry.unitPrice) });
+      return;
+    }
+    const key = `${entry.serviceKey}|${entry.unitPrice}`;
+    const line = grouped.get(key) || { serviceKey: entry.serviceKey, name: entry.name, description: entry.description, flat: false, unitPrice: entry.unitPrice, quantity: 0, amount: 0 };
+    line.quantity += entry.quantity;
+    grouped.set(key, line);
   });
-  const materialsTotal = money(materialLines.reduce((sum, line) => sum + line.total, 0));
-  const usageTotal = money(laborTotal + materialsTotal);
-  const monthToDate = money(Math.max(card.baseFee + usageTotal, card.minimumCharge));
+  const serviceLines = [...grouped.values()]
+    .map((line) => ({ ...line, quantity: money(line.quantity), amount: money(line.quantity * line.unitPrice) }))
+    .sort((a, b) => (serviceOrder.get(a.serviceKey) ?? 999) - (serviceOrder.get(b.serviceKey) ?? 999) || a.unitPrice - b.unitPrice);
+  const lines = [...serviceLines, ...flatLines];
 
+  const serviceTotal = money(serviceLines.reduce((sum, line) => sum + line.amount, 0));
+  const flatTotal = money(flatLines.reduce((sum, line) => sum + line.amount, 0));
+  const subtotal = money(serviceTotal + flatTotal);
+  const tax = money(subtotal * card.taxRate / 100);
   const progress = monthProgress(month, now);
-  const projectedUsage = progress.fraction > 0 ? money(usageTotal / progress.fraction) : 0;
-  const projectedTotal = money(Math.max(card.baseFee + projectedUsage, card.minimumCharge));
+  // Only per-unit work is extrapolated; one-off charges like external shipping are added as-is.
+  const projectedSubtotal = progress.fraction > 0 ? money(serviceTotal / progress.fraction + flatTotal) : subtotal;
+  const [year, monthIndex] = month.split('-').map(Number);
 
   return {
     month,
+    period: { start: `${monthIndex}/1/${year}`, end: `${monthIndex}/${progress.daysInMonth}/${year}` },
     rateCard: card,
-    orders,
-    lines: [
-      { label: 'Monthly base fee', detail: '', total: card.baseFee },
-      { label: 'Fulfillment labor', detail: `${orders} orders × $${card.orderLaborRate.toFixed(2)}`, total: laborTotal },
-      ...materialLines.map((line) => ({
-        label: line.label,
-        detail: `${line.quantity} × $${line.unitCost.toFixed(2)}${card.packagingMultiplier !== 1 ? ` × ${card.packagingMultiplier}` : ''}`,
-        total: line.total
-      }))
-    ],
+    lines,
     totals: {
-      usage: usageTotal,
-      minimumAdjustment: money(Math.max(0, card.minimumCharge - (card.baseFee + usageTotal))),
-      monthToDate,
-      projected: projectedTotal
+      subtotal,
+      tax,
+      total: money(subtotal + tax),
+      projected: money(projectedSubtotal + projectedSubtotal * card.taxRate / 100)
     },
     progress
   };
 }
 
 module.exports = {
+  RATE_SHEET,
+  ENTRY_SHEET,
   BILLING_RATE_HEADERS,
   BILLING_ENTRY_HEADERS,
   MONTH_PATTERN,
   sanitizeRateCard,
   rateCardFromRow,
+  entryFromRow,
+  sanitizeEntry,
   currentMonth,
   summarizeBilling
 };
