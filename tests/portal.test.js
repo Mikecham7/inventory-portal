@@ -740,6 +740,96 @@ test('drive folders and chat files stay inside the signed-in client account', as
   }
 });
 
+test('billing math applies per-client rates, packaging multiplier, minimums, and month-end projection', () => {
+  const { summarizeBilling, sanitizeRateCard } = require('../api/billing.js');
+  const rateCard = {
+    baseFee: 100, orderLaborRate: 1.5, packagingMultiplier: 1.2, minimumCharge: 0,
+    materials: [{ key: 'box', label: 'Small box', unitCost: 0.5 }, { key: 'tape', label: 'Tape', unitCost: 2 }]
+  };
+  const entries = [
+    { month: '2026-09', type: 'orders', quantity: 200 },
+    { month: '2026-09', type: 'orders', quantity: -10 },
+    { month: '2026-09', type: 'material', itemKey: 'box', quantity: 100 },
+    { month: '2026-08', type: 'orders', quantity: 999 }
+  ];
+  const mid = summarizeBilling({ rateCard, entries, month: '2026-09', now: new Date('2026-09-10T12:00:00Z') });
+  assert.equal(mid.orders, 190);
+  assert.equal(mid.totals.usage, 345);
+  assert.equal(mid.totals.monthToDate, 445);
+  assert.equal(mid.totals.projected, 1135);
+  assert.deepEqual(mid.lines.map((line) => line.total), [100, 285, 60, 0]);
+
+  const past = summarizeBilling({ rateCard: { ...rateCard, minimumCharge: 2000 }, entries, month: '2026-09', now: new Date('2026-10-02T00:00:00Z') });
+  assert.equal(past.totals.projected, 2000);
+  assert.equal(past.totals.minimumAdjustment, 1555);
+
+  const cleaned = sanitizeRateCard({ baseFee: -5, orderLaborRate: 'abc', packagingMultiplier: '', materials: '[{"label":"Box","unitCost":-1},{"label":""}]', clientVisible: 'TRUE' });
+  assert.deepEqual(cleaned, { baseFee: 0, orderLaborRate: 0, packagingMultiplier: 1, minimumCharge: 0, materials: [{ key: 'box', label: 'Box', unitCost: 0 }], clientVisible: true });
+});
+
+test('billing API keeps rate cards and usage entries admin-only and respects client visibility', async () => {
+  const { invalidateReadCache: clearCache } = require('../api/server.js');
+  const { currentMonth } = require('../api/billing.js');
+  clearCache('');
+  const makeRow = (values) => ({ values, get: (key) => values[key] ?? '', set: (key, value) => { values[key] = value; }, save: async () => {} });
+  const rateRows = [];
+  const entryRows = [];
+  const sheets = {
+    Billing_Rates: { headerValues: [], loadHeaderRow: async () => {}, setHeaderRow: async (h) => { sheets.Billing_Rates.headerValues = h; }, getRows: async () => rateRows, addRow: async (row) => rateRows.push(makeRow(row)) },
+    Billing_Entries: { headerValues: [], loadHeaderRow: async () => {}, setHeaderRow: async (h) => { sheets.Billing_Entries.headerValues = h; }, getRows: async () => entryRows, addRows: async (rows) => rows.forEach((row) => entryRows.push(makeRow(row))) }
+  };
+  const titleDescriptor = Object.getOwnPropertyDescriptor(GoogleSpreadsheet.prototype, 'sheetsByTitle');
+  const indexDescriptor = Object.getOwnPropertyDescriptor(GoogleSpreadsheet.prototype, 'sheetsByIndex');
+  const oldLoadInfo = GoogleSpreadsheet.prototype.loadInfo;
+  GoogleSpreadsheet.prototype.loadInfo = async () => {};
+  Object.defineProperty(GoogleSpreadsheet.prototype, 'sheetsByTitle', { configurable: true, get: () => sheets });
+  Object.defineProperty(GoogleSpreadsheet.prototype, 'sheetsByIndex', { configurable: true, get: () => Object.values(sheets) });
+  const { app } = require('../api/server.js');
+  const server = app.listen(0);
+  const base = `http://127.0.0.1:${server.address().port}/api`;
+  const call = (method, path, body, token) => fetch(`${base}${path}`, {
+    method,
+    headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+    body: body ? JSON.stringify(body) : undefined
+  });
+  const admin = signNotificationSession('ADMIN', 'CL-000', 'admin');
+  const acme = signNotificationSession('Acme', 'CL-004', 'client');
+  try {
+    assert.equal((await call('GET', '/billing/summary?clientId=CL-004')).status, 401);
+    assert.equal((await call('GET', '/billing/summary', null, acme)).status, 403);
+    assert.equal((await call('PUT', '/admin/billing/rates/CL-004', { baseFee: 50 }, acme)).status, 401);
+
+    const saved = await (await call('PUT', '/admin/billing/rates/CL-004', {
+      baseFee: 50, orderLaborRate: 2, packagingMultiplier: 1, minimumCharge: 0, clientVisible: true,
+      materials: [{ label: 'Bubble mailer', unitCost: 0.4 }]
+    }, admin)).json();
+    assert.ok(saved.success);
+    assert.equal(rateRows[0].get('Client_ID'), 'CL-004');
+
+    assert.equal((await call('POST', '/admin/billing/entries', { clientId: 'CL-004', orders: 1.5 }, admin)).status, 400);
+    assert.equal((await call('POST', '/admin/billing/entries', { clientId: 'CL-004', materials: { ghost: 3 } }, admin)).status, 400);
+    assert.equal((await call('POST', '/admin/billing/entries', { clientId: 'CL-004', orders: 10 }, acme)).status, 401);
+    const added = await (await call('POST', '/admin/billing/entries', { clientId: 'CL-004', orders: 10, materials: { 'bubble-mailer': 5 }, note: 'week 1' }, admin)).json();
+    assert.equal(added.added, 2);
+    assert.equal(entryRows[0].get('Entered_By'), 'ADMIN');
+
+    const adminView = await (await call('GET', '/billing/summary?clientId=CL-004', null, admin)).json();
+    assert.equal(adminView.month, currentMonth());
+    assert.equal(adminView.totals.monthToDate, 72);
+    assert.equal(adminView.recentEntries.length, 2);
+
+    const clientView = await (await call('GET', '/billing/summary?clientId=CL-005', null, acme)).json();
+    assert.equal(clientView.clientId, 'CL-004');
+    assert.equal(clientView.totals.monthToDate, 72);
+    assert.equal(clientView.recentEntries, undefined);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+    GoogleSpreadsheet.prototype.loadInfo = oldLoadInfo;
+    Object.defineProperty(GoogleSpreadsheet.prototype, 'sheetsByTitle', titleDescriptor);
+    Object.defineProperty(GoogleSpreadsheet.prototype, 'sheetsByIndex', indexDescriptor);
+  }
+});
+
 test('dashboard filters combine stock, fulfillment, and attribute selections', () => {
   const context = vm.createContext({
     document: { hidden: false, getElementById: () => null, querySelectorAll: () => [], addEventListener() {} },

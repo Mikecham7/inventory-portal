@@ -44,6 +44,12 @@ const UPDATE_QUANTITY_URL = window.location.hostname === 'localhost' || window.l
 const QUICK_EDIT_UNLOCK_URL = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
   ? 'http://localhost:3001/api/quick-edit/unlock'
   : '/api/quick-edit/unlock';
+const BILLING_URL = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
+  ? 'http://localhost:3001/api/billing/summary'
+  : '/api/billing/summary';
+const ADMIN_BILLING_URL = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
+  ? 'http://localhost:3001/api/admin/billing'
+  : '/api/admin/billing';
 
 const defaultInventory = [];
 
@@ -231,6 +237,9 @@ const state = {
   items: [],
   filters: { stock: [], stage: [], attr: [] },
   quickEditUnlock: null,
+  billing: null,
+  rateCardClientId: null,
+  rateMaterials: [],
   query: '',
   selectedItemId: null,
   auth: false,
@@ -275,9 +284,13 @@ function cacheClientView(clientId, values) {
   if (!clientId) return;
   clientViewCache.set(clientId, { ...(clientViewCache.get(clientId) || {}), ...values });
 }
-const syncTimers = { chat: null, inventory: null, notifications: null };
-const syncFailures = { chat: 0, inventory: 0, notifications: 0 };
-const syncIntervals = { chat: 10000, inventory: 15000, notifications: 30000 };
+const syncTimers = { chat: null, inventory: null, notifications: null, billing: null };
+const syncFailures = { chat: 0, inventory: 0, notifications: 0, billing: 0 };
+const syncIntervals = { chat: 10000, inventory: 15000, notifications: 30000, billing: 15000 };
+
+function isPageActive(pageId) {
+  return Boolean(document.getElementById(pageId)?.classList.contains('active'));
+}
 
 function stopBackgroundSync() {
   syncGeneration += 1;
@@ -293,10 +306,12 @@ function scheduleBackgroundSync(kind, delay, generation = syncGeneration) {
   syncTimers[kind] = setTimeout(async () => {
     if (generation !== syncGeneration || !state.auth || document.hidden) return;
     if (kind === 'chat' && !document.getElementById('page-chat')?.classList.contains('active')) return;
+    if (kind === 'billing' && !isPageActive('page-billing')) return;
 
     const clientId = state.activeClientId;
     const status = kind === 'chat' ? await loadChatMessages(clientId)
-      : kind === 'inventory' ? await fetchInventory(clientId) : await fetchNotifications(clientId);
+      : kind === 'billing' ? await loadBillingSummary(clientId)
+        : kind === 'inventory' ? await fetchInventory(clientId) : await fetchNotifications(clientId);
     if (generation !== syncGeneration || !state.auth || document.hidden || clientId !== state.activeClientId) return;
 
     syncFailures[kind] = status === 200 ? 0 : syncFailures[kind] + 1;
@@ -313,6 +328,9 @@ function startBackgroundSync(immediate = false) {
   scheduleBackgroundSync('notifications', immediate ? 1500 : syncIntervals.notifications);
   if (document.getElementById('page-chat')?.classList.contains('active')) {
     scheduleBackgroundSync('chat', immediate ? 1000 : syncIntervals.chat);
+  }
+  if (isPageActive('page-billing')) {
+    scheduleBackgroundSync('billing', immediate ? 500 : syncIntervals.billing);
   }
 }
 
@@ -455,9 +473,10 @@ function setPage(pageId) {
   const tabMap = {
     'page-dashboard': 0,
     'page-update': 1,
-    'page-order': 3,
-    'page-logs': 4,
-    'page-chat': 5,
+    'page-order': 2,
+    'page-logs': 3,
+    'page-chat': 4,
+    'page-billing': 5,
     'page-clients': 6
   };
 
@@ -471,6 +490,11 @@ function setPage(pageId) {
       clearTimeout(syncTimers.chat);
       syncTimers.chat = null;
     }
+    if (pageId === 'page-billing') scheduleBackgroundSync('billing', syncIntervals.billing);
+    else {
+      clearTimeout(syncTimers.billing);
+      syncTimers.billing = null;
+    }
   }
 }
 
@@ -481,6 +505,7 @@ function showPage(pageName, markChatRead = true) {
     order: 'page-order',
     logs: 'page-logs',
     chat: 'page-chat',
+    billing: 'page-billing',
     clients: 'page-clients'
   };
 
@@ -495,6 +520,9 @@ function showPage(pageName, markChatRead = true) {
         markNotificationsRead('chat', clientId);
       }
     });
+  }
+  if (targetPage === 'page-billing' && state.auth) {
+    loadBillingSummary(state.activeClientId);
   }
   if (targetPage === 'page-clients') {
     renderClientFieldRows();
@@ -652,23 +680,58 @@ function getItemAttributes(item, profile = state.clientProfile, now = Date.now()
   return attributes;
 }
 
-function renderFilterControls() {
-  const host = document.getElementById('filterGroups');
-  if (!host) return;
+function renderFilterControls(resultCount = getFilteredItems().length) {
   const filters = state.filters || emptyFilters();
-  const anyActive = FILTER_GROUPS.some((group) => filters[group.key].length);
-  host.innerHTML = `
-    <button class="filter-btn ${anyActive ? '' : 'active'}" type="button" data-action="clear-filters">All</button>
-    ${FILTER_GROUPS.map((group) => `
-      <div class="filter-group" role="group" aria-label="${group.label}">
-        <span class="filter-group-label">${group.label}</span>
-        ${group.options.map(([key, label]) => {
-          const active = filters[group.key].includes(key);
-          return `<button class="filter-btn ${active ? 'active' : ''}" type="button" aria-pressed="${active}" data-action="toggle-filter" data-group="${group.key}" data-key="${key}">${label}</button>`;
-        }).join('')}
+  const selected = FILTER_GROUPS.flatMap((group) => group.options
+    .filter(([key]) => filters[group.key].includes(key))
+    .map(([key, label]) => ({ group: group.key, key, label })));
+
+  const host = document.getElementById('filterGroups');
+  if (host) {
+    const focused = document.activeElement?.dataset?.key ? `${document.activeElement.dataset.group}:${document.activeElement.dataset.key}` : '';
+    host.innerHTML = FILTER_GROUPS.map((group) => `
+      <div class="filter-section" role="group" aria-label="${group.label}">
+        <div class="filter-section-title">${group.label}</div>
+        <div class="filter-options">
+          ${group.options.map(([key, label]) => `<button class="filter-option" type="button" aria-pressed="${filters[group.key].includes(key)}" data-action="toggle-filter" data-group="${group.key}" data-key="${key}">${label}</button>`).join('')}
+        </div>
       </div>
-    `).join('')}
-  `;
+    `).join('');
+    // Re-rendering replaces the buttons, so keep keyboard focus on the option that was toggled.
+    if (focused) {
+      const [groupKey, optionKey] = focused.split(':');
+      host.querySelector(`[data-group="${groupKey}"][data-key="${optionKey}"]`)?.focus();
+    }
+  }
+
+  const chips = document.getElementById('activeFilters');
+  if (chips) {
+    chips.innerHTML = selected.length
+      ? selected.map((entry) => `<button class="active-filter-chip" type="button" data-action="toggle-filter" data-group="${entry.group}" data-key="${entry.key}" aria-label="Remove filter ${entry.label}">${entry.label} <span aria-hidden="true">✕</span></button>`).join('')
+        + '<button class="active-filter-clear" type="button" data-action="clear-filters">Clear</button>'
+      : '';
+  }
+
+  const count = document.getElementById('filterCount');
+  if (count) {
+    count.hidden = !selected.length;
+    count.textContent = String(selected.length);
+  }
+  document.getElementById('filterToggle')?.classList.toggle('has-filters', selected.length > 0);
+  const done = document.getElementById('filterDone');
+  if (done) done.textContent = `Show ${resultCount} item${resultCount === 1 ? '' : 's'}`;
+}
+
+function setFilterPanelOpen(open) {
+  const panel = document.getElementById('filterPanel');
+  const toggle = document.getElementById('filterToggle');
+  const backdrop = document.getElementById('filterBackdrop');
+  if (!panel) return;
+  panel.hidden = !open;
+  if (backdrop) backdrop.hidden = !open;
+  toggle?.setAttribute('aria-expanded', String(open));
+  if (open) panel.querySelector('.filter-option')?.focus();
+  else toggle?.focus();
 }
 
 function toggleFilter(groupKey, optionKey) {
@@ -802,8 +865,8 @@ function scrollInventoryTable(direction) {
 }
 
 function renderTable() {
-  renderFilterControls();
   const items = getFilteredItems();
+  renderFilterControls(items.length);
   if (!inventoryBody) return;
 
   syncDashboardColumns();
@@ -1181,7 +1244,7 @@ function syncAddTabVisibility() {
   const clientId = state.activeClientId || state.session?.clientId || 'CL-001';
   const config = getClientInventoryFields(clientId);
   const shouldShow = Boolean(config && !config.readOnly && !config.requirePin);
-  ['tabAdd', 'tabOrder'].forEach((id) => {
+  ['tabOrder'].forEach((id) => {
     const tab = document.getElementById(id);
     if (tab) tab.style.display = shouldShow ? 'block' : 'none';
   });
@@ -1316,6 +1379,8 @@ function switchClientView(clientId) {
   state.activeClientId = nextClientId;
   state.filters = emptyFilters();
   state.quickEditUnlock = null;
+  state.billing = null;
+  state.rateCardClientId = null;
   state.query = '';
   state.clientProfile = cached.profile || null;
   state.items = cached.items || [];
@@ -1333,6 +1398,7 @@ function switchClientView(clientId) {
   updateSummary();
   renderTable();
   renderChatMessages();
+  renderBilling();
 
   clearTimeout(switchTimer);
   const sequence = ++switchSequence;
@@ -1349,7 +1415,8 @@ function switchClientView(clientId) {
           renderTable();
         }),
         fetchInventory(nextClientId),
-        chatOpen ? loadChatMessages(nextClientId) : null
+        chatOpen ? loadChatMessages(nextClientId) : null,
+        isPageActive('page-billing') ? loadBillingSummary(nextClientId) : null
       ]);
       if (sequence !== switchSequence) return resolve();
       fetchNotifications(nextClientId);
@@ -1421,6 +1488,7 @@ async function executePortalAuth() {
     renderProductForm();
     renderTable();
     startBackgroundSync();
+    syncBillingTab();
     showToast('Signed in successfully', 'success');
   } catch (error) {
     if (loginErrorMsg) {
@@ -1450,9 +1518,17 @@ function executePortalLogout() {
   state.pinUnlocked = false;
   state.quickEditUnlock = null;
   state.filters = emptyFilters();
+  state.billing = null;
+  state.rateCardClientId = null;
+  syncBillingTab();
+  renderBilling();
   state.messages = [];
   state.notifications = { chat: 0, inventory: 0, total: 0, items: [] };
   document.getElementById('notificationPanel') && (document.getElementById('notificationPanel').style.display = 'none');
+  ['filterPanel', 'filterBackdrop'].forEach((id) => {
+    const el = document.getElementById(id);
+    if (el) el.hidden = true;
+  });
   renderNotifications();
   state.items = [];
   state.clientProfile = null;
@@ -1560,23 +1636,6 @@ function verifyPinPrompt() {
 }
 
 function requestUpdatePage() {
-  const clientId = state.activeClientId || state.session?.clientId || 'CL-001';
-  const config = getClientInventoryFields(clientId);
-
-  if (!config.readOnly && !config.requirePin) {
-    setPage('page-update');
-    return;
-  }
-
-  if (state.pinUnlocked) {
-    setPage('page-update');
-    return;
-  }
-
-  openPinPrompt(() => setPage('page-update'));
-}
-
-function goToAddItem() {
   const clientId = state.activeClientId || state.session?.clientId || 'CL-001';
   const config = getClientInventoryFields(clientId);
 
@@ -1901,6 +1960,14 @@ document.addEventListener('click', (event) => {
     clearFilters();
   }
 
+  if (action === 'toggle-filter-panel') {
+    setFilterPanelOpen(document.getElementById('filterPanel')?.hidden !== false);
+  }
+
+  if (action === 'close-filter-panel') {
+    setFilterPanelOpen(false);
+  }
+
   if (action === 'adjust') {
     const direction = Number(element.dataset.direction || 1);
     const itemId = element.dataset.id;
@@ -1924,6 +1991,9 @@ document.addEventListener('input', (event) => {
 });
 
 document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape' && document.getElementById('filterPanel')?.hidden === false) {
+    setFilterPanelOpen(false);
+  }
   if (event.key === 'Enter') {
     if (document.activeElement === portalUser || document.activeElement === portalPass) {
       executePortalAuth();
@@ -1933,6 +2003,12 @@ document.addEventListener('keydown', (event) => {
     }
   }
 });
+
+// Capture phase runs before option clicks re-render the panel, so the target is still attached.
+document.addEventListener('click', (event) => {
+  const panel = document.getElementById('filterPanel');
+  if (panel && panel.hidden === false && !event.target.closest('.filter-bar')) setFilterPanelOpen(false);
+}, true);
 
 document.getElementById('portalUser')?.addEventListener('keydown', (event) => {
   if (event.key === 'Enter') executePortalAuth();
@@ -2348,6 +2424,224 @@ async function resetClientPasswordPrompt() {
   } catch (error) {
     showResetPasswordMessage(error.message || 'Unable to reset password.', 'error');
   }
+}
+
+function formatMoney(value) {
+  return `$${(Number(value) || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
+function getBillingMonth() {
+  const input = document.getElementById('billingMonth');
+  const fallback = new Date().toISOString().slice(0, 7);
+  if (input && !input.value) input.value = fallback;
+  return (input && input.value) || fallback;
+}
+
+async function loadBillingSummary(clientId = state.activeClientId) {
+  if (!state.auth) return 401;
+  const month = getBillingMonth();
+  if (state.isAdmin && (!clientId || clientId === 'CL-000')) {
+    state.billing = null;
+    renderBilling('Choose a client in the switcher above to see their bill.');
+    return 200;
+  }
+  try {
+    const response = await fetch(`${BILLING_URL}?clientId=${encodeURIComponent(clientId)}&month=${encodeURIComponent(month)}`, {
+      headers: adminHeaders({ Accept: 'application/json' }),
+      signal: viewSignal()
+    });
+    if (clientId !== state.activeClientId || month !== getBillingMonth()) return response.status;
+    if (!response.ok) {
+      state.billing = null;
+      renderBilling(response.status === 403 ? 'Billing is not shared for this account.' : 'Unable to load billing right now.');
+      return response.status;
+    }
+    state.billing = await response.json();
+    renderBilling();
+    // Only refill the rate-card form when the client changes so polling never wipes unsaved edits.
+    if (state.isAdmin && state.rateCardClientId !== clientId) {
+      state.rateCardClientId = clientId;
+      fillRateCardForm(state.billing.rateCard);
+    }
+    return 200;
+  } catch (error) {
+    return 0;
+  }
+}
+
+function renderBilling(message = '') {
+  const summary = state.billing;
+  const messageEl = document.getElementById('billingMsg');
+  if (messageEl) {
+    messageEl.hidden = !message;
+    messageEl.textContent = message;
+  }
+  ['billingAdminEntry', 'billingAdminRates'].forEach((id) => {
+    const el = document.getElementById(id);
+    if (el) el.hidden = !(state.isAdmin && summary);
+  });
+  const host = document.getElementById('billingSummary');
+  if (!host) return;
+  if (!summary) {
+    host.innerHTML = '';
+    return;
+  }
+
+  const { totals, lines, progress } = summary;
+  const finalMonth = progress.fraction >= 1;
+  const lineRows = lines.map((line) => `
+    <tr><td>${escapeHtml(line.label)}</td><td class="billing-detail">${escapeHtml(line.detail)}</td><td class="num">${formatMoney(line.total)}</td></tr>
+  `).join('');
+  host.innerHTML = `
+    ${summary.configured ? '' : `<div class="ac-note">No rate card saved yet${state.isAdmin ? ' — set one up below.' : '.'}</div>`}
+    <div class="billing-totals">
+      <div class="billing-total primary"><span>${finalMonth ? 'Month total' : 'Projected end of month'}</span><strong>${formatMoney(totals.projected)}</strong></div>
+      <div class="billing-total"><span>Month to date</span><strong>${formatMoney(totals.monthToDate)}</strong></div>
+      <div class="billing-total"><span>Orders fulfilled</span><strong>${summary.orders}</strong></div>
+    </div>
+    <div class="billing-progress" role="progressbar" aria-label="Month progress" aria-valuemin="0" aria-valuemax="${progress.daysInMonth}" aria-valuenow="${progress.daysElapsed}">
+      <div style="width:${Math.round(progress.fraction * 100)}%"></div>
+    </div>
+    <div class="billing-progress-label">Day ${progress.daysElapsed} of ${progress.daysInMonth}</div>
+    <table class="billing-lines">
+      <thead><tr><th>Item</th><th>Detail</th><th class="num">Amount</th></tr></thead>
+      <tbody>
+        ${lineRows}
+        ${totals.minimumAdjustment ? `<tr><td>Minimum charge adjustment</td><td></td><td class="num">${formatMoney(totals.minimumAdjustment)}</td></tr>` : ''}
+        <tr class="billing-sum"><td colspan="2">Month to date</td><td class="num">${formatMoney(totals.monthToDate)}</td></tr>
+      </tbody>
+    </table>
+    <p class="billing-updated">Updated ${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })} · refreshes automatically</p>
+  `;
+
+  const materialHost = document.getElementById('billingMaterialInputs');
+  if (materialHost) {
+    const typed = Object.fromEntries([...materialHost.querySelectorAll('input')].map((input) => [input.dataset.key, input.value]));
+    materialHost.innerHTML = summary.rateCard.materials.map((material) => `
+      <div>
+        <label class="ac-label" for="billingMat_${escapeHtml(material.key)}">${escapeHtml(material.label)} used</label>
+        <input type="number" step="1" id="billingMat_${escapeHtml(material.key)}" data-key="${escapeHtml(material.key)}" class="ac-input" placeholder="0" value="${escapeHtml(typed[material.key] || '')}" />
+      </div>
+    `).join('');
+  }
+
+  const recentHost = document.getElementById('billingRecent');
+  if (recentHost) {
+    const labels = Object.fromEntries(summary.rateCard.materials.map((material) => [material.key, material.label]));
+    const recent = summary.recentEntries || [];
+    recentHost.innerHTML = recent.length ? `
+      <h3 class="billing-subhead">Recent entries this month</h3>
+      <ul class="billing-entries">
+        ${recent.map((entry) => `
+          <li>
+            <span>${escapeHtml(new Date(entry.timestamp).toLocaleDateString())}</span>
+            <strong>${entry.quantity > 0 ? '+' : ''}${entry.quantity} ${escapeHtml(entry.type === 'orders' ? 'orders' : (labels[entry.itemKey] || entry.itemKey))}</strong>
+            <span>${escapeHtml(entry.note)}</span>
+          </li>
+        `).join('')}
+      </ul>
+    ` : '';
+  }
+}
+
+async function submitBillingEntry() {
+  const clientId = state.activeClientId;
+  const materials = {};
+  document.querySelectorAll('#billingMaterialInputs input').forEach((input) => {
+    if (input.value.trim()) materials[input.dataset.key] = Number(input.value);
+  });
+  const ordersValue = document.getElementById('billingOrders')?.value.trim() || '';
+  try {
+    const response = await fetch(`${ADMIN_BILLING_URL}/entries`, {
+      method: 'POST',
+      headers: adminHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ clientId, month: getBillingMonth(), orders: ordersValue ? Number(ordersValue) : 0, materials, note: document.getElementById('billingNote')?.value || '' })
+    });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok || !result.success) throw new Error(result.error || 'Unable to save entry.');
+    ['billingOrders', 'billingNote'].forEach((id) => {
+      const input = document.getElementById(id);
+      if (input) input.value = '';
+    });
+    document.querySelectorAll('#billingMaterialInputs input').forEach((input) => { input.value = ''; });
+    showToast('Billing updated', 'success');
+    await loadBillingSummary(clientId);
+  } catch (error) {
+    showToast(error.message || 'Unable to save entry', 'error');
+  }
+}
+
+function fillRateCardForm(card = {}) {
+  const set = (id, value) => {
+    const input = document.getElementById(id);
+    if (input) input.value = value ?? '';
+  };
+  set('rcBaseFee', card.baseFee);
+  set('rcLaborRate', card.orderLaborRate);
+  set('rcMultiplier', card.packagingMultiplier ?? 1);
+  set('rcMinimum', card.minimumCharge);
+  const visible = document.getElementById('rcClientVisible');
+  if (visible) visible.checked = Boolean(card.clientVisible);
+  state.rateMaterials = (card.materials || []).map((material) => ({ ...material }));
+  renderRateMaterials();
+}
+
+function renderRateMaterials() {
+  const host = document.getElementById('rcMaterials');
+  if (!host) return;
+  host.innerHTML = state.rateMaterials.length ? state.rateMaterials.map((material, index) => `
+    <div class="rc-material-row">
+      <input type="text" class="ac-input" aria-label="Material name" placeholder="e.g. Small box" value="${escapeHtml(material.label)}" oninput="state.rateMaterials[${index}].label = this.value" />
+      <input type="number" class="ac-input" aria-label="Unit cost" min="0" step="0.01" placeholder="Unit cost" value="${escapeHtml(material.unitCost ?? '')}" oninput="state.rateMaterials[${index}].unitCost = this.value" />
+      <button type="button" class="ac-field-remove" aria-label="Remove material" onclick="state.rateMaterials.splice(${index}, 1); renderRateMaterials()">✕</button>
+    </div>
+  `).join('') : '<div class="no-results" style="padding:10px;">No packaging materials yet.</div>';
+}
+
+function addRateMaterial() {
+  state.rateMaterials.push({ label: '', unitCost: '' });
+  renderRateMaterials();
+}
+
+async function saveRateCard() {
+  const clientId = state.activeClientId;
+  const value = (id) => document.getElementById(id)?.value;
+  try {
+    const response = await fetch(`${ADMIN_BILLING_URL}/rates/${encodeURIComponent(clientId)}`, {
+      method: 'PUT',
+      headers: adminHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({
+        baseFee: value('rcBaseFee'),
+        orderLaborRate: value('rcLaborRate'),
+        packagingMultiplier: value('rcMultiplier') === '' ? 1 : value('rcMultiplier'),
+        minimumCharge: value('rcMinimum'),
+        clientVisible: Boolean(document.getElementById('rcClientVisible')?.checked),
+        materials: state.rateMaterials
+      })
+    });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok || !result.success) throw new Error(result.error || 'Unable to save rate card.');
+    showToast('Rate card saved', 'success');
+    state.rateCardClientId = null;
+    await loadBillingSummary(clientId);
+  } catch (error) {
+    showToast(error.message || 'Unable to save rate card', 'error');
+  }
+}
+
+async function syncBillingTab() {
+  const tab = document.getElementById('tabBilling');
+  if (!tab) return;
+  if (!state.auth) {
+    tab.style.display = 'none';
+    return;
+  }
+  if (state.isAdmin) {
+    tab.style.display = 'block';
+    return;
+  }
+  const status = await loadBillingSummary(state.activeClientId);
+  tab.style.display = status === 200 ? 'block' : 'none';
 }
 
 function initializeApp() {

@@ -123,10 +123,10 @@
     <div class="tabs" id="mainTabs">
       <div class="tab active" onclick="goToDashboard()">📊 Dashboard</div>
       <div class="tab" id="tabUpdate" onclick="requestUpdatePage()">✏️ Update</div>
-      <div class="tab" id="tabAdd" onclick="goToAddItem()" style="display:none;">＋ Add</div>
       <div class="tab" id="tabOrder" onclick="goToAddOrder()" style="display:none;">📦 Add Order</div>
       <div class="tab" onclick="goToLogs()">📋 Logs</div>
       <div class="tab" onclick="showPage('chat')">💬 Chat</div>
+      <div class="tab" id="tabBilling" onclick="showPage('billing')" style="display:none;">💵 Billing</div>
       <div class="tab" id="tabClients" onclick="showPage('clients')" style="display:none;">🏷️ Clients</div>
     </div>
 
@@ -142,8 +142,25 @@
         <div class="summary-card danger"><div class="num" id="s-out">—</div><div class="lbl">OUT OF STOCK</div></div>
       </div>
       <div class="filter-bar">
-        <input type="text" id="tableSearch" placeholder="🔍 Search SKU or product..." oninput="renderTable()" />
-        <div class="filter-btn-row" id="filterGroups"></div>
+        <div class="filter-toolbar">
+          <input type="text" id="tableSearch" placeholder="🔍 Search SKU or product..." oninput="renderTable()" />
+          <button type="button" class="filter-toggle" id="filterToggle" data-action="toggle-filter-panel" aria-expanded="false" aria-controls="filterPanel">
+            <span aria-hidden="true">☰</span> Filters <span class="filter-count" id="filterCount" hidden></span>
+          </button>
+        </div>
+        <div class="active-filters" id="activeFilters"></div>
+        <div class="filter-backdrop" id="filterBackdrop" data-action="close-filter-panel" hidden></div>
+        <div class="filter-panel" id="filterPanel" role="dialog" aria-label="Inventory filters" hidden>
+          <div class="filter-panel-head">
+            <strong>Filters</strong>
+            <button type="button" class="filter-panel-close" data-action="close-filter-panel" aria-label="Close filters">✕</button>
+          </div>
+          <div class="filter-panel-body" id="filterGroups"></div>
+          <div class="filter-panel-foot">
+            <button type="button" class="filter-clear" data-action="clear-filters">Clear all</button>
+            <button type="button" class="filter-done" id="filterDone" data-action="close-filter-panel">Show results</button>
+          </div>
+        </div>
       </div>
       <div class="data-cards" id="inventoryCards"></div>
       <div class="table-shell">
@@ -285,6 +302,65 @@
             <input type="text" id="msgInput" placeholder="Type a message…" autocomplete="off" />
           </div>
           <button class="send-btn" onclick="submitMessage()" title="Send">➔</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="page-billing" class="page content" style="display:none;">
+      <div class="update-card">
+        <div class="billing-head">
+          <h2>💵 Billing Estimate</h2>
+          <label class="billing-month" for="billingMonth">Month <input type="month" id="billingMonth" class="ac-input" onchange="loadBillingSummary()" /></label>
+        </div>
+        <div id="billingMsg" class="ac-note" hidden></div>
+        <div id="billingSummary"></div>
+      </div>
+
+      <div class="update-card" id="billingAdminEntry" hidden>
+        <h2>🧾 Log Fulfilled Orders &amp; Materials</h2>
+        <div class="ac-settings-grid">
+          <div>
+            <label class="ac-label" for="billingOrders">Orders fulfilled</label>
+            <input type="number" step="1" id="billingOrders" class="ac-input" placeholder="0" />
+          </div>
+        </div>
+        <div id="billingMaterialInputs" class="ac-settings-grid"></div>
+        <div style="margin-top:10px;">
+          <label class="ac-label" for="billingNote">Note (optional)</label>
+          <input type="text" id="billingNote" class="ac-input" maxlength="200" placeholder="e.g. Week 2 shipments" />
+        </div>
+        <p class="billing-hint">Entries add to the selected month. Use a negative number to correct a mistake.</p>
+        <button type="button" class="btn-set" onclick="submitBillingEntry()">Add to this month</button>
+        <div id="billingRecent"></div>
+      </div>
+
+      <div class="update-card" id="billingAdminRates" hidden>
+        <h2>⚙️ Rate Card</h2>
+        <p class="billing-hint">This client's contract rates, saved in the Billing_Rates sheet tab.</p>
+        <div class="ac-settings-grid">
+          <div>
+            <label class="ac-label" for="rcBaseFee">Monthly base fee ($)</label>
+            <input type="number" min="0" step="0.01" id="rcBaseFee" class="ac-input" />
+          </div>
+          <div>
+            <label class="ac-label" for="rcLaborRate">Labor rate per order ($)</label>
+            <input type="number" min="0" step="0.01" id="rcLaborRate" class="ac-input" />
+          </div>
+          <div>
+            <label class="ac-label" for="rcMultiplier">Packaging cost multiplier</label>
+            <input type="number" min="0" step="0.01" id="rcMultiplier" class="ac-input" placeholder="1" />
+          </div>
+          <div>
+            <label class="ac-label" for="rcMinimum">Monthly minimum ($)</label>
+            <input type="number" min="0" step="0.01" id="rcMinimum" class="ac-input" />
+          </div>
+        </div>
+        <h3 class="billing-subhead">Packaging materials</h3>
+        <div id="rcMaterials"></div>
+        <button type="button" class="btn-set" style="margin-top:8px;" onclick="addRateMaterial()">+ Add Material</button>
+        <label class="ac-check" style="margin-top:14px;"><input type="checkbox" id="rcClientVisible" /> Client can see their billing estimate</label>
+        <div style="margin-top:14px;">
+          <button type="button" class="big-btn plus" onclick="saveRateCard()">Save Rate Card</button>
         </div>
       </div>
     </div>

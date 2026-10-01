@@ -7,6 +7,7 @@ const { GoogleSpreadsheet } = require('google-spreadsheet');
 const { JWT } = require('google-auth-library');
 const { normalizeInventoryRow, getSheetNameForClient, isAdminClient, getChatSenderRole, getClientInventoryFields, getDashboardColumns, getCreateFormTitleConfig, getChatDriveFolderForClient, isGoogleDriveUrl, normalizeDriveFolderUrl } = require('./portalLogic');
 const { mapClientSettings, settingsFromInput, isValidQuickEditPin, planClientSettingsMigration } = require('./clientSchema');
+const { BILLING_RATE_HEADERS, BILLING_ENTRY_HEADERS, MONTH_PATTERN, sanitizeRateCard, rateCardFromRow, currentMonth, summarizeBilling } = require('./billing');
 
 dotenv.config();
 
@@ -1707,6 +1708,130 @@ app.get('/api/inventory', async (req, res) => {
       ? 'Google Sheets configuration is missing or invalid. Update the .env values for GOOGLE_SERVICE_ACCOUNT_EMAIL, GOOGLE_PRIVATE_KEY, and GOOGLE_SHEET_ID.'
       : 'Unable to fetch inventory items.';
     res.status(error?.response?.status === 429 ? 429 : 500).json({ message });
+  }
+});
+
+async function loadBillingRateRow(clientId) {
+  const rows = await loadNotificationRows('Billing_Rates');
+  return rows.find((row) => normalizeClientId(row.get('Client_ID')) === clientId) || null;
+}
+
+async function loadBillingEntries(clientId) {
+  const rows = await loadNotificationRows('Billing_Entries');
+  return rows
+    .filter((row) => normalizeClientId(row.get('Client_ID')) === clientId)
+    .map((row) => ({
+      timestamp: row.get('Timestamp') || '',
+      month: String(row.get('Month') || '').trim(),
+      type: String(row.get('Type') || '').trim(),
+      itemKey: String(row.get('Item_Key') || '').trim(),
+      quantity: Number(row.get('Quantity')) || 0,
+      note: String(row.get('Note') || ''),
+      enteredBy: String(row.get('Entered_By') || '')
+    }));
+}
+
+function isBillableClient(clientId) {
+  return /^CL-\d{3,}$/.test(clientId) && clientId !== 'CL-000';
+}
+
+app.get('/api/billing/summary', async (req, res) => {
+  const session = readNotificationSession(req);
+  if (!session) return res.status(401).json({ message: 'Sign-in required.' });
+  try {
+    const staff = isStaffSession(session);
+    const clientId = staff ? normalizeClientId(req.query.clientId) : normalizeClientId(session.clientId);
+    const month = String(req.query.month || currentMonth()).trim();
+    if (!isBillableClient(clientId) || !MONTH_PATTERN.test(month)) {
+      return res.status(400).json({ message: 'Choose a client and a valid month.' });
+    }
+    const [rateRow, entries] = await Promise.all([loadBillingRateRow(clientId), loadBillingEntries(clientId)]);
+    const rateCard = rateCardFromRow(rateRow);
+    if (!staff && !rateCard.clientVisible) {
+      return res.status(403).json({ message: 'Billing is not shared for this account.' });
+    }
+    const summary = summarizeBilling({ rateCard, entries, month });
+    return res.json({
+      clientId,
+      configured: Boolean(rateRow),
+      ...summary,
+      ...(staff ? { recentEntries: entries.filter((entry) => entry.month === month).slice(-10).reverse() } : {})
+    });
+  } catch (error) {
+    console.error('Billing summary error:', error.message);
+    return res.status(error?.response?.status === 429 ? 429 : 500).json({ message: 'Unable to load billing.' });
+  }
+});
+
+app.put('/api/admin/billing/rates/:clientId', async (req, res) => {
+  try {
+    const clientId = normalizeClientId(req.params.clientId);
+    if (!isBillableClient(clientId)) return res.status(400).json({ success: false, error: 'Choose a client.' });
+    const rateCard = sanitizeRateCard(req.body || {});
+    const values = {
+      Client_ID: clientId,
+      Base_Fee: rateCard.baseFee,
+      Order_Labor_Rate: rateCard.orderLaborRate,
+      Packaging_Multiplier: rateCard.packagingMultiplier,
+      Minimum_Charge: rateCard.minimumCharge,
+      Materials_JSON: JSON.stringify(rateCard.materials),
+      Client_Visible: rateCard.clientVisible ? 'true' : 'false',
+      Updated_At: new Date().toISOString()
+    };
+    const sheet = await getOrCreateSheet('Billing_Rates', BILLING_RATE_HEADERS);
+    const rows = await withRetry(() => sheet.getRows());
+    const row = rows.find((entry) => normalizeClientId(entry.get('Client_ID')) === clientId);
+    if (row) {
+      Object.entries(values).forEach(([key, value]) => row.set(key, value));
+      await withRetry(() => row.save());
+    } else {
+      await withRetry(() => sheet.addRow(values));
+    }
+    invalidateReadCache('rows:Billing_Rates');
+    return res.json({ success: true, rateCard });
+  } catch (error) {
+    console.error('Billing rate save error:', error.message);
+    return res.status(error?.response?.status === 429 ? 429 : 500).json({ success: false, error: 'Unable to save rate card.' });
+  }
+});
+
+app.post('/api/admin/billing/entries', async (req, res) => {
+  try {
+    const body = req.body || {};
+    const clientId = normalizeClientId(body.clientId);
+    const month = String(body.month || currentMonth()).trim();
+    if (!isBillableClient(clientId) || !MONTH_PATTERN.test(month)) {
+      return res.status(400).json({ success: false, error: 'Choose a client and a valid month.' });
+    }
+    const rateCard = rateCardFromRow(await loadBillingRateRow(clientId));
+    const materialKeys = new Set(rateCard.materials.map((material) => material.key));
+    const isCount = (value) => Number.isSafeInteger(value) && Math.abs(value) <= 1000000;
+
+    // Negative quantities are allowed so mistakes can be corrected with an offsetting entry.
+    const pending = [];
+    const orders = Number(body.orders || 0);
+    if (!isCount(orders)) return res.status(400).json({ success: false, error: 'Orders must be a whole number.' });
+    if (orders) pending.push({ type: 'orders', key: '', quantity: orders });
+    for (const [key, raw] of Object.entries(body.materials && typeof body.materials === 'object' ? body.materials : {})) {
+      const quantity = Number(raw || 0);
+      if (!materialKeys.has(key)) return res.status(400).json({ success: false, error: `Unknown material "${key}".` });
+      if (!isCount(quantity)) return res.status(400).json({ success: false, error: 'Material quantities must be whole numbers.' });
+      if (quantity) pending.push({ type: 'material', key, quantity });
+    }
+    if (!pending.length) return res.status(400).json({ success: false, error: 'Enter at least one order count or material quantity.' });
+
+    const timestamp = new Date().toISOString();
+    const note = String(body.note || '').trim().slice(0, 200);
+    const sheet = await getOrCreateSheet('Billing_Entries', BILLING_ENTRY_HEADERS);
+    await withRetry(() => sheet.addRows(pending.map((entry) => ({
+      Timestamp: timestamp, Client_ID: clientId, Month: month, Type: entry.type, Item_Key: entry.key,
+      Quantity: entry.quantity, Note: note, Entered_By: req.adminSession.username
+    }))));
+    invalidateReadCache('rows:Billing_Entries');
+    return res.json({ success: true, added: pending.length });
+  } catch (error) {
+    console.error('Billing entry error:', error.message);
+    return res.status(error?.response?.status === 429 ? 429 : 500).json({ success: false, error: 'Unable to save billing entry.' });
   }
 });
 
