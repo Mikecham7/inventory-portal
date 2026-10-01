@@ -161,7 +161,25 @@ function getClientInventoryFields(clientId) {
 
 function getChatDriveFolderForClient(clientId) {
   const safeClientId = String(clientId || '').trim().toUpperCase();
-  return CLIENT_DRIVE_FOLDERS[safeClientId] || CLIENT_DRIVE_FOLDERS['CL-001'];
+  return CLIENT_DRIVE_FOLDERS[safeClientId] || '';
+}
+
+const DRIVE_HOSTS = new Set(['drive.google.com', 'docs.google.com']);
+
+function isGoogleDriveUrl(value) {
+  try {
+    const url = new URL(String(value || '').trim());
+    return url.protocol === 'https:' && DRIVE_HOSTS.has(url.hostname);
+  } catch (error) {
+    return false;
+  }
+}
+
+// Accepts a bare folder ID or a Drive folder URL; anything else becomes '' (no folder).
+function normalizeDriveFolderUrl(value) {
+  const raw = String(value || '').trim();
+  if (/^[A-Za-z0-9_-]{10,}$/.test(raw)) return `https://drive.google.com/drive/folders/${raw}`;
+  return isGoogleDriveUrl(raw) && new URL(raw).pathname.includes('/folders/') ? raw : '';
 }
 
 const INVENTORY_FIELD_ALIASES = {
@@ -233,6 +251,8 @@ module.exports = {
   getShipmentStatus,
   getCreateFormTitleConfig,
   getChatDriveFolderForClient,
+  isGoogleDriveUrl,
+  normalizeDriveFolderUrl,
   getInventoryFieldSample,
   getClientFieldPlaceholder
 };

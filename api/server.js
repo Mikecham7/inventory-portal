@@ -5,7 +5,8 @@ const dotenv = require('dotenv');
 const bcrypt = require('bcryptjs');
 const { GoogleSpreadsheet } = require('google-spreadsheet');
 const { JWT } = require('google-auth-library');
-const { normalizeInventoryRow, getSheetNameForClient, isAdminClient, getChatSenderRole, getClientInventoryFields, getDashboardColumns, getCreateFormTitleConfig, getChatDriveFolderForClient } = require('./portalLogic');
+const { normalizeInventoryRow, getSheetNameForClient, isAdminClient, getChatSenderRole, getClientInventoryFields, getDashboardColumns, getCreateFormTitleConfig, getChatDriveFolderForClient, isGoogleDriveUrl, normalizeDriveFolderUrl } = require('./portalLogic');
+const { mapClientSettings, settingsFromInput, isValidQuickEditPin, planClientSettingsMigration } = require('./clientSchema');
 
 dotenv.config();
 
@@ -35,35 +36,114 @@ function looksHashed(value) {
 }
 
 async function verifySecret(value, hash) {
-  if (!hash) return false;
+  if (!looksHashed(hash)) return false;
   return bcrypt.compare(String(value ?? ''), String(hash));
 }
 
-function notificationSigningKey() {
-  const privateKey = process.env.GOOGLE_PRIVATE_KEY;
-  if (!privateKey) throw new Error('Missing Google Sheets environment variables.');
-  return crypto.createHash('sha256').update(`portal-notifications:${privateKey}`).digest();
+// Hashing both sides first gives timingSafeEqual equal-length inputs and hides how much of a guess matched.
+function constantTimeEqual(provided, stored) {
+  const digest = (value) => crypto.createHash('sha256').update(String(value ?? '')).digest();
+  return crypto.timingSafeEqual(digest(provided), digest(stored));
 }
 
-function signNotificationSession(username, clientId, role) {
-  const payload = Buffer.from(JSON.stringify({ username, clientId, role, expires: Date.now() + 12 * 60 * 60 * 1000 })).toString('base64url');
-  const signature = crypto.createHmac('sha256', notificationSigningKey()).update(payload).digest('base64url');
+function normalizeCode(value) {
+  return String(value ?? '').trim().toUpperCase();
+}
+
+function codesMatch(provided, stored) {
+  return Boolean(normalizeCode(stored)) && constantTimeEqual(normalizeCode(provided), normalizeCode(stored));
+}
+
+// In-memory, so on Netlify each warm function instance keeps its own counters.
+const AUTH_WINDOW_MS = 15 * 60 * 1000;
+const AUTH_LIMITS = { ip: 20, user: 8 };
+const authAttempts = new Map();
+
+function requestIp(req) {
+  return String(req.get('x-nf-client-connection-ip') || req.ip || req.socket?.remoteAddress || 'unknown');
+}
+
+function authRateLimit(req, res, next) {
+  const now = Date.now();
+  if (authAttempts.size > 10000) {
+    for (const [key, entry] of authAttempts) if (entry.resetAt <= now) authAttempts.delete(key);
+  }
+
+  const username = String(req.rateLimitUser || req.body?.username || '').trim().toLowerCase();
+  const keys = [[`ip:${requestIp(req)}`, AUTH_LIMITS.ip]];
+  if (username) keys.push([`user:${username}`, AUTH_LIMITS.user]);
+
+  const blocked = keys
+    .map(([key, limit]) => {
+      const entry = authAttempts.get(key);
+      return entry && entry.resetAt > now && entry.count >= limit ? entry : null;
+    })
+    .find(Boolean);
+  if (blocked) {
+    res.set('Retry-After', String(Math.ceil((blocked.resetAt - now) / 1000)));
+    return res.status(429).json({ success: false, error: 'Too many attempts. Please wait a few minutes and try again.' });
+  }
+
+  // Count up front so parallel guesses can't all slip past the check before any finish.
+  keys.forEach(([key]) => {
+    const entry = authAttempts.get(key);
+    if (entry && entry.resetAt > now) entry.count += 1;
+    else authAttempts.set(key, { count: 1, resetAt: now + AUTH_WINDOW_MS });
+  });
+
+  res.on('finish', () => {
+    if ([400, 401, 403].includes(res.statusCode)) return;
+    const ipEntry = authAttempts.get(keys[0][0]);
+    if (ipEntry && ipEntry.count > 0) ipEntry.count -= 1;
+    if (!username) return;
+    if (res.statusCode < 300) authAttempts.delete(`user:${username}`);
+    else {
+      const userEntry = authAttempts.get(`user:${username}`);
+      if (userEntry && userEntry.count > 0) userEntry.count -= 1;
+    }
+  });
+  next();
+}
+
+// Separate purposes get separate keys, so a quick-edit unlock token can never pass as a session.
+function signingKey(purpose) {
+  const privateKey = process.env.GOOGLE_PRIVATE_KEY;
+  if (!privateKey) throw new Error('Missing Google Sheets environment variables.');
+  return crypto.createHash('sha256').update(`portal-${purpose}:${privateKey}`).digest();
+}
+
+function signToken(data, purpose) {
+  const payload = Buffer.from(JSON.stringify(data)).toString('base64url');
+  const signature = crypto.createHmac('sha256', signingKey(purpose)).update(payload).digest('base64url');
   return `${payload}.${signature}`;
 }
 
-function readNotificationSession(req) {
-  const token = String(req.get('Authorization') || '').replace(/^Bearer\s+/i, '');
-  const [payload, signature] = token.split('.');
+function readToken(token, purpose) {
+  const [payload, signature] = String(token || '').split('.');
   if (!payload || !signature) return null;
-  const expected = crypto.createHmac('sha256', notificationSigningKey()).update(payload).digest();
+  const expected = crypto.createHmac('sha256', signingKey(purpose)).update(payload).digest();
   const received = Buffer.from(signature, 'base64url');
   if (received.length !== expected.length || !crypto.timingSafeEqual(received, expected)) return null;
   try {
-    const session = JSON.parse(Buffer.from(payload, 'base64url').toString());
-    return session.expires > Date.now() && session.username && session.clientId ? session : null;
+    const data = JSON.parse(Buffer.from(payload, 'base64url').toString());
+    return data.expires > Date.now() && data.username && data.clientId ? data : null;
   } catch (error) {
     return null;
   }
+}
+
+function signNotificationSession(username, clientId, role) {
+  return signToken({ username, clientId, role, expires: Date.now() + 12 * 60 * 60 * 1000 }, 'notifications');
+}
+
+function readNotificationSession(req) {
+  return readToken(String(req.get('Authorization') || '').replace(/^Bearer\s+/i, ''), 'notifications');
+}
+
+const QUICK_EDIT_UNLOCK_MS = 30 * 60 * 1000;
+
+function isStaffSession(session) {
+  return Boolean(session) && (session.role === 'admin' || session.clientId === 'CL-000');
 }
 
 function getServiceAccountAuth() {
@@ -84,6 +164,34 @@ function getServiceAccountAuth() {
 function normalizeClientId(value) {
   const normalized = String(value ?? '').trim();
   return normalized ? normalized.toUpperCase() : '';
+}
+
+// Concurrent callers for the same key share one in-flight Sheets read; failures are never cached.
+const readCache = new Map();
+const INVENTORY_CACHE_MS = 8000;
+const PROFILE_CACHE_MS = 60000;
+const ROWS_CACHE_MS = 4000;
+
+function cachedRead(key, ttlMs, loader) {
+  const hit = readCache.get(key);
+  if (hit && (hit.pending || Date.now() - hit.at < ttlMs)) return hit.promise;
+  const entry = { pending: true, at: 0 };
+  entry.promise = loader().then((value) => {
+    entry.pending = false;
+    entry.at = Date.now();
+    return value;
+  }, (error) => {
+    if (readCache.get(key) === entry) readCache.delete(key);
+    throw error;
+  });
+  readCache.set(key, entry);
+  return entry.promise;
+}
+
+function invalidateReadCache(...prefixes) {
+  for (const key of [...readCache.keys()]) {
+    if (prefixes.some((prefix) => key.startsWith(prefix))) readCache.delete(key);
+  }
 }
 
 // Reuse a single GoogleSpreadsheet instance instead of re-authenticating and
@@ -161,11 +269,14 @@ async function getOrCreateSheet(sheetName, headers = []) {
       currentHeaders = [];
     }
 
-    const headersMatch = headers.length === currentHeaders.length
-      && headers.every((header, index) => String(currentHeaders[index] || '').trim().toLowerCase() === String(header).trim().toLowerCase());
+    // Extra trailing columns are tolerated so a newer deploy's added columns aren't wiped.
+    const headersMatch = headers.every((header, index) => String(currentHeaders[index] || '').trim().toLowerCase() === String(header).trim().toLowerCase());
 
     if (!headersMatch) {
-      await withRetry(() => sheet.setHeaderRow(headers));
+      if (Number(sheet.columnCount) < headers.length) {
+        await withRetry(() => sheet.resize({ rowCount: sheet.rowCount, columnCount: headers.length }));
+      }
+      await withRetry(() => sheet.setHeaderRow([...headers, ...currentHeaders.slice(headers.length)]));
     }
   }
 
@@ -201,7 +312,7 @@ const USER_CREDENTIALS_HEADERS = [
   'Portal_Title', 'Portal_Subtitle', 'Inventory_Mode', 'Enable_Add_Item', 'Accent_Color',
   'Allow_Chat', 'Allow_Logs', 'Allow_Update', 'Drive_Folder_URL', 'Read_Only', 'Require_Pin',
   'Title_Field_Label', 'Title_Field_Placeholder', 'Fields_JSON',
-  'Activation_Code', 'Recovery_Code_Hash'
+  'Activation_Code', 'Recovery_Code_Hash', 'Client_Settings_JSON', 'Quick_Edit_PIN_Hash'
 ];
 const LEGACY_CLIENT_IDS = ['CL-001', 'CL-002', 'CL-003'];
 
@@ -256,10 +367,18 @@ function sanitizeFieldDefs(rawFields) {
         key,
         label,
         type,
-        ...(options ? { options } : {})
+        ...(options ? { options } : {}),
+        visibility: { inventory: field?.showInInventory !== false, order: field?.showInOrder !== false }
       };
     })
     .filter(Boolean);
+}
+
+function splitFieldVisibility(sanitizedFields) {
+  return {
+    fields: sanitizedFields.map(({ visibility, ...field }) => field),
+    fieldVisibility: Object.fromEntries(sanitizedFields.map((field) => [field.key, field.visibility]))
+  };
 }
 
 // Best-effort field detection for a client sheet with no explicit Fields_JSON — reads the
@@ -288,14 +407,56 @@ async function autoDetectFieldsFromSheet(sheetName) {
 // configuration (unchanged behavior); any other client is driven entirely by the
 // User_Credentials sheet row plus (if Fields_JSON is blank) auto-detected sheet columns,
 // so new clients "just work" once a row + sheet tab exist — no code changes required.
-async function getClientProfile(clientId) {
+function getClientProfile(clientId) {
+  const safeClientId = normalizeClientId(clientId) || 'CL-001';
+  return cachedRead(`profile:${safeClientId}`, PROFILE_CACHE_MS, () => loadClientProfile(safeClientId));
+}
+
+async function findCredentialsRow(clientId) {
+  const sheet = await findSheetByTitle('User_Credentials');
+  if (!sheet) return null;
+  const rows = await withRetry(() => sheet.getRows());
+  return rows.find((entry) => normalizeClientId(entry.get('Client_ID') || entry.get('clientId')) === clientId) || null;
+}
+
+function hasQuickEditPin(row) {
+  return Boolean(row) && (looksHashed(row.get('Quick_Edit_PIN_Hash')) || isValidQuickEditPin(String(row.get('Edit_PIN') || '').trim()));
+}
+
+function applyClientSettings(profile, row) {
+  const settings = mapClientSettings(row ? row.get('Client_Settings_JSON') : null, { fields: profile.fields, clientId: profile.clientId });
+  // CL-002 quantities are driven by its shipment columns, which the quick-edit endpoint rejects.
+  if (profile.clientId === 'CL-002') settings.quickEditMode = 'disabled';
+  Object.assign(profile, settings, {
+    quickEditPinSet: hasQuickEditPin(row),
+    hideQuickEdit: settings.quickEditMode === 'disabled'
+  });
+  // The folder on the client's own credentials row wins; there is never a cross-client fallback.
+  profile.driveFolderUrl = normalizeDriveFolderUrl(row ? row.get('Drive_Folder_URL') : '') || normalizeDriveFolderUrl(profile.driveFolderUrl);
+  profile.hasEmail = Boolean(row && String(row.get('Email') || '').trim());
+  profile.driveAccessReady = Boolean(profile.driveFolderUrl && profile.hasEmail);
+  return profile;
+}
+
+function withEditColumn(columns, profile) {
+  const base = columns.filter((label) => label !== 'EDIT');
+  return profile.readOnly || profile.hideQuickEdit ? base : [...base, 'EDIT'];
+}
+
+async function loadClientProfile(clientId) {
   const safeClientId = normalizeClientId(clientId) || 'CL-001';
 
   if (LEGACY_CLIENT_IDS.includes(safeClientId) || safeClientId === 'CL-000') {
     const configClientId = safeClientId === 'CL-000' ? 'CL-001' : safeClientId;
     const inventoryConfig = getClientInventoryFields(configClientId);
     const titleConfig = getCreateFormTitleConfig(configClientId);
-    return {
+    let row = null;
+    try {
+      row = await findCredentialsRow(safeClientId);
+    } catch (error) {
+      console.warn(`Unable to load settings for ${safeClientId}:`, error.message);
+    }
+    const profile = applyClientSettings({
       clientId: safeClientId,
       clientName: inventoryConfig.label,
       portalTitle: 'ECL Inventory Portal',
@@ -309,15 +470,16 @@ async function getClientProfile(clientId) {
       readOnly: Boolean(inventoryConfig.readOnly),
       requirePin: Boolean(inventoryConfig.requirePin),
       // CL-002 already expresses quantity via its own Quantity Ordered/Received/Shipped
-      // fields, so the generic QTY/EDIT quick-adjust columns would be redundant there.
+      // fields, so the generic QTY column would be redundant there.
       hideQtyColumn: configClientId === 'CL-002',
-      hideQuickEdit: configClientId === 'CL-002',
-      driveFolderUrl: getChatDriveFolderForClient(configClientId),
+      legacy: true,
+      driveFolderUrl: safeClientId === 'CL-000' ? '' : getChatDriveFolderForClient(safeClientId),
       titleField: titleConfig,
       fields: inventoryConfig.fields || [],
-      dashboardColumns: getDashboardColumns(configClientId),
       dashboardFieldKeys: LEGACY_DASHBOARD_FIELD_KEYS[configClientId] || []
-    };
+    }, row);
+    profile.dashboardColumns = withEditColumn(getDashboardColumns(configClientId), profile);
+    return profile;
   }
 
   const profile = {
@@ -340,10 +502,10 @@ async function getClientProfile(clientId) {
     fields: []
   };
 
+  let credentialsRow = null;
   try {
-    const sheet = await getSheetByName('User_Credentials');
-    const rows = await withRetry(() => sheet.getRows());
-    const row = rows.find((entry) => normalizeClientId(entry.get('Client_ID') || entry.get('clientId')) === safeClientId);
+    const row = await findCredentialsRow(safeClientId);
+    credentialsRow = row;
 
     if (row) {
       profile.clientName = String(row.get('Client_Name') || row.get('clientName') || safeClientId).trim();
@@ -375,13 +537,13 @@ async function getClientProfile(clientId) {
     console.warn(`Unable to load client profile for ${safeClientId}:`, error.message);
   }
 
-  profile.dashboardColumns = [
+  applyClientSettings(profile, credentialsRow);
+  profile.dashboardColumns = withEditColumn([
     'PRODUCT TITLE',
     ...profile.fields.map((field) => String(field.label || field.key).toUpperCase()),
     ...(profile.hideQtyColumn ? [] : ['QTY']),
-    'STATUS',
-    ...(profile.readOnly || profile.hideQuickEdit ? [] : ['EDIT'])
-  ];
+    'STATUS'
+  ], profile);
   profile.dashboardFieldKeys = profile.fields.map((field) => field.key);
   return profile;
 }
@@ -419,7 +581,12 @@ async function getClientRoster() {
   }
 }
 
-async function listInventoryForClient(targetClientId) {
+function listInventoryForClient(targetClientId) {
+  const key = `inventory:${normalizeClientId(targetClientId) || 'CL-001'}`;
+  return cachedRead(key, INVENTORY_CACHE_MS, () => loadInventoryForClient(targetClientId));
+}
+
+async function loadInventoryForClient(targetClientId) {
   const sheetName = getSheetNameForClient(targetClientId);
   try {
     // Once clients are deletable, a stale/typo'd clientId must not silently fall back to
@@ -657,7 +824,7 @@ async function listInventoryForClient(targetClientId) {
 
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Quick-Edit-Token');
   res.header('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
   if (req.method === 'OPTIONS') {
     return res.sendStatus(200);
@@ -666,8 +833,12 @@ app.use((req, res, next) => {
 });
 
 app.get('/api/clients', async (req, res) => {
+  const session = readNotificationSession(req);
+  if (!session) return res.status(401).json({ message: 'Sign-in required.' });
   try {
-    const roster = await getClientRoster();
+    const isAdmin = session.role === 'admin' || session.clientId === 'CL-000';
+    const roster = (await getClientRoster())
+      .filter((entry) => isAdmin || normalizeClientId(entry.clientId) === normalizeClientId(session.clientId));
     // Never leak password hashes (or legacy plain-text passwords) to the client.
     const publicRoster = roster.map(({ password, ...rest }) => rest);
     return res.json(publicRoster);
@@ -678,13 +849,52 @@ app.get('/api/clients', async (req, res) => {
 });
 
 app.get('/api/client-profile', async (req, res) => {
+  const session = readNotificationSession(req);
+  if (!session) return res.status(401).json({ message: 'Sign-in required.' });
   try {
-    const clientId = normalizeClientId(req.query.clientId || 'CL-001');
-    const profile = await getClientProfile(clientId);
+    const requested = normalizeClientId(req.query.clientId || session.clientId);
+    if (!isStaffSession(session) && requested !== normalizeClientId(session.clientId)) {
+      return res.status(403).json({ message: 'You can only view your own account.' });
+    }
+    const profile = await getClientProfile(requested);
     return res.json(profile);
   } catch (error) {
     console.error('Client profile error:', error);
     return res.status(500).json({ message: 'Unable to fetch client profile.' });
+  }
+});
+
+app.use('/api/admin', (req, res, next) => {
+  const session = readNotificationSession(req);
+  if (!session || (session.role !== 'admin' && session.clientId !== 'CL-000')) {
+    return res.status(401).json({ success: false, error: 'Admin sign-in required.' });
+  }
+  req.adminSession = session;
+  next();
+});
+
+app.post('/api/admin/clients/:clientId/reset-password', async (req, res) => {
+  try {
+    const clientId = normalizeClientId(req.params.clientId);
+    const credentialsSheet = await getOrCreateSheet('User_Credentials', USER_CREDENTIALS_HEADERS);
+    const rows = await withRetry(() => credentialsSheet.getRows());
+    const row = rows.find((entry) => normalizeClientId(entry.get('Client_ID')) === clientId);
+    if (!row) return res.status(404).json({ success: false, error: `${clientId} was not found.` });
+
+    const username = String(row.get('Username') || '').trim();
+    if (username === req.adminSession.username) {
+      return res.status(400).json({ success: false, error: 'You cannot reset the account you are signed in with.' });
+    }
+
+    const activationCode = `${generateCode(4)}-${generateCode(4)}`;
+    row.set('Password', '');
+    row.set('Recovery_Code_Hash', '');
+    row.set('Activation_Code', activationCode);
+    await withRetry(() => row.save());
+    return res.json({ success: true, clientId, username, activationCode });
+  } catch (error) {
+    console.error('Password reset error:', error.message);
+    return res.status(error?.response?.status === 429 ? 429 : 500).json({ success: false, error: 'Unable to reset password.' });
   }
 });
 
@@ -701,6 +911,9 @@ app.post('/api/admin/clients', async (req, res) => {
     if (!/^CL-\d{3,}$/.test(clientId)) {
       return res.status(400).json({ success: false, error: 'Client ID must look like CL-004.' });
     }
+    if (String(body.driveFolderUrl || '').trim() && !normalizeDriveFolderUrl(body.driveFolderUrl)) {
+      return res.status(400).json({ success: false, error: 'Drive folder must be a Google Drive folder link or folder ID.' });
+    }
 
     const roster = await getClientRoster();
     if (roster.some((entry) => entry.clientId === clientId)) {
@@ -710,7 +923,16 @@ app.post('/api/admin/clients', async (req, res) => {
       return res.status(409).json({ success: false, error: `Username "${username}" is already taken.` });
     }
 
-    const fields = sanitizeFieldDefs(body.fields);
+    const { fields, fieldVisibility } = splitFieldVisibility(sanitizeFieldDefs(body.fields));
+    const settings = settingsFromInput({ ...body, fields: [], fieldVisibility }, fields, clientId);
+    const quickEditPin = String(body.quickEditPin || '').trim();
+    if (quickEditPin && !isValidQuickEditPin(quickEditPin)) {
+      return res.status(400).json({ success: false, error: 'Quick Edit PIN must be 4-32 characters with no spaces.' });
+    }
+    if (settings.quickEditMode === 'password' && !quickEditPin) {
+      return res.status(400).json({ success: false, error: 'Set a Quick Edit PIN to use Password Protected mode.' });
+    }
+
     // The client sets their own password later via "Create Account", proven by this
     // one-time code instead of the admin having to hand out (and know) a real password.
     const activationCode = `${generateCode(4)}-${generateCode(4)}`;
@@ -724,6 +946,7 @@ app.post('/api/admin/clients', async (req, res) => {
     }
 
     const credentialsSheet = await getOrCreateSheet('User_Credentials', USER_CREDENTIALS_HEADERS);
+    const quickEditPinHash = quickEditPin ? await hashSecret(quickEditPin) : '';
     await withRetry(() => credentialsSheet.addRow({
       Client_ID: clientId,
       Username: username,
@@ -740,16 +963,19 @@ app.post('/api/admin/clients', async (req, res) => {
       Allow_Chat: body.allowChat === false ? 'false' : 'true',
       Allow_Logs: body.allowLogs === false ? 'false' : 'true',
       Allow_Update: body.allowUpdate === false ? 'false' : 'true',
-      Drive_Folder_URL: String(body.driveFolderUrl || '').trim(),
+      Drive_Folder_URL: normalizeDriveFolderUrl(body.driveFolderUrl),
       Read_Only: body.readOnly === true ? 'true' : 'false',
       Require_Pin: body.requirePin === true ? 'true' : 'false',
       Title_Field_Label: String(body.titleFieldLabel || '').trim(),
       Title_Field_Placeholder: String(body.titleFieldPlaceholder || '').trim(),
       Fields_JSON: JSON.stringify(fields),
       Activation_Code: activationCode,
-      Recovery_Code_Hash: ''
+      Recovery_Code_Hash: '',
+      Client_Settings_JSON: JSON.stringify(settings),
+      Quick_Edit_PIN_Hash: quickEditPinHash
     }));
 
+    invalidateReadCache('profile:', 'inventory:');
     const profile = await getClientProfile(clientId);
     return res.json({ success: true, profile, username, activationCode });
   } catch (error) {
@@ -792,9 +1018,10 @@ async function syncClientFieldColumns(sheet, oldFields, orderedFields, titleLabe
 app.put('/api/admin/clients/:clientId', async (req, res) => {
   try {
     const clientId = normalizeClientId(req.params.clientId);
-    if (LEGACY_CLIENT_IDS.includes(clientId) || clientId === 'CL-000') {
-      return res.status(400).json({ success: false, error: "This client's layout is built into the app and can't be edited here." });
+    if (clientId === 'CL-000') {
+      return res.status(400).json({ success: false, error: 'The admin account has no client settings.' });
     }
+    const isLegacy = LEGACY_CLIENT_IDS.includes(clientId);
 
     const credentialsSheet = await getOrCreateSheet('User_Credentials', USER_CREDENTIALS_HEADERS);
     const rows = await withRetry(() => credentialsSheet.getRows());
@@ -804,66 +1031,70 @@ app.put('/api/admin/clients/:clientId', async (req, res) => {
     }
 
     const body = req.body || {};
-
-    // Account-reset-only requests must never fall through to the field/settings sync
-    // below (an empty/omitted `fields` array there would wipe out the client's columns).
-    if (body.resetAccount === true && body.fields === undefined) {
-      const newActivationCode = `${generateCode(4)}-${generateCode(4)}`;
-      row.set('Password', '');
-      row.set('Recovery_Code_Hash', '');
-      row.set('Activation_Code', newActivationCode);
-      await withRetry(() => row.save());
-      const profile = await getClientProfile(clientId);
-      return res.json({ success: true, profile, activationCode: newActivationCode });
+    const quickEditPin = String(body.quickEditPin || '').trim();
+    if (quickEditPin && !isValidQuickEditPin(quickEditPin)) {
+      return res.status(400).json({ success: false, error: 'Quick Edit PIN must be 4-32 characters with no spaces.' });
+    }
+    if (!isLegacy && String(body.driveFolderUrl || '').trim() && !normalizeDriveFolderUrl(body.driveFolderUrl)) {
+      return res.status(400).json({ success: false, error: 'Drive folder must be a Google Drive folder link or folder ID.' });
     }
 
-    const oldFields = parseFieldsJson(row.get('Fields_JSON')) || [];
-    const submittedFields = sanitizeFieldDefs(body.fields);
-    const submittedKeys = submittedFields.map((field) => field.key);
+    let settings;
+    let orderedFields = null;
+    if (isLegacy) {
+      // Built-in layouts keep their sheet columns; only the per-client settings are stored.
+      settings = settingsFromInput(body, getClientInventoryFields(clientId).fields || [], clientId);
+    } else {
+      const oldFields = parseFieldsJson(row.get('Fields_JSON')) || [];
+      const { fields: submittedFields, fieldVisibility } = splitFieldVisibility(sanitizeFieldDefs(body.fields));
+      const submittedKeys = submittedFields.map((field) => field.key);
 
-    // Keep existing fields in their original column order (renames only change the label);
-    // anything brand new is appended at the end. This guarantees the header row we write
-    // always lines up with the sheet's actual column order, regardless of what order the
-    // fields arrived in from the client.
-    const orderedFields = oldFields
-      .filter((field) => submittedKeys.includes(field.key))
-      .map((field) => submittedFields.find((updated) => updated.key === field.key) || field)
-      .concat(submittedFields.filter((field) => !oldFields.some((old) => old.key === field.key)));
-
-    const titleLabel = String(body.titleFieldLabel || row.get('Title_Field_Label') || '').trim() || 'Product Title';
-    const inventorySheet = await getSheetByName(clientId);
-    await withRetry(() => inventorySheet.loadHeaderRow());
-    await syncClientFieldColumns(inventorySheet, oldFields, orderedFields, titleLabel);
-
-    row.set('Client_Name', String(body.clientName || row.get('Client_Name') || clientId).trim());
-    row.set('Portal_Title', String(body.portalTitle ?? row.get('Portal_Title') ?? '').trim());
-    row.set('Portal_Subtitle', String(body.portalSubtitle ?? row.get('Portal_Subtitle') ?? '').trim());
-    row.set('Accent_Color', String(body.accentColor ?? row.get('Accent_Color') ?? '').trim());
-    row.set('Drive_Folder_URL', String(body.driveFolderUrl ?? row.get('Drive_Folder_URL') ?? '').trim());
-    row.set('Enable_Add_Item', body.enableAddItem === false ? 'false' : 'true');
-    row.set('Allow_Chat', body.allowChat === false ? 'false' : 'true');
-    row.set('Allow_Logs', body.allowLogs === false ? 'false' : 'true');
-    row.set('Allow_Update', body.allowUpdate === false ? 'false' : 'true');
-    row.set('Read_Only', body.readOnly === true ? 'true' : 'false');
-    row.set('Require_Pin', body.requirePin === true ? 'true' : 'false');
-    row.set('Title_Field_Label', titleLabel);
-    row.set('Title_Field_Placeholder', String(body.titleFieldPlaceholder ?? row.get('Title_Field_Placeholder') ?? '').trim());
-    row.set('Fields_JSON', JSON.stringify(orderedFields));
-
-    // Deactivates the account and issues a fresh activation code — for when a client is
-    // locked out and has lost/never received their recovery code.
-    let newActivationCode;
-    if (body.resetAccount === true) {
-      newActivationCode = `${generateCode(4)}-${generateCode(4)}`;
-      row.set('Password', '');
-      row.set('Recovery_Code_Hash', '');
-      row.set('Activation_Code', newActivationCode);
+      // Keep existing fields in their original column order (renames only change the label);
+      // anything brand new is appended at the end. This guarantees the header row we write
+      // always lines up with the sheet's actual column order, regardless of what order the
+      // fields arrived in from the client.
+      orderedFields = oldFields
+        .filter((field) => submittedKeys.includes(field.key))
+        .map((field) => submittedFields.find((updated) => updated.key === field.key) || field)
+        .concat(submittedFields.filter((field) => !oldFields.some((old) => old.key === field.key)));
+      settings = settingsFromInput({ ...body, fields: [], fieldVisibility }, orderedFields, clientId);
     }
+
+    if (settings.quickEditMode === 'password' && !quickEditPin && !hasQuickEditPin(row)) {
+      return res.status(400).json({ success: false, error: 'Set a Quick Edit PIN to use Password Protected mode.' });
+    }
+
+    if (!isLegacy) {
+      const oldFields = parseFieldsJson(row.get('Fields_JSON')) || [];
+      const titleLabel = String(body.titleFieldLabel || row.get('Title_Field_Label') || '').trim() || 'Product Title';
+      const inventorySheet = await getSheetByName(clientId);
+      await withRetry(() => inventorySheet.loadHeaderRow());
+      await syncClientFieldColumns(inventorySheet, oldFields, orderedFields, titleLabel);
+
+      row.set('Client_Name', String(body.clientName || row.get('Client_Name') || clientId).trim());
+      row.set('Portal_Title', String(body.portalTitle ?? row.get('Portal_Title') ?? '').trim());
+      row.set('Portal_Subtitle', String(body.portalSubtitle ?? row.get('Portal_Subtitle') ?? '').trim());
+      row.set('Accent_Color', String(body.accentColor ?? row.get('Accent_Color') ?? '').trim());
+      row.set('Drive_Folder_URL', normalizeDriveFolderUrl(body.driveFolderUrl ?? row.get('Drive_Folder_URL')));
+      row.set('Enable_Add_Item', body.enableAddItem === false ? 'false' : 'true');
+      row.set('Allow_Chat', body.allowChat === false ? 'false' : 'true');
+      row.set('Allow_Logs', body.allowLogs === false ? 'false' : 'true');
+      row.set('Allow_Update', body.allowUpdate === false ? 'false' : 'true');
+      row.set('Read_Only', body.readOnly === true ? 'true' : 'false');
+      row.set('Require_Pin', body.requirePin === true ? 'true' : 'false');
+      row.set('Title_Field_Label', titleLabel);
+      row.set('Title_Field_Placeholder', String(body.titleFieldPlaceholder ?? row.get('Title_Field_Placeholder') ?? '').trim());
+      row.set('Fields_JSON', JSON.stringify(orderedFields));
+    }
+
+    row.set('Client_Settings_JSON', JSON.stringify(settings));
+    if (quickEditPin) row.set('Quick_Edit_PIN_Hash', await hashSecret(quickEditPin));
 
     await withRetry(() => row.save());
 
+    invalidateReadCache('profile:', 'inventory:');
     const profile = await getClientProfile(clientId);
-    return res.json({ success: true, profile, ...(newActivationCode ? { activationCode: newActivationCode } : {}) });
+    return res.json({ success: true, profile });
   } catch (error) {
     console.error('Update client error:', error);
     return res.status(500).json({ success: false, error: 'Unable to update client.' });
@@ -884,6 +1115,7 @@ app.delete('/api/admin/clients/:clientId', async (req, res) => {
 
     const doc = await getDoc();
     if (doc.sheetsByTitle[clientId]) await withRetry(() => doc.sheetsByTitle[clientId].delete());
+    invalidateReadCache('profile:', 'inventory:');
 
     return res.json({ success: true });
   } catch (error) {
@@ -893,25 +1125,26 @@ app.delete('/api/admin/clients/:clientId', async (req, res) => {
 });
 
 app.get('/api/chat', async (req, res) => {
+  const session = readNotificationSession(req);
+  if (!session) return res.status(401).json({ message: 'Sign in again to view chat.' });
   try {
-    const clientId = normalizeClientId(req.query.clientId || 'CL-001');
-    const sheet = await getOrCreateSheet('Chat_log', ['Timestamp', 'Sender', 'Message', 'ClientID', 'IsStaff', 'FileUrl', 'FileName']);
-    const rows = await withRetry(() => sheet.getRows());
-    const history = rows
-      .filter((row) => {
-        const rowClientId = normalizeClientId(row.get('ClientID') || row.get('clientId') || row.get('Client_ID') || '');
-        if (!clientId || clientId === 'CL-000') return true;
-        return rowClientId === clientId;
-      })
-      .map((row) => ({
+    const clientId = isStaffSession(session) ? normalizeClientId(req.query.clientId || session.clientId) : normalizeClientId(session.clientId);
+    const allMessages = await cachedRead('rows:Chat_log:history', ROWS_CACHE_MS, async () => {
+      const sheet = await getOrCreateSheet('Chat_log', ['Timestamp', 'Sender', 'Message', 'ClientID', 'IsStaff', 'FileUrl', 'FileName']);
+      const rows = await withRetry(() => sheet.getRows());
+      return rows.map((row) => ({
         timestamp: row.get('Timestamp') || row.get('timestamp') || '',
         sender: row.get('Sender') || row.get('sender') || 'Unknown',
         message: row.get('Message') || row.get('message') || '',
-        clientId: normalizeClientId(row.get('ClientID') || row.get('clientId') || row.get('Client_ID') || clientId) || clientId,
+        clientId: normalizeClientId(row.get('ClientID') || row.get('clientId') || row.get('Client_ID') || ''),
         isStaff: String(row.get('IsStaff') || row.get('isStaff') || '0').trim() === '1',
-        fileUrl: row.get('FileUrl') || row.get('fileUrl') || '',
+        fileUrl: isGoogleDriveUrl(row.get('FileUrl') || row.get('fileUrl')) ? String(row.get('FileUrl') || row.get('fileUrl')).trim() : '',
         fileName: row.get('FileName') || row.get('fileName') || ''
       }));
+    });
+    const history = allMessages
+      .filter((message) => message.clientId === clientId || (clientId === 'CL-000' && message.clientId))
+      .map((message) => ({ ...message, clientId: message.clientId || clientId }));
 
     return res.json(history);
   } catch (error) {
@@ -929,6 +1162,7 @@ async function recordInventoryEvent(clientId, description, username) {
     await withRetry(() => sheet.addRow({
       Timestamp: new Date().toISOString(), ClientID: clientId, Description: description, ActorUsername: username || ''
     }));
+    invalidateReadCache('rows:Inventory_Events');
   } catch (error) {
     console.warn('Inventory notification was not recorded:', error.message);
   }
@@ -949,9 +1183,11 @@ function summarizeUnreadNotifications(chatMessages, inventoryEvents, seenAt, use
   };
 }
 
-async function loadNotificationRows(sheetName) {
-  const sheet = await findSheetByTitle(sheetName);
-  return sheet ? withRetry(() => sheet.getRows()) : [];
+function loadNotificationRows(sheetName) {
+  return cachedRead(`rows:${sheetName}`, ROWS_CACHE_MS, async () => {
+    const sheet = await findSheetByTitle(sheetName);
+    return sheet ? withRetry(() => sheet.getRows()) : [];
+  });
 }
 
 app.get('/api/notifications', async (req, res) => {
@@ -1037,6 +1273,7 @@ app.post('/api/notifications/read', async (req, res) => {
     } else {
       await withRetry(() => sheet.addRow({ Username: session.username, ClientID: clientId, ...changes }));
     }
+    invalidateReadCache('rows:Notification_State');
     return res.json({ success: true });
   } catch (error) {
     console.error('Notification read error:', error.message);
@@ -1045,26 +1282,33 @@ app.post('/api/notifications/read', async (req, res) => {
 });
 
 app.post('/api/chat', async (req, res) => {
+  const session = readNotificationSession(req);
+  if (!session) return res.status(401).json({ success: false, error: 'Sign in again to send messages.' });
   try {
-    const { clientId, sender, message, isStaff, fileUrl, fileName } = req.body || {};
-    const normalizedClientId = normalizeClientId(clientId);
-    if (!normalizedClientId || !sender || !message) {
+    const { clientId, sender, message, fileUrl, fileName } = req.body || {};
+    const isStaff = isStaffSession(session);
+    const normalizedClientId = isStaff ? normalizeClientId(clientId) : normalizeClientId(session.clientId);
+    if (!normalizedClientId || normalizedClientId === 'CL-000' || !sender || !message) {
       return res.status(400).json({ success: false, error: 'Client, sender, and message are required.' });
+    }
+    const safeFileUrl = String(fileUrl || '').trim();
+    if (safeFileUrl && !isGoogleDriveUrl(safeFileUrl)) {
+      return res.status(400).json({ success: false, error: 'Shared files must be Google Drive links.' });
     }
 
     const sheet = await getOrCreateSheet('Chat_log', ['Timestamp', 'Sender', 'Message', 'ClientID', 'IsStaff', 'FileUrl', 'FileName']);
-    const safeFileUrl = String(fileUrl || '').trim();
     const safeFileName = String(fileName || '').trim() || (safeFileUrl ? 'Shared file' : '');
-    await withRetry(() => sheet.addRow([new Date().toISOString(), sender, message, normalizedClientId, Boolean(isStaff) ? '1' : '0', safeFileUrl, safeFileName]));
+    await withRetry(() => sheet.addRow([new Date().toISOString(), sender, message, normalizedClientId, isStaff ? '1' : '0', safeFileUrl, safeFileName]));
+    invalidateReadCache('rows:Chat_log');
 
     return res.json({
       success: true,
-      role: getChatSenderRole(Boolean(isStaff)),
+      role: getChatSenderRole(isStaff),
       message: {
         sender,
         clientId: normalizedClientId,
         message,
-        isStaff: Boolean(isStaff),
+        isStaff,
         fileUrl: safeFileUrl,
         fileName: safeFileName
       }
@@ -1081,12 +1325,22 @@ app.post('/api/chat', async (req, res) => {
 
 app.post('/api/inventory/create', async (req, res) => {
   try {
-    const { clientId, sku, title, qty, status, notes, extraFields = {}, isAdmin } = req.body || {};
+    const { clientId, sku, title, qty, notes, extraFields = {}, isAdmin } = req.body || {};
+    const kind = req.body?.kind === 'order' ? 'order' : 'inventory';
+    const status = kind === 'order' ? 'Not Shipped' : req.body?.status;
     const targetClientId = String(clientId || 'CL-001').trim() || 'CL-001';
     const itemSku = String(sku || '').trim();
     const itemTitle = String(title || '').trim();
-    const values = extraFields && typeof extraFields === 'object' ? extraFields : {};
+    const values = extraFields && typeof extraFields === 'object' ? { ...extraFields } : {};
     const adminAccess = Boolean(isAdmin) || String(req.body?.role || '').toLowerCase() === 'admin';
+
+    // Fields the admin switched off for this form are dropped server-side too, not just hidden.
+    if (!isStaffSession(readNotificationSession(req))) {
+      const { fieldVisibility = {} } = await getClientProfile(targetClientId);
+      Object.keys(values).forEach((key) => {
+        if (fieldVisibility[key] && fieldVisibility[key][kind] === false) delete values[key];
+      });
+    }
 
     const sheetName = getSheetNameForClient(targetClientId);
     const sheet = await getSheetByName(sheetName);
@@ -1145,11 +1399,70 @@ app.post('/api/inventory/create', async (req, res) => {
     }
 
     await withRetry(() => sheet.addRow(row));
-    await recordInventoryEvent(targetClientId, `Added ${itemTitle || itemSku}`, readNotificationSession(req)?.username);
+    invalidateReadCache('inventory:');
+    await recordInventoryEvent(targetClientId, `Added ${kind === 'order' ? 'order ' : ''}${itemTitle || itemSku}`, readNotificationSession(req)?.username);
     return res.json({ success: true, sheet: sheetName, item: row });
   } catch (error) {
     console.error('Inventory create error:', error);
     return res.status(500).json({ success: false, error: 'Unable to create inventory item.' });
+  }
+});
+
+async function checkQuickEditAccess(req, session, clientId) {
+  const { quickEditMode } = await getClientProfile(clientId);
+  if (quickEditMode === 'disabled') {
+    return { code: 'QUICK_EDIT_DISABLED', error: 'Quick Edit is turned off for this account.' };
+  }
+  if (quickEditMode === 'password') {
+    const unlock = readToken(req.get('X-Quick-Edit-Token'), 'quick-edit');
+    if (!unlock || unlock.username !== session.username || unlock.clientId !== clientId) {
+      return { code: 'QUICK_EDIT_PIN_REQUIRED', error: 'Enter the Quick Edit PIN to change quantities.' };
+    }
+  }
+  return null;
+}
+
+async function verifyQuickEditPin(row, pin) {
+  const provided = String(pin ?? '').trim();
+  if (!provided) return false;
+  const storedHash = row.get('Quick_Edit_PIN_Hash');
+  if (looksHashed(storedHash)) return verifySecret(provided, storedHash);
+
+  // Legacy plain-text Edit_PIN: accept once, then store a hash. Edit_PIN itself is left as-is.
+  const legacyPin = String(row.get('Edit_PIN') || '').trim();
+  if (!isValidQuickEditPin(legacyPin) || !constantTimeEqual(provided, legacyPin)) return false;
+  try {
+    row.set('Quick_Edit_PIN_Hash', await hashSecret(legacyPin));
+    await withRetry(() => row.save());
+  } catch (error) {
+    console.warn('Quick Edit PIN hash migration failed:', error.message);
+  }
+  return true;
+}
+
+app.post('/api/quick-edit/unlock', (req, res, next) => {
+  const session = readNotificationSession(req);
+  if (!session) return res.status(401).json({ success: false, error: 'Sign in again to unlock Quick Edit.' });
+  req.unlockSession = session;
+  req.rateLimitUser = `quick-edit:${session.username}`;
+  next();
+}, authRateLimit, async (req, res) => {
+  try {
+    const session = req.unlockSession;
+    const clientId = normalizeClientId(req.body?.clientId);
+    if (!clientId || (!isStaffSession(session) && session.clientId !== clientId)) {
+      return res.status(400).json({ success: false, error: 'Invalid unlock request.' });
+    }
+    await getOrCreateSheet('User_Credentials', USER_CREDENTIALS_HEADERS);
+    const row = await findCredentialsRow(clientId);
+    if (!row || !(await verifyQuickEditPin(row, req.body?.pin))) {
+      return res.status(401).json({ success: false, error: 'Incorrect PIN.' });
+    }
+    const expires = Date.now() + QUICK_EDIT_UNLOCK_MS;
+    return res.json({ success: true, token: signToken({ username: session.username, clientId, expires }, 'quick-edit'), expiresAt: expires });
+  } catch (error) {
+    console.error('Quick Edit unlock error:', error.message);
+    return res.status(error?.response?.status === 429 ? 429 : 500).json({ success: false, error: 'Unable to unlock Quick Edit.' });
   }
 });
 
@@ -1165,6 +1478,10 @@ app.put('/api/inventory/quantity', async (req, res) => {
       return res.status(400).json({ success: false, error: 'Invalid inventory update.' });
     }
     if (clientId === 'CL-002') return res.status(400).json({ success: false, error: 'Use the shipment workflow for this client.' });
+    if (!isStaff) {
+      const denied = await checkQuickEditAccess(req, session, clientId);
+      if (denied) return res.status(403).json({ success: false, ...denied });
+    }
 
     const sheet = await findSheetByTitle(clientId);
     if (!sheet) return res.status(404).json({ success: false, error: 'Inventory sheet not found.' });
@@ -1187,6 +1504,7 @@ app.put('/api/inventory/quantity', async (req, res) => {
     sheet.getCell(rowIndex, quantityColumn).value = quantity;
     if (statusColumn >= 0) sheet.getCell(rowIndex, statusColumn).value = quantity === 0 ? 'Out of Stock' : quantity <= 5 ? 'Low Stock' : 'In Stock';
     await withRetry(() => sheet.saveUpdatedCells());
+    invalidateReadCache('inventory:');
     await recordInventoryEvent(clientId, `Updated ${sku} to ${quantity}`, session.username);
     return res.json({ success: true, qty: quantity });
   } catch (error) {
@@ -1195,7 +1513,7 @@ app.put('/api/inventory/quantity', async (req, res) => {
   }
 });
 
-app.post('/api/login', async (req, res) => {
+app.post('/api/login', authRateLimit, async (req, res) => {
   const { username, password } = req.body || {};
 
   try {
@@ -1222,7 +1540,7 @@ app.post('/api/login', async (req, res) => {
       passwordOk = await verifySecret(password, storedPassword);
     } else {
       // Legacy plain-text row (pre-dates hashing) — verify, then transparently upgrade it.
-      passwordOk = storedPassword === String(password || '');
+      passwordOk = constantTimeEqual(String(password || ''), storedPassword);
       if (passwordOk) {
         try {
           user.set('Password', await hashSecret(password));
@@ -1256,7 +1574,7 @@ app.post('/api/login', async (req, res) => {
   }
 });
 
-app.post('/api/account/activate', async (req, res) => {
+app.post('/api/account/activate', authRateLimit, async (req, res) => {
   try {
     const { username, activationCode, password } = req.body || {};
     const safeUsername = String(username || '').trim();
@@ -1277,8 +1595,7 @@ app.post('/api/account/activate', async (req, res) => {
     if (String(user.get('Password') || '').trim()) return invalid();
 
     const storedCode = String(user.get('Activation_Code') || '').trim();
-    const codeOk = Boolean(storedCode) && storedCode.toUpperCase() === activationCode.trim().toUpperCase();
-    if (!codeOk) return invalid();
+    if (!codesMatch(activationCode, storedCode)) return invalid();
 
     const recoveryCode = `${generateCode(4)}-${generateCode(4)}`;
     user.set('Password', await hashSecret(safePassword));
@@ -1297,7 +1614,7 @@ app.post('/api/account/activate', async (req, res) => {
   }
 });
 
-app.post('/api/account/recover', async (req, res) => {
+app.post('/api/account/recover', authRateLimit, async (req, res) => {
   try {
     const { username, recoveryCode, newPassword } = req.body || {};
     const safeUsername = String(username || '').trim();
@@ -1314,8 +1631,7 @@ app.post('/api/account/recover', async (req, res) => {
     const invalid = () => res.status(400).json({ success: false, error: 'Invalid username or recovery code.' });
 
     if (!user) return invalid();
-    const codeOk = await verifySecret(recoveryCode, user.get('Recovery_Code_Hash'));
-    if (!codeOk) return invalid();
+    if (!(await verifySecret(normalizeCode(recoveryCode), user.get('Recovery_Code_Hash')))) return invalid();
 
     // Rotate the recovery code so each one only works once.
     const newRecoveryCode = `${generateCode(4)}-${generateCode(4)}`;
@@ -1330,23 +1646,61 @@ app.post('/api/account/recover', async (req, res) => {
   }
 });
 
+// Inventory rows carry no dates, so "added" and "last activity" come from Inventory_Events
+// descriptions that mention the item's SKU or title. Items with no matching events get null.
+async function attachActivityDates(items, fallbackClientId = '') {
+  let events = [];
+  try {
+    events = (await loadNotificationRows('Inventory_Events')).map((row) => ({
+      clientId: normalizeClientId(row.get('ClientID')),
+      text: String(row.get('Description') || '').trim().toLowerCase(),
+      time: Date.parse(row.get('Timestamp'))
+    })).filter((event) => event.text && Number.isFinite(event.time));
+  } catch (error) {
+    console.warn('Inventory activity dates unavailable:', error.message);
+  }
+
+  const byClient = new Map();
+  events.forEach((event) => {
+    if (!byClient.has(event.clientId)) byClient.set(event.clientId, []);
+    byClient.get(event.clientId).push(event);
+  });
+
+  return items.map((item) => {
+    const clientEvents = byClient.get(normalizeClientId(item.clientId || fallbackClientId)) || [];
+    const needles = [item.sku, item.title]
+      .map((value) => String(value || '').trim().toLowerCase())
+      .filter((value) => value.length >= 3 && value !== 'n/a');
+    let addedAt = null;
+    let lastActivityAt = null;
+    clientEvents.forEach((event) => {
+      if (!needles.some((needle) => event.text.includes(needle))) return;
+      if (event.text.startsWith('added') && (addedAt === null || event.time < addedAt)) addedAt = event.time;
+      if (lastActivityAt === null || event.time > lastActivityAt) lastActivityAt = event.time;
+    });
+    return {
+      ...item,
+      addedAt: addedAt === null ? null : new Date(addedAt).toISOString(),
+      lastActivityAt: lastActivityAt === null ? null : new Date(lastActivityAt).toISOString()
+    };
+  });
+}
+
 app.get('/api/inventory', async (req, res) => {
   try {
     const clientId = String(req.query.clientId || '').trim();
 
     if (clientId && clientId.toUpperCase() === 'CL-000') {
       const roster = await getClientRoster();
-      const inventory = [];
-      for (const client of roster) {
-        const items = await listInventoryForClient(client.clientId || 'CL-001');
-        inventory.push(...items);
-      }
-      return res.json(inventory);
+      // CL-000 resolves to the CL-001 sheet, so including it would list CL-001 twice.
+      const clientIds = [...new Set(roster.map((client) => normalizeClientId(client.clientId)).filter((id) => id && id !== 'CL-000'))];
+      const perClient = await Promise.all(clientIds.map((id) => listInventoryForClient(id)));
+      return res.json(await attachActivityDates(perClient.flat()));
     }
 
     const targetClientId = clientId || 'CL-001';
     const items = await listInventoryForClient(targetClientId);
-    return res.json(items);
+    return res.json(await attachActivityDates(items, targetClientId));
   } catch (error) {
     console.error('Error fetching inventory:', error.message);
     const message = error.message && error.message.includes('Missing Google Sheets environment variables')
@@ -1355,6 +1709,72 @@ app.get('/api/inventory', async (req, res) => {
     res.status(error?.response?.status === 429 ? 429 : 500).json({ message });
   }
 });
+
+// Fills the newer settings columns for every client row (including legacy CL-001/002/003).
+// Only blank, formula-free cells in those two columns are written; nothing else is touched.
+async function migrateClientSettings({ apply = false } = {}) {
+  const sheet = apply
+    ? await getOrCreateSheet('User_Credentials', USER_CREDENTIALS_HEADERS)
+    : await findSheetByTitle('User_Credentials');
+  if (!sheet) throw new Error('User_Credentials sheet not found.');
+  if (!apply) await withRetry(() => sheet.loadHeaderRow());
+
+  const headers = sheet.headerValues || [];
+  const settingsCol = headers.indexOf('Client_Settings_JSON');
+  const pinHashCol = headers.indexOf('Quick_Edit_PIN_Hash');
+  const rows = await withRetry(() => sheet.getRows());
+  const read = (row, header) => (headers.includes(header) ? row.get(header) : '');
+
+  const plans = rows
+    .map((row) => {
+      const clientId = normalizeClientId(read(row, 'Client_ID'));
+      if (!clientId || clientId === 'CL-000') return null;
+      const fields = LEGACY_CLIENT_IDS.includes(clientId)
+        ? (getClientInventoryFields(clientId).fields || [])
+        : (parseFieldsJson(read(row, 'Fields_JSON')) || []);
+      return {
+        row,
+        ...planClientSettingsMigration({
+          clientId,
+          settingsCell: read(row, 'Client_Settings_JSON'),
+          pinHashCell: read(row, 'Quick_Edit_PIN_Hash'),
+          editPinCell: read(row, 'Edit_PIN'),
+          fields
+        })
+      };
+    })
+    .filter(Boolean);
+
+  const report = plans.map((plan) => ({
+    clientId: plan.clientId,
+    settings: plan.settingsJson ? (apply ? 'defaults written' : 'would write defaults') : 'already set',
+    quickEditPin: plan.hashLegacyPin ? (apply ? 'hashed from Edit_PIN' : 'would hash Edit_PIN') : 'unchanged'
+  }));
+  if (!apply || !plans.length) return report;
+
+  const lastRow = Math.max(...plans.map((plan) => plan.row.rowNumber));
+  const firstCol = Math.min(settingsCol, pinHashCol);
+  const lastCol = Math.max(settingsCol, pinHashCol);
+  await withRetry(() => sheet.loadCells({ startRowIndex: 1, endRowIndex: lastRow, startColumnIndex: firstCol, endColumnIndex: lastCol + 1 }));
+
+  const writeIfBlank = (rowNumber, col, value) => {
+    const cell = sheet.getCell(rowNumber - 1, col);
+    if (cell.formula || String(cell.value ?? '').trim()) return false;
+    cell.value = value;
+    return true;
+  };
+
+  for (const [index, plan] of plans.entries()) {
+    if (plan.settingsJson && !writeIfBlank(plan.row.rowNumber, settingsCol, plan.settingsJson)) report[index].settings = 'skipped (cell not blank)';
+    if (plan.hashLegacyPin) {
+      const hashed = await hashSecret(String(plan.row.get('Edit_PIN')).trim());
+      if (!writeIfBlank(plan.row.rowNumber, pinHashCol, hashed)) report[index].quickEditPin = 'skipped (cell not blank)';
+    }
+  }
+  await withRetry(() => sheet.saveUpdatedCells());
+  invalidateReadCache('profile:');
+  return report;
+}
 
 app.get('*', (req, res) => {
   res.sendFile(path.join(__dirname, '../frontend/index.html'));
@@ -1376,5 +1796,9 @@ module.exports = {
   listInventoryForClient,
   summarizeUnreadNotifications,
   signNotificationSession,
-  readNotificationSession
+  readNotificationSession,
+  cachedRead,
+  invalidateReadCache,
+  attachActivityDates,
+  migrateClientSettings
 };

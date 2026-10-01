@@ -124,6 +124,7 @@
       <div class="tab active" onclick="goToDashboard()">📊 Dashboard</div>
       <div class="tab" id="tabUpdate" onclick="requestUpdatePage()">✏️ Update</div>
       <div class="tab" id="tabAdd" onclick="goToAddItem()" style="display:none;">＋ Add</div>
+      <div class="tab" id="tabOrder" onclick="goToAddOrder()" style="display:none;">📦 Add Order</div>
       <div class="tab" onclick="goToLogs()">📋 Logs</div>
       <div class="tab" onclick="showPage('chat')">💬 Chat</div>
       <div class="tab" id="tabClients" onclick="showPage('clients')" style="display:none;">🏷️ Clients</div>
@@ -142,12 +143,7 @@
       </div>
       <div class="filter-bar">
         <input type="text" id="tableSearch" placeholder="🔍 Search SKU or product..." oninput="renderTable()" />
-        <div class="filter-btn-row">
-          <button class="filter-btn active" id="f-all" data-filter="all" type="button">All</button>
-          <button class="filter-btn" id="f-in" data-filter="in" type="button">In Stock</button>
-          <button class="filter-btn" id="f-low" data-filter="low" type="button">Low Stock</button>
-          <button class="filter-btn" id="f-out" data-filter="out" type="button">Out of Stock</button>
-        </div>
+        <div class="filter-btn-row" id="filterGroups"></div>
       </div>
       <div class="data-cards" id="inventoryCards"></div>
       <div class="table-shell">
@@ -225,6 +221,30 @@
           <button id="createProductSubmit" class="btn-set" onclick="createProduct()">Add</button>
         </div>
         <div id="customProductFields" style="margin-top:12px; display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:10px;"></div>
+      </div>
+    </div>
+
+    <div id="page-order" class="page content" style="display:none;">
+      <div class="update-card">
+        <h2>📦 Add Order</h2>
+        <p style="color:#666;font-size:12px;margin-bottom:12px;">New orders start as "Not Shipped".</p>
+        <div id="createOrderReadOnlyNotice" style="display:none; color:#b45309; background:#fff7ed; border:1px solid #fed7aa; padding:8px 10px; border-radius:8px; margin-bottom:12px; font-size:12px; font-weight:700;"></div>
+        <div class="set-row" style="display:grid;grid-template-columns:1fr 1fr 110px auto;gap:8px;align-items:end;">
+          <div id="newOrderSkuWrap">
+            <label class="ac-label" for="newOrderSku">SKU</label>
+            <input type="text" id="newOrderSku" class="ac-input" />
+          </div>
+          <div id="newOrderTitleWrap">
+            <label class="ac-label" id="newOrderTitleLabel" for="newOrderTitle">Product Title</label>
+            <input type="text" id="newOrderTitle" class="ac-input" />
+          </div>
+          <div>
+            <label class="ac-label" for="newOrderQty">Qty</label>
+            <input type="number" id="newOrderQty" value="0" min="0" class="ac-input" />
+          </div>
+          <button id="createOrderSubmit" class="btn-set" onclick="createProduct('order')">Add</button>
+        </div>
+        <div id="orderProductFields" style="margin-top:12px; display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:10px;"></div>
       </div>
     </div>
 
@@ -314,9 +334,28 @@
           <label class="ac-check"><input type="checkbox" id="acReadOnly" /> Read-only dashboard</label>
         </div>
 
+        <div class="ac-settings-grid">
+          <div>
+            <label class="ac-label" for="acQuickEditMode">Quick Edit (table +/− buttons)</label>
+            <select id="acQuickEditMode" class="ac-input" onchange="syncQuickEditPinField('ac')">
+              <option value="enabled">Enabled</option>
+              <option value="password">Password Protected</option>
+              <option value="disabled">Disabled</option>
+            </select>
+          </div>
+          <div id="acQuickEditPinWrap" style="display:none;">
+            <label class="ac-label" for="acQuickEditPin">Quick Edit PIN</label>
+            <input type="password" id="acQuickEditPin" class="ac-input" autocomplete="new-password" placeholder="4-32 characters" />
+          </div>
+          <div>
+            <label class="ac-label" for="acOverstockLevel">Overstock above (qty)</label>
+            <input type="number" id="acOverstockLevel" class="ac-input" min="1" placeholder="100" />
+          </div>
+        </div>
+
         <hr class="divider" />
         <h2>📋 Dashboard / Add-Item Fields</h2>
-        <p style="color:#666;font-size:12px;margin-bottom:10px;">Every field you add here becomes a column on the dashboard and a field on the Add Item form.</p>
+        <p style="color:#666;font-size:12px;margin-bottom:10px;">Every field you add here becomes a dashboard column. Untick "Add Inventory" or "Add Order" to hide it on that form.</p>
         <div id="acFieldsList"></div>
         <button type="button" class="btn-set" style="margin-top:8px;" onclick="addClientFieldRow()">+ Add Field</button>
 
@@ -336,6 +375,8 @@
         </select>
 
         <div id="editClientForm" style="display:none;">
+          <div id="ecLegacyNote" class="ac-note" style="display:none;">This is a built-in client. Its sheet columns and layout stay as they are; you can change field visibility, Quick Edit, filter mapping, and overstock level.</div>
+          <div id="ecGenericSettings">
           <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
             <div>
               <label class="ac-label">Client Name</label>
@@ -362,30 +403,73 @@
             <label class="ac-check"><input type="checkbox" id="ecAllowUpdate" /> Allow update</label>
             <label class="ac-check"><input type="checkbox" id="ecReadOnly" /> Read-only dashboard</label>
           </div>
+          </div>
+
+          <div class="ac-settings-grid">
+            <div>
+              <label class="ac-label" for="ecQuickEditMode">Quick Edit (table +/− buttons)</label>
+              <select id="ecQuickEditMode" class="ac-input" onchange="syncQuickEditPinField('ec')">
+                <option value="enabled">Enabled</option>
+                <option value="password">Password Protected</option>
+                <option value="disabled">Disabled</option>
+              </select>
+            </div>
+            <div id="ecQuickEditPinWrap" style="display:none;">
+              <label class="ac-label" for="ecQuickEditPin">Quick Edit PIN</label>
+              <input type="password" id="ecQuickEditPin" class="ac-input" autocomplete="new-password" placeholder="4-32 characters" />
+            </div>
+            <div>
+              <label class="ac-label" for="ecOverstockLevel">Overstock above (qty)</label>
+              <input type="number" id="ecOverstockLevel" class="ac-input" min="1" placeholder="100" />
+            </div>
+          </div>
+
+          <h2 style="margin-top:14px;">🏷️ Filter Attribute Mapping</h2>
+          <p style="color:#666;font-size:12px;margin-bottom:10px;">Pick the field that holds a Y/N value for each dashboard filter. Aged Orders and Dead Stock use the activity log automatically.</p>
+          <div class="ac-settings-grid">
+            <div>
+              <label class="ac-label" for="ecAttrBundled">Bundled field</label>
+              <select id="ecAttrBundled" class="ac-input"></select>
+            </div>
+            <div>
+              <label class="ac-label" for="ecAttrFragile">Fragile field</label>
+              <select id="ecAttrFragile" class="ac-input"></select>
+            </div>
+            <div>
+              <label class="ac-label" for="ecAttrOversized">Oversized field</label>
+              <select id="ecAttrOversized" class="ac-input"></select>
+            </div>
+          </div>
 
           <hr class="divider" />
           <h2>📋 Dashboard / Add-Item Fields</h2>
-          <p style="color:#666;font-size:12px;margin-bottom:10px;">Rename a field's label to rename its column, or remove it to delete the column (and its data) entirely.</p>
+          <p style="color:#666;font-size:12px;margin-bottom:10px;">Rename a field's label to rename its column, or remove it to delete the column (and its data) entirely. Untick "Add Inventory" or "Add Order" to hide a field on that form.</p>
           <div id="ecFieldsList"></div>
-          <button type="button" class="btn-set" style="margin-top:8px;" onclick="addEditClientFieldRow()">+ Add Field</button>
-
-          <hr class="divider" />
-          <h2>🔑 Account Access</h2>
-          <p style="color:#666;font-size:12px;margin-bottom:10px;">If the client lost their activation code or recovery code, reset their account here and give them the new activation code.</p>
-          <button type="button" class="btn-set" onclick="resetClientAccountPrompt()">Reset Account (new activation code)</button>
+          <button type="button" id="ecAddFieldBtn" class="btn-set" style="margin-top:8px;" onclick="addEditClientFieldRow()">+ Add Field</button>
 
           <div style="margin-top:18px;display:flex;gap:10px;">
             <button type="button" class="big-btn plus" onclick="submitClientEdit()">Save Changes</button>
-            <button type="button" class="big-btn minus" onclick="deleteClientPrompt()">Delete Client</button>
+            <button type="button" id="ecDeleteBtn" class="big-btn minus" onclick="deleteClientPrompt()">Delete Client</button>
           </div>
         </div>
+      </div>
+
+      <div class="update-card">
+        <h2>🔑 Reset Client Password</h2>
+        <p style="color:#666;font-size:12px;margin-bottom:12px;">Passwords and recovery codes are stored hashed and can't be read from the sheet. Resetting signs the client out of their old password and gives you a one-time activation code to send them; they then choose a new password with "Create Account".</p>
+        <div id="resetPasswordMsg" style="display:none;margin-bottom:12px;padding:8px 10px;border-radius:8px;font-size:12px;font-weight:700;"></div>
+        <label class="ac-label" for="rpClientSelect">Client</label>
+        <select id="rpClientSelect" style="width:100%;padding:10px 12px;border:1px solid #dfe7f1;border-radius:8px;margin-bottom:12px;">
+          <option value="">— Choose a client —</option>
+        </select>
+        <button type="button" class="btn-set" onclick="resetClientPasswordPrompt()">Reset Password</button>
       </div>
     </div>
 
     <div class="pin-overlay" id="pinOverlay">
       <div class="pin-box">
-        <h3>Protected Action</h3>
-        <p>Enter your 3-digit PIN to continue</p>
+        <h3 id="pinTitle">Protected Action</h3>
+        <p id="pinMessage">Enter your 3-digit PIN to continue</p>
         <input type="password" id="pinInput" maxlength="3" placeholder="•••" inputmode="numeric" />
         <div class="pin-actions">
           <button class="pin-btn cancel" onclick="closePinPrompt()">Cancel</button>

@@ -41,6 +41,9 @@ const NOTIFICATIONS_URL = window.location.hostname === 'localhost' || window.loc
 const UPDATE_QUANTITY_URL = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
   ? 'http://localhost:3001/api/inventory/quantity'
   : '/api/inventory/quantity';
+const QUICK_EDIT_UNLOCK_URL = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
+  ? 'http://localhost:3001/api/quick-edit/unlock'
+  : '/api/quick-edit/unlock';
 
 const defaultInventory = [];
 
@@ -71,12 +74,6 @@ const CLIENT_INVENTORY_FIELDS = {
     { key: 'quantityShipped', label: 'Quantity Shipped', type: 'number', adminOnly: true },
     { key: 'notes', label: 'Notes', type: 'textarea' }
   ] }
-};
-
-const CLIENT_DRIVE_FOLDERS = {
-  'CL-001': 'https://drive.google.com/drive/folders/12kLeOKbQ2A_siusOder-4qzF8xMwNyU1?usp=drive_link',
-  'CL-002': 'https://drive.google.com/drive/folders/14OQQ-PJWjOPf_jW_QhWne7iB-q8l-60k?usp=drive_link',
-  'CL-003': 'https://drive.google.com/drive/folders/19iAZ6O_akxRqMtuSYE11GMifz3yNMrav?usp=drive_link'
 };
 
 function getVisibleClientFields(clientId, isAdmin = false) {
@@ -119,12 +116,21 @@ function getClientInventoryFields(clientId) {
   return CLIENT_INVENTORY_FIELDS[safeClientId] || { label: 'Client', readOnly: true, requirePin: true, fields: [] };
 }
 
+// Only the loaded profile of this exact client can supply a folder; no profile, email, or folder means no link.
 function getChatDriveFolderForClient(clientId) {
   const safeClientId = String(clientId || '').trim().toUpperCase();
-  if (state.clientProfile && state.clientProfile.clientId === safeClientId && state.clientProfile.driveFolderUrl) {
-    return state.clientProfile.driveFolderUrl;
+  const profile = state.clientProfile;
+  if (!profile || profile.clientId !== safeClientId || !profile.driveAccessReady) return '';
+  return isGoogleDriveUrl(profile.driveFolderUrl) ? profile.driveFolderUrl : '';
+}
+
+function isGoogleDriveUrl(value) {
+  try {
+    const url = new URL(String(value || '').trim());
+    return url.protocol === 'https:' && (url.hostname === 'drive.google.com' || url.hostname === 'docs.google.com');
+  } catch (error) {
+    return false;
   }
-  return CLIENT_DRIVE_FOLDERS[safeClientId] || CLIENT_DRIVE_FOLDERS['CL-001'];
 }
 
 const INVENTORY_FIELD_ALIASES = {
@@ -223,7 +229,8 @@ function normalizeInventoryItem(item, fallbackClientId = '') {
 
 const state = {
   items: [],
-  filter: 'all',
+  filters: { stock: [], stage: [], attr: [] },
+  quickEditUnlock: null,
   query: '',
   selectedItemId: null,
   auth: false,
@@ -246,6 +253,28 @@ let notificationRequestId = 0;
 let chatSignature = null;
 let inventorySignature = null;
 let syncGeneration = 0;
+
+// Last-good data per client so switching back renders instantly while a refresh runs.
+const clientViewCache = new Map();
+const SWITCH_DEBOUNCE_MS = 250;
+let switchTimer = null;
+let switchSequence = 0;
+let viewController = typeof AbortController === 'function' ? new AbortController() : null;
+
+function viewSignal() {
+  return viewController ? viewController.signal : undefined;
+}
+
+function resetViewRequests() {
+  if (!viewController) return;
+  viewController.abort();
+  viewController = new AbortController();
+}
+
+function cacheClientView(clientId, values) {
+  if (!clientId) return;
+  clientViewCache.set(clientId, { ...(clientViewCache.get(clientId) || {}), ...values });
+}
 const syncTimers = { chat: null, inventory: null, notifications: null };
 const syncFailures = { chat: 0, inventory: 0, notifications: 0 };
 const syncIntervals = { chat: 10000, inventory: 15000, notifications: 30000 };
@@ -338,7 +367,8 @@ async function fetchNotifications(clientId = state.activeClientId) {
   const session = state.session;
   try {
     const response = await fetch(`${NOTIFICATIONS_URL}?clientId=${encodeURIComponent(clientId || session.clientId)}`, {
-      headers: { Authorization: `Bearer ${session.notificationToken}`, Accept: 'application/json' }
+      headers: { Authorization: `Bearer ${session.notificationToken}`, Accept: 'application/json' },
+      signal: viewSignal()
     });
     if (!response.ok) return response.status;
     const summary = await response.json();
@@ -425,9 +455,10 @@ function setPage(pageId) {
   const tabMap = {
     'page-dashboard': 0,
     'page-update': 1,
-    'page-logs': 3,
-    'page-chat': 4,
-    'page-clients': 5
+    'page-order': 3,
+    'page-logs': 4,
+    'page-chat': 5,
+    'page-clients': 6
   };
 
   const tabIndex = tabMap[pageId];
@@ -447,6 +478,7 @@ function showPage(pageName, markChatRead = true) {
   const routeMap = {
     dashboard: 'page-dashboard',
     update: 'page-update',
+    order: 'page-order',
     logs: 'page-logs',
     chat: 'page-chat',
     clients: 'page-clients'
@@ -517,16 +549,16 @@ function getStatusBadgeClass(status) {
 async function fetchClientProfile(clientId = state.activeClientId || state.session?.clientId || 'CL-001') {
   try {
     const response = await fetch(`${CLIENT_PROFILE_URL}?clientId=${encodeURIComponent(clientId)}`, {
-      headers: { Accept: 'application/json' }
+      headers: adminHeaders({ Accept: 'application/json' }),
+      signal: viewSignal()
     });
-    if (!response.ok) {
-      state.clientProfile = null;
-      return null;
-    }
-    state.clientProfile = await response.json();
-    return state.clientProfile;
+    if (!response.ok) return null;
+    const profile = await response.json();
+    cacheClientView(clientId, { profile });
+    // A slow profile for a previously selected client must not relabel the current table.
+    if (state.activeClientId === clientId) state.clientProfile = profile;
+    return profile;
   } catch (error) {
-    state.clientProfile = null;
     return null;
   }
 }
@@ -557,20 +589,99 @@ function getFilterConfig(clientId = state.activeClientId || state.session?.clien
   };
 }
 
-function syncFilterButtons() {
-  const clientId = state.activeClientId || state.session?.clientId || 'CL-001';
-  const config = getFilterConfig(clientId);
-  const buttons = Array.from(document.querySelectorAll('.filter-btn'));
+const FILTER_GROUPS = [
+  { key: 'stock', label: 'Stock Levels', options: [['in', 'In Stock'], ['low', 'Low Stock'], ['out', 'Out of Stock'], ['over', 'Overstock'], ['negative', 'Negative Inventory']] },
+  { key: 'stage', label: 'Fulfillment Stages', options: [['not', 'Not Shipped'], ['partial', 'Partially Shipped'], ['fully', 'Fully Shipped'], ['label', 'Ready for Label'], ['exception', 'Exception / Delivery Issue']] },
+  { key: 'attr', label: 'Attributes & Time', options: [['bundled', 'Bundled'], ['unbundled', 'Non-Bundled'], ['fragile', 'Fragile'], ['oversized', 'Oversized'], ['aged', 'Aged Orders (>48h)'], ['dead', 'Dead Stock']] }
+];
+const AGED_ORDER_MS = 48 * 60 * 60 * 1000;
+const DEAD_STOCK_MS = 90 * 24 * 60 * 60 * 1000;
 
-  buttons.forEach((button, index) => {
-    const option = config.options[index];
-    if (!option) return;
-    button.id = option.key === 'all' ? 'f-all' : `f-${option.key}`;
-    button.dataset.filter = option.key;
-    button.textContent = option.label;
-    button.onclick = () => setFilter(option.key);
-    button.classList.toggle('active', state.filter === option.key);
-  });
+function emptyFilters() {
+  return { stock: [], stage: [], attr: [] };
+}
+
+function toNumber(value) {
+  const parsed = Number(String(value ?? '').replace(/[^0-9.-]/g, ''));
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function isYes(value) {
+  return ['y', 'yes', 'true', '1', 'x'].includes(String(value ?? '').trim().toLowerCase());
+}
+
+function getStockLevel(item, profile = state.clientProfile) {
+  const qty = toNumber(item.qty ?? item.quantity);
+  if (qty < 0) return 'negative';
+  if (qty === 0) return 'out';
+  if (qty <= Number(item.reorderLevel || 0)) return 'low';
+  const overstockLevel = Number(profile?.overstockLevel) || 0;
+  if (overstockLevel && qty > overstockLevel) return 'over';
+  return 'in';
+}
+
+// Returns null when a row carries no shipping information at all (plain stock items).
+function getFulfillmentStage(item) {
+  const text = `${item.status || ''} ${item.notes || ''} ${item.fulfillment || ''}`.toLowerCase();
+  if (/exception|delivery issue|lost|damaged|returned to sender/.test(text)) return 'exception';
+  if (/ready for label/.test(text)) return 'label';
+  const hasShipmentNumbers = String(item.quantityOrdered ?? '').trim() !== '' || String(item.quantityShipped ?? '').trim() !== '';
+  if (hasShipmentNumbers) {
+    const ordered = toNumber(item.quantityOrdered);
+    const shipped = toNumber(item.quantityShipped);
+    if (shipped <= 0) return 'not';
+    if (ordered > 0 && shipped < ordered) return 'partial';
+    return 'fully';
+  }
+  if (/fully shipped|delivered/.test(text)) return 'fully';
+  if (/partially shipped/.test(text)) return 'partial';
+  if (/not shipped/.test(text)) return 'not';
+  return null;
+}
+
+function getItemAttributes(item, profile = state.clientProfile, now = Date.now()) {
+  const attributes = new Set();
+  const map = profile?.attributeMap || {};
+  if (map.bundled) attributes.add(isYes(item[map.bundled]) ? 'bundled' : 'unbundled');
+  if (map.fragile && isYes(item[map.fragile])) attributes.add('fragile');
+  if (map.oversized && isYes(item[map.oversized])) attributes.add('oversized');
+  const addedAt = Date.parse(item.addedAt || '');
+  if (Number.isFinite(addedAt) && now - addedAt > AGED_ORDER_MS && getFulfillmentStage(item) !== 'fully') attributes.add('aged');
+  const lastActivityAt = Date.parse(item.lastActivityAt || '');
+  if (Number.isFinite(lastActivityAt) && now - lastActivityAt > DEAD_STOCK_MS && toNumber(item.qty ?? item.quantity) > 0) attributes.add('dead');
+  return attributes;
+}
+
+function renderFilterControls() {
+  const host = document.getElementById('filterGroups');
+  if (!host) return;
+  const filters = state.filters || emptyFilters();
+  const anyActive = FILTER_GROUPS.some((group) => filters[group.key].length);
+  host.innerHTML = `
+    <button class="filter-btn ${anyActive ? '' : 'active'}" type="button" data-action="clear-filters">All</button>
+    ${FILTER_GROUPS.map((group) => `
+      <div class="filter-group" role="group" aria-label="${group.label}">
+        <span class="filter-group-label">${group.label}</span>
+        ${group.options.map(([key, label]) => {
+          const active = filters[group.key].includes(key);
+          return `<button class="filter-btn ${active ? 'active' : ''}" type="button" aria-pressed="${active}" data-action="toggle-filter" data-group="${group.key}" data-key="${key}">${label}</button>`;
+        }).join('')}
+      </div>
+    `).join('')}
+  `;
+}
+
+function toggleFilter(groupKey, optionKey) {
+  const group = FILTER_GROUPS.find((entry) => entry.key === groupKey);
+  if (!group || !group.options.some(([key]) => key === optionKey)) return;
+  const selected = state.filters[groupKey];
+  state.filters[groupKey] = selected.includes(optionKey) ? selected.filter((key) => key !== optionKey) : [...selected, optionKey];
+  renderTable();
+}
+
+function clearFilters() {
+  state.filters = emptyFilters();
+  renderTable();
 }
 
 function updateSummary() {
@@ -619,29 +730,21 @@ function updateSummary() {
 
 function getFilteredItems() {
   const query = (state.query || '').trim().toLowerCase();
-  const clientId = state.activeClientId || state.session?.clientId || 'CL-001';
-  const config = getFilterConfig(clientId);
+  const filters = state.filters || emptyFilters();
+  const now = Date.now();
 
-  const items = state.items.filter((item) => {
+  // OR within a group, AND across groups; an empty group doesn't filter.
+  return state.items.filter((item) => {
     const text = `${item.sku || ''} ${item.title || ''} ${item.category || ''} ${item.location || ''}`.toLowerCase();
     if (query && !text.includes(query)) return false;
-
-    const status = getItemStatus(item);
-    if (state.filter === 'all') return true;
-    if (config.mode === 'shipping') {
-      if (state.filter === 'fully' && status !== 'fully') return false;
-      if (state.filter === 'partial' && status !== 'partial') return false;
-      if (state.filter === 'not' && status !== 'not') return false;
-      return true;
+    if (filters.stock.length && !filters.stock.includes(getStockLevel(item))) return false;
+    if (filters.stage.length && !filters.stage.includes(getFulfillmentStage(item))) return false;
+    if (filters.attr.length) {
+      const attributes = getItemAttributes(item, state.clientProfile, now);
+      if (!filters.attr.some((key) => attributes.has(key))) return false;
     }
-
-    if (state.filter === 'in' && status !== 'in') return false;
-    if (state.filter === 'low' && status !== 'low') return false;
-    if (state.filter === 'out' && status !== 'out') return false;
     return true;
   });
-
-  return items;
 }
 
 function syncDashboardColumns() {
@@ -659,29 +762,47 @@ function syncDashboardColumns() {
     }).join('');
   }
 
+  scheduleTableScrollUpdate();
+}
+
+let tableScrollFrame = null;
+
+function scheduleTableScrollUpdate() {
+  if (tableScrollFrame !== null || !document.getElementById('inventoryTableWrap')) return;
+  const nextFrame = typeof requestAnimationFrame === 'function' ? requestAnimationFrame : (callback) => setTimeout(callback, 16);
+  tableScrollFrame = nextFrame(() => {
+    tableScrollFrame = null;
+    updateTableScrollButtons();
+  });
+}
+
+function updateTableScrollButtons() {
   const tableWrap = document.getElementById('inventoryTableWrap');
   const leftButton = document.getElementById('tableScrollLeft');
   const rightButton = document.getElementById('tableScrollRight');
+  if (!tableWrap || !leftButton || !rightButton) return;
 
-  if (tableWrap && leftButton && rightButton) {
-    const canScroll = tableWrap.scrollWidth > tableWrap.clientWidth + 2;
-    const step = Math.max(220, tableWrap.clientWidth * 0.7);
+  const canScroll = tableWrap.scrollWidth > tableWrap.clientWidth + 2;
+  const atStart = tableWrap.scrollLeft <= 2;
+  const atEnd = tableWrap.scrollLeft + tableWrap.clientWidth >= tableWrap.scrollWidth - 2;
 
-    leftButton.classList.toggle('visible', canScroll);
-    rightButton.classList.toggle('visible', canScroll);
-    leftButton.classList.toggle('disabled', tableWrap.scrollLeft <= 2);
-    rightButton.classList.toggle('disabled', tableWrap.scrollLeft + tableWrap.clientWidth >= tableWrap.scrollWidth - 2);
+  leftButton.classList.toggle('visible', canScroll);
+  rightButton.classList.toggle('visible', canScroll);
+  leftButton.classList.toggle('disabled', atStart);
+  rightButton.classList.toggle('disabled', atEnd);
+  leftButton.disabled = !canScroll || atStart;
+  rightButton.disabled = !canScroll || atEnd;
+}
 
-    leftButton.disabled = !canScroll || tableWrap.scrollLeft <= 2;
-    rightButton.disabled = !canScroll || tableWrap.scrollLeft + tableWrap.clientWidth >= tableWrap.scrollWidth - 2;
-
-    leftButton.onclick = () => tableWrap.scrollBy({ left: -step, behavior: 'smooth' });
-    rightButton.onclick = () => tableWrap.scrollBy({ left: step, behavior: 'smooth' });
-  }
+function scrollInventoryTable(direction) {
+  const tableWrap = document.getElementById('inventoryTableWrap');
+  if (!tableWrap) return;
+  const step = Math.max(220, tableWrap.clientWidth * 0.7);
+  tableWrap.scrollBy({ left: direction * step, behavior: 'smooth' });
 }
 
 function renderTable() {
-  syncFilterButtons();
+  renderFilterControls();
   const items = getFilteredItems();
   if (!inventoryBody) return;
 
@@ -751,16 +872,16 @@ function renderChatMessages() {
   msgBox.innerHTML = messages.map((message) => {
     const messageIsStaff = message.isStaff === true;
     const isMine = messageIsStaff === isCurrentUserStaff;
-    const senderLabel = isMine ? 'Me' : (messageIsStaff ? (message.sender || 'Admin') : (message.sender || 'Client'));
+    const senderLabel = escapeHtml(isMine ? 'Me' : (messageIsStaff ? (message.sender || 'Admin') : (message.sender || 'Client')));
     const fileUrl = String(message.fileUrl || '').trim();
-    const fileName = String(message.fileName || (fileUrl ? 'Shared file' : '')).trim();
-    const fileMarkup = fileUrl
-      ? `<div class="msg-file"><a href="${fileUrl}" target="_blank" rel="noreferrer">${fileName || 'Open shared file'}</a></div>`
+    const fileName = String(message.fileName || 'Shared file').trim();
+    const fileMarkup = isGoogleDriveUrl(fileUrl)
+      ? `<div class="msg-file"><a href="${escapeHtml(fileUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(fileName || 'Open shared file')}</a></div>`
       : '';
     return `
       <div class="msg-wrap ${isMine ? 'me' : 'them'}">
         <div class="msg-meta"><span>${senderLabel}</span></div>
-        <div class="msg-bubble">${String(message.message || '').replace(/</g, '&lt;')}${fileMarkup}</div>
+        <div class="msg-bubble">${escapeHtml(message.message)}${fileMarkup}</div>
       </div>
     `;
   }).join('');
@@ -773,12 +894,16 @@ async function loadChatMessages(clientId = state.activeClientId || state.session
   const session = state.session;
   try {
     const response = await fetch(`${CHAT_URL}?clientId=${encodeURIComponent(clientId)}`, {
-      headers: { Accept: 'application/json' }
+      headers: adminHeaders({ Accept: 'application/json' }),
+      signal: viewSignal()
     });
 
     if (!response.ok) return response.status;
 
     const payload = await response.json();
+    if (Array.isArray(payload)) {
+      cacheClientView(clientId, { messages: payload, chatSignature: JSON.stringify(payload) });
+    }
     if (requestId === chatRequestId && state.auth && state.session === session && state.activeClientId === clientId && Array.isArray(payload)) {
       const signature = JSON.stringify(payload);
       if (signature !== chatSignature) {
@@ -791,16 +916,6 @@ async function loadChatMessages(clientId = state.activeClientId || state.session
   } catch (error) {
     return 0;
   }
-}
-
-function setFilter(filterName) {
-  const clientId = state.activeClientId || state.session?.clientId || 'CL-001';
-  const config = getFilterConfig(clientId);
-  const allowed = new Set(config.options.map((option) => option.key));
-  const nextFilter = allowed.has(String(filterName || '')) ? String(filterName) : 'all';
-  state.filter = nextFilter;
-  syncFilterButtons();
-  renderTable();
 }
 
 function clearLoginError() {
@@ -939,12 +1054,19 @@ async function fetchInventory(clientId = state.activeClientId || state.session?.
 
   try {
     const response = await fetch(inventoryUrl, {
-      headers: { Accept: 'application/json' }
+      headers: { Accept: 'application/json' },
+      signal: viewSignal()
     });
 
     if (!response.ok) return response.status;
 
     const result = await response.json();
+    if (Array.isArray(result)) {
+      cacheClientView(targetClientId, {
+        items: result.map((item) => normalizeInventoryItem(item, targetClientId)),
+        itemsSignature: JSON.stringify(result)
+      });
+    }
     if (requestId === inventoryRequestId && state.auth && state.session === session && state.activeClientId === targetClientId && Array.isArray(result)) {
       const signature = JSON.stringify(result);
       if (signature !== inventorySignature) {
@@ -963,7 +1085,7 @@ async function fetchInventory(clientId = state.activeClientId || state.session?.
 async function fetchClientRoster() {
   try {
     const response = await fetch(CLIENTS_URL, {
-      headers: { Accept: 'application/json' }
+      headers: adminHeaders({ Accept: 'application/json' })
     });
 
     if (!response.ok) {
@@ -1037,153 +1159,204 @@ function renderClientHeader() {
 function renderDriveFolderLink() {
   const link = document.getElementById('driveFolderLink');
   if (!link) return;
-  const clientId = state.activeClientId || state.session?.clientId || 'CL-001';
+  const clientId = state.activeClientId || state.session?.clientId || '';
   const folderUrl = getChatDriveFolderForClient(clientId);
-  link.href = folderUrl;
-  link.textContent = `Open ${getClientInventoryFields(clientId).label || 'Client'} Drive Folder`;
+  if (folderUrl) {
+    link.href = folderUrl;
+    link.removeAttribute('aria-disabled');
+    link.classList.remove('drive-link-disabled');
+    link.textContent = `Open ${getClientInventoryFields(clientId).label || 'Client'} Drive Folder`;
+    return;
+  }
+  link.removeAttribute('href');
+  link.setAttribute('aria-disabled', 'true');
+  link.classList.add('drive-link-disabled');
+  const profile = state.clientProfile && state.clientProfile.clientId === clientId ? state.clientProfile : null;
+  link.textContent = !profile ? 'Drive folder unavailable'
+    : !profile.driveFolderUrl ? 'No Drive folder on file for this account'
+      : 'Drive folder needs an email on file for this account';
 }
 
 function syncAddTabVisibility() {
-  const addTab = document.getElementById('tabAdd');
-  if (!addTab) return;
-
   const clientId = state.activeClientId || state.session?.clientId || 'CL-001';
   const config = getClientInventoryFields(clientId);
   const shouldShow = Boolean(config && !config.readOnly && !config.requirePin);
-  addTab.style.display = shouldShow ? 'block' : 'none';
+  ['tabAdd', 'tabOrder'].forEach((id) => {
+    const tab = document.getElementById(id);
+    if (tab) tab.style.display = shouldShow ? 'block' : 'none';
+  });
+}
+
+const ITEM_FORMS = {
+  inventory: { prefix: 'newProduct', fieldPrefix: 'customField_', fieldsHost: 'customProductFields', submit: 'createProductSubmit', notice: 'createProductReadOnlyNotice' },
+  order: { prefix: 'newOrder', fieldPrefix: 'orderField_', fieldsHost: 'orderProductFields', submit: 'createOrderSubmit', notice: 'createOrderReadOnlyNotice' }
+};
+
+// Custom fields for one form, minus any the admin switched off for this client and form.
+function getFormFields(clientId, kind) {
+  const profile = state.clientProfile && state.clientProfile.clientId === clientId ? state.clientProfile : null;
+  const visibility = (profile && profile.fieldVisibility) || {};
+  return getVisibleClientFields(clientId, state.isAdmin).filter((field) => !visibility[field.key] || visibility[field.key][kind] !== false);
 }
 
 function syncCreateFormLayout() {
-  const skuWrap = document.getElementById('newProductSkuWrap');
-  const skuInput = document.getElementById('newProductSku');
-  const titleWrap = document.getElementById('newProductTitleWrap');
-  const titleLabel = document.getElementById('newProductTitleLabel');
-  const titleInput = document.getElementById('newProductTitle');
   const clientId = state.activeClientId || state.session?.clientId || 'CL-001';
   const titleConfig = getCreateFormTitleConfig(clientId);
   const isCardClient = clientId === 'CL-003';
 
-  if (skuWrap) skuWrap.style.display = isCardClient ? 'none' : 'block';
-  if (skuInput) skuInput.disabled = isCardClient;
-  if (titleWrap) titleWrap.style.display = titleConfig.visible ? 'block' : 'none';
-  if (titleLabel) titleLabel.textContent = titleConfig.label;
-  if (titleInput) {
-    titleInput.placeholder = titleConfig.placeholder;
-    if (!titleConfig.visible) titleInput.value = '';
-  }
+  Object.values(ITEM_FORMS).forEach(({ prefix }) => {
+    const skuWrap = document.getElementById(`${prefix}SkuWrap`);
+    const skuInput = document.getElementById(`${prefix}Sku`);
+    const titleWrap = document.getElementById(`${prefix}TitleWrap`);
+    const titleLabel = document.getElementById(`${prefix}TitleLabel`);
+    const titleInput = document.getElementById(`${prefix}Title`);
+
+    if (skuWrap) skuWrap.style.display = isCardClient ? 'none' : 'block';
+    if (skuInput) skuInput.disabled = isCardClient;
+    if (titleWrap) titleWrap.style.display = titleConfig.visible ? 'block' : 'none';
+    if (titleLabel) titleLabel.textContent = titleConfig.label;
+    if (titleInput) {
+      titleInput.placeholder = titleConfig.placeholder;
+      if (!titleConfig.visible) titleInput.value = '';
+    }
+  });
+}
+
+function escapeHtml(value) {
+  return String(value ?? '').replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
+}
+
+function renderFieldInputs(fields, idPrefix) {
+  const labelStyle = 'display:block;font-size:11px;font-weight:700;color:#475569;margin-bottom:6px;';
+  const commonStyle = 'width:100%;padding:10px 12px;border:1px solid #dfe7f1;border-radius:8px;';
+  return fields.map((field) => {
+    const fieldId = escapeHtml(`${idPrefix}${field.key}`);
+    const label = escapeHtml(field.label);
+    const isReadOnlyField = Boolean(field.readOnly) && !state.isAdmin;
+    const samplePlaceholder = escapeHtml(getClientFieldPlaceholder(field, state.items));
+
+    if (field.type === 'select') {
+      const options = (field.options || []).map((option) => {
+        const value = escapeHtml(option || '');
+        return `<option value="${value}">${value || '—'}</option>`;
+      }).join('');
+      return `
+        <div>
+          <label style="${labelStyle}">${label}</label>
+          <select id="${fieldId}" style="${commonStyle}" data-placeholder="${samplePlaceholder}" ${isReadOnlyField ? 'disabled' : ''}>${options}</select>
+        </div>
+      `;
+    }
+
+    if (field.type === 'textarea') {
+      return `
+        <div style="grid-column:1 / -1;">
+          <label style="${labelStyle}">${label}</label>
+          <textarea id="${fieldId}" placeholder="${samplePlaceholder}" style="${commonStyle};min-height:84px;resize:vertical;" ${isReadOnlyField ? 'readonly' : ''}></textarea>
+        </div>
+      `;
+    }
+
+    return `
+      <div>
+        <label style="${labelStyle}">${label}</label>
+        <input type="${field.type === 'number' ? 'number' : 'text'}" id="${fieldId}" placeholder="${samplePlaceholder}" style="${commonStyle}" ${isReadOnlyField ? 'readonly' : ''} />
+      </div>
+    `;
+  }).join('');
 }
 
 function renderProductForm() {
-  const host = document.getElementById('customProductFields');
-  const notice = document.getElementById('createProductReadOnlyNotice');
-  const submitBtn = document.getElementById('createProductSubmit');
   const clientId = state.activeClientId || state.session?.clientId || 'CL-001';
   const config = getClientInventoryFields(clientId);
-  const visibleFields = getVisibleClientFields(clientId, state.isAdmin);
 
   syncAddTabVisibility();
   syncCreateFormLayout();
 
-  const productSkuInput = document.getElementById('newProductSku');
-  const productTitleInput = document.getElementById('newProductTitle');
   const skuSample = getInventoryFieldSample(state.items, 'sku');
   const titleSample = getInventoryFieldSample(state.items, 'title');
 
-  if (productSkuInput && !productSkuInput.dataset.userTyped) {
-    productSkuInput.placeholder = skuSample ? `e.g. ${skuSample}` : 'A-25-Cu-01';
-  }
+  Object.entries(ITEM_FORMS).forEach(([kind, form]) => {
+    const skuInput = document.getElementById(`${form.prefix}Sku`);
+    const titleInput = document.getElementById(`${form.prefix}Title`);
+    if (skuInput && !skuInput.dataset.userTyped) skuInput.placeholder = skuSample ? `e.g. ${skuSample}` : 'A-25-Cu-01';
+    if (titleInput && !titleInput.dataset.userTyped) titleInput.placeholder = titleSample ? `e.g. ${titleSample}` : 'Copper Marker';
 
-  if (productTitleInput && !productTitleInput.dataset.userTyped) {
-    productTitleInput.placeholder = titleSample ? `e.g. ${titleSample}` : 'Copper Marker';
-  }
+    const host = document.getElementById(form.fieldsHost);
+    if (host) host.innerHTML = renderFieldInputs(getFormFields(clientId, kind), form.fieldPrefix);
 
-  if (host) {
-    host.innerHTML = visibleFields.map((field) => {
-      const fieldId = `customField_${field.key}`;
-      const commonStyle = 'width:100%;padding:10px 12px;border:1px solid #dfe7f1;border-radius:8px;';
-      const isTextarea = field.type === 'textarea';
-      const isSelect = field.type === 'select';
-      const isReadOnlyField = Boolean(field.readOnly) && !state.isAdmin;
-      const samplePlaceholder = getClientFieldPlaceholder(field, state.items);
+    const notice = document.getElementById(form.notice);
+    if (notice) {
+      notice.style.display = config.readOnly ? 'block' : 'none';
+      notice.textContent = config.readOnly
+        ? 'This client is in view-only mode. Inventory is locked and cannot be added to directly.'
+        : '';
+    }
 
-      if (isSelect) {
-        const options = (field.options || []).map((option) => {
-          const value = String(option || '');
-          const label = value ? value : '—';
-          return `<option value="${value}">${label}</option>`;
-        }).join('');
-
-        return `
-          <div>
-            <label style="display:block;font-size:11px;font-weight:700;color:#475569;margin-bottom:6px;">${field.label}</label>
-            <select id="${fieldId}" style="${commonStyle}" data-placeholder="${samplePlaceholder}" ${isReadOnlyField ? 'disabled' : ''}>
-              ${options}
-            </select>
-          </div>
-        `;
-      }
-
-      if (isTextarea) {
-        return `
-          <div style="grid-column:1 / -1;">
-            <label style="display:block;font-size:11px;font-weight:700;color:#475569;margin-bottom:6px;">${field.label}</label>
-            <textarea id="${fieldId}" placeholder="${samplePlaceholder}" style="${commonStyle};min-height:84px;resize:vertical;" ${isReadOnlyField ? 'readonly' : ''}></textarea>
-          </div>
-        `;
-      }
-
-      return `
-        <div>
-          <label style="display:block;font-size:11px;font-weight:700;color:#475569;margin-bottom:6px;">${field.label}</label>
-          <input type="${field.type === 'number' ? 'number' : 'text'}" id="${fieldId}" placeholder="${samplePlaceholder}" style="${commonStyle}" ${isReadOnlyField ? 'readonly' : ''} />
-        </div>
-      `;
-    }).join('');
-  }
-
-  if (notice) {
-    notice.style.display = config.readOnly ? 'block' : 'none';
-    notice.textContent = config.readOnly
-      ? 'This client is in view-only mode. Inventory is locked and cannot be added to directly.'
-      : '';
-  }
-
-  if (submitBtn) {
-    submitBtn.disabled = Boolean(config.readOnly);
-    submitBtn.textContent = config.readOnly ? 'Locked' : 'Add';
-    submitBtn.style.opacity = config.readOnly ? '0.6' : '1';
-  }
+    const submitBtn = document.getElementById(form.submit);
+    if (submitBtn) {
+      submitBtn.disabled = Boolean(config.readOnly);
+      submitBtn.textContent = config.readOnly ? 'Locked' : 'Add';
+      submitBtn.style.opacity = config.readOnly ? '0.6' : '1';
+    }
+  });
 }
 
-async function switchClientView(clientId, clientName) {
+function switchClientView(clientId) {
+  const nextClientId = String(clientId || '').trim().toUpperCase();
+  if (!nextClientId) return Promise.resolve();
+
   stopBackgroundSync();
+  resetViewRequests();
   notificationRequestId += 1;
-  state.activeClientId = String(clientId || '').trim().toUpperCase();
-  state.filter = 'all';
-  state.query = '';
-  state.items = [];
-  state.messages = [];
-  inventorySignature = null;
-  chatSignature = null;
-  state.notifications = { chat: 0, inventory: 0, total: 0, items: [] };
-  renderNotifications();
   inventoryRequestId += 1;
   chatRequestId += 1;
+
+  const cached = clientViewCache.get(nextClientId) || {};
+  state.activeClientId = nextClientId;
+  state.filters = emptyFilters();
+  state.quickEditUnlock = null;
+  state.query = '';
+  state.clientProfile = cached.profile || null;
+  state.items = cached.items || [];
+  state.messages = cached.messages || [];
+  inventorySignature = cached.itemsSignature || null;
+  chatSignature = cached.chatSignature || null;
+  state.notifications = { chat: 0, inventory: 0, total: 0, items: [] };
   if (tableSearch) tableSearch.value = '';
 
+  renderNotifications();
   renderClientHeader();
-  await fetchClientProfile(state.activeClientId);
-
   renderAdminSwitcher();
   renderDriveFolderLink();
   renderProductForm();
   updateSummary();
   renderTable();
   renderChatMessages();
-  await fetchInventory(state.activeClientId);
-  await loadChatMessages(state.activeClientId);
-  await fetchNotifications(state.activeClientId);
-  startBackgroundSync();
+
+  clearTimeout(switchTimer);
+  const sequence = ++switchSequence;
+  // Rapid clicks through several clients only hit Google Sheets for the one the admin lands on.
+  return new Promise((resolve) => {
+    switchTimer = setTimeout(async () => {
+      if (sequence !== switchSequence) return resolve();
+      const chatOpen = document.getElementById('page-chat')?.classList.contains('active');
+      await Promise.all([
+        fetchClientProfile(nextClientId).then(() => {
+          if (sequence !== switchSequence) return;
+          renderDriveFolderLink();
+          renderProductForm();
+          renderTable();
+        }),
+        fetchInventory(nextClientId),
+        chatOpen ? loadChatMessages(nextClientId) : null
+      ]);
+      if (sequence !== switchSequence) return resolve();
+      fetchNotifications(nextClientId);
+      startBackgroundSync();
+      resolve();
+    }, SWITCH_DEBOUNCE_MS);
+  });
 }
 
 async function executePortalAuth() {
@@ -1235,20 +1408,18 @@ async function executePortalAuth() {
         if (document.getElementById('activeClientHeader')) {
           document.getElementById('activeClientHeader').textContent = `CLIENT: ${String(first.clientName || first.clientId || 'CLIENT').toUpperCase()}`;
         }
-        await fetchInventory(state.activeClientId);
-      } else {
-        await fetchInventory(state.activeClientId);
       }
-    } else {
-      await fetchInventory(state.activeClientId);
     }
 
-    await fetchClientProfile(state.activeClientId);
+    const firstClientId = state.activeClientId;
+    await Promise.all([
+      fetchClientProfile(firstClientId),
+      fetchInventory(firstClientId),
+      fetchNotifications(firstClientId)
+    ]);
     renderDriveFolderLink();
     renderProductForm();
     renderTable();
-    await loadChatMessages(state.activeClientId);
-    await fetchNotifications(state.activeClientId);
     startBackgroundSync();
     showToast('Signed in successfully', 'success');
   } catch (error) {
@@ -1261,6 +1432,10 @@ async function executePortalAuth() {
 
 function executePortalLogout() {
   stopBackgroundSync();
+  resetViewRequests();
+  clearTimeout(switchTimer);
+  switchSequence += 1;
+  clientViewCache.clear();
   chatRequestId += 1;
   inventoryRequestId += 1;
   notificationRequestId += 1;
@@ -1273,6 +1448,8 @@ function executePortalLogout() {
   state.activeClientId = null;
   state.selectedItemId = null;
   state.pinUnlocked = false;
+  state.quickEditUnlock = null;
+  state.filters = emptyFilters();
   state.messages = [];
   state.notifications = { chat: 0, inventory: 0, total: 0, items: [] };
   document.getElementById('notificationPanel') && (document.getElementById('notificationPanel').style.display = 'none');
@@ -1300,10 +1477,19 @@ function executePortalLogout() {
   showToast('Signed out', 'success');
 }
 
-function openPinPrompt(cb) {
+function openPinPrompt(cb, mode = 'page') {
   state.pendingPinAction = cb;
+  state.pinMode = mode;
+  const quickEdit = mode === 'quick-edit';
+  const title = document.getElementById('pinTitle');
+  const message = document.getElementById('pinMessage');
+  if (title) title.textContent = quickEdit ? 'Quick Edit Locked' : 'Protected Action';
+  if (message) message.textContent = quickEdit ? "Enter this account's Quick Edit PIN to change quantities." : 'Enter your 3-digit PIN to continue';
   if (pinOverlay) pinOverlay.style.display = 'flex';
   if (pinInput) {
+    pinInput.maxLength = quickEdit ? 32 : 3;
+    pinInput.inputMode = quickEdit ? 'text' : 'numeric';
+    pinInput.placeholder = quickEdit ? 'PIN' : '•••';
     pinInput.value = '';
     pinInput.focus();
   }
@@ -1312,10 +1498,48 @@ function openPinPrompt(cb) {
 function closePinPrompt() {
   if (pinOverlay) pinOverlay.style.display = 'none';
   state.pendingPinAction = null;
+  state.pinMode = 'page';
+}
+
+function quickEditHeaders(clientId) {
+  const unlock = state.quickEditUnlock;
+  return unlock && unlock.clientId === clientId && unlock.expiresAt > Date.now() ? { 'X-Quick-Edit-Token': unlock.token } : {};
+}
+
+async function unlockQuickEdit(pin) {
+  if (state.pinBusy || !pin) return;
+  state.pinBusy = true;
+  const clientId = state.activeClientId;
+  try {
+    const response = await fetch(QUICK_EDIT_UNLOCK_URL, {
+      method: 'POST',
+      headers: adminHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ clientId, pin })
+    });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok || !result.success) throw new Error(result.error || 'Incorrect PIN');
+    state.quickEditUnlock = { clientId, token: result.token, expiresAt: result.expiresAt };
+    const action = state.pendingPinAction;
+    closePinPrompt();
+    showToast('Quick Edit unlocked', 'success');
+    if (typeof action === 'function' && clientId === state.activeClientId) action();
+  } catch (error) {
+    showToast(error.message || 'Incorrect PIN', 'error');
+    if (pinInput) {
+      pinInput.value = '';
+      pinInput.focus();
+    }
+  } finally {
+    state.pinBusy = false;
+  }
 }
 
 function verifyPinPrompt() {
   const value = (pinInput?.value || '').trim();
+  if (state.pinMode === 'quick-edit') {
+    unlockQuickEdit(value);
+    return;
+  }
   if (value === '646') {
     state.pinUnlocked = true;
     closePinPrompt();
@@ -1369,6 +1593,16 @@ function goToAddItem() {
   openPinPrompt(() => setPage('page-update'));
 }
 
+function goToAddOrder() {
+  const clientId = state.activeClientId || state.session?.clientId || 'CL-001';
+  const config = getClientInventoryFields(clientId);
+  if ((!config.readOnly && !config.requirePin) || state.pinUnlocked) {
+    setPage('page-order');
+    return;
+  }
+  openPinPrompt(() => setPage('page-order'));
+}
+
 function goToDashboard() {
   setPage('page-dashboard');
   updateSummary();
@@ -1410,6 +1644,10 @@ async function submitMessage() {
   const fileInput = document.getElementById('chatFileUrl');
   const rawFileUrl = (fileInput?.value || '').trim();
   const fileUrl = rawFileUrl || '';
+  if (fileUrl && !isGoogleDriveUrl(fileUrl)) {
+    showToast('Shared files must be Google Drive links', 'error');
+    return;
+  }
   const fileName = fileUrl ? (fileUrl.split('/').pop() || 'Shared file') : '';
 
   const isStaff = Boolean(state.session && (String(state.session.role || '').toLowerCase() === 'admin' || String(state.session.clientId || '').toUpperCase() === 'CL-000'));
@@ -1425,7 +1663,7 @@ async function submitMessage() {
   try {
     const response = await fetch(CHAT_URL, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: adminHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify(payload)
     });
 
@@ -1508,10 +1746,15 @@ async function saveQuantity(item, quantity) {
   try {
     const response = await fetch(UPDATE_QUANTITY_URL, {
       method: 'PUT',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${state.session?.notificationToken || ''}` },
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${state.session?.notificationToken || ''}`, ...quickEditHeaders(clientId) },
       body: JSON.stringify({ clientId, sku: item.sku, qty: quantity })
     });
     const result = await response.json();
+    if (result.code === 'QUICK_EDIT_PIN_REQUIRED') {
+      state.quickEditUnlock = null;
+      openPinPrompt(() => saveQuantity(item, quantity), 'quick-edit');
+      return;
+    }
     if (!response.ok || !result.success) throw new Error(result.error || 'Unable to update inventory.');
     if (clientId !== state.activeClientId || !state.auth) return;
     item.qty = quantity;
@@ -1554,7 +1797,9 @@ async function setExactQty() {
   await saveQuantity(item, Math.max(0, val));
 }
 
-async function createProduct() {
+async function createProduct(kind = 'inventory') {
+  const form = ITEM_FORMS[kind] || ITEM_FORMS.inventory;
+  const isOrder = form === ITEM_FORMS.order;
   const clientId = state.activeClientId || state.session?.clientId || 'CL-001';
   const config = getClientInventoryFields(clientId);
   const isCardClient = clientId === 'CL-003';
@@ -1564,18 +1809,18 @@ async function createProduct() {
     return;
   }
 
-  const skuInput = document.getElementById('newProductSku');
+  const skuInput = document.getElementById(`${form.prefix}Sku`);
   const sku = (skuInput && !isCardClient) ? skuInput.value.trim() : '';
-  const titleInput = document.getElementById('newProductTitle');
-  const productNameInput = document.getElementById('customField_productName');
+  const titleInput = document.getElementById(`${form.prefix}Title`);
+  const productNameInput = document.getElementById(`${form.fieldPrefix}productName`);
   const title = (titleInput?.value?.trim() || productNameInput?.value?.trim() || '');
-  const qty = Number(document.getElementById('newProductQty')?.value ?? 0);
+  const qty = Number(document.getElementById(`${form.prefix}Qty`)?.value ?? 0);
   const extraFields = {};
-  const allowedFields = getVisibleClientFields(clientId, state.isAdmin);
+  const allowedFields = getFormFields(clientId, isOrder ? 'order' : 'inventory');
 
   allowedFields.forEach((field) => {
     if ((field.key === 'quantityReceived' || field.key === 'quantityShipped') && !state.isAdmin) return;
-    const value = document.getElementById(`customField_${field.key}`)?.value?.trim() || '';
+    const value = document.getElementById(`${form.fieldPrefix}${field.key}`)?.value?.trim() || '';
     if (value) extraFields[field.key] = value;
   });
 
@@ -1588,7 +1833,7 @@ async function createProduct() {
     const response = await fetch(CREATE_ITEM_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${state.session?.notificationToken || ''}` },
-      body: JSON.stringify({ clientId, sku: sku || title, title, qty, status: qty <= 5 ? 'Low Stock' : 'In Stock', extraFields, isAdmin: state.isAdmin, role: state.session?.role || (state.isAdmin ? 'admin' : 'client') })
+      body: JSON.stringify({ clientId, kind: isOrder ? 'order' : 'inventory', sku: sku || title, title, qty, status: isOrder ? 'Not Shipped' : (qty <= 5 ? 'Low Stock' : 'In Stock'), extraFields, isAdmin: state.isAdmin, role: state.session?.role || (state.isAdmin ? 'admin' : 'client') })
     });
 
     const result = await response.json().catch(() => ({ success: false, error: 'Create failed' }));
@@ -1596,15 +1841,18 @@ async function createProduct() {
       throw new Error(result.error || 'Create failed');
     }
 
-    if (document.getElementById('newProductSku')) document.getElementById('newProductSku').value = '';
-    document.getElementById('newProductTitle').value = '';
-    document.getElementById('newProductQty').value = '0';
+    ['Sku', 'Title'].forEach((suffix) => {
+      const input = document.getElementById(`${form.prefix}${suffix}`);
+      if (input) input.value = '';
+    });
+    const qtyInput = document.getElementById(`${form.prefix}Qty`);
+    if (qtyInput) qtyInput.value = '0';
     config.fields.forEach((field) => {
-      const input = document.getElementById(`customField_${field.key}`);
+      const input = document.getElementById(`${form.fieldPrefix}${field.key}`);
       if (input) input.value = '';
     });
     await fetchInventory(clientId);
-    showToast('Product added successfully', 'success');
+    showToast(isOrder ? 'Order added successfully' : 'Product added successfully', 'success');
   } catch (error) {
     showToast(error.message || 'Unable to add product', 'error');
   }
@@ -1626,16 +1874,14 @@ function filterLogs() {
     : '<div class="no-results" style="padding:30px;">No matching log entries.</div>';
 }
 
-window.addEventListener('resize', () => {
-  syncDashboardColumns();
-});
+window.addEventListener('resize', scheduleTableScrollUpdate);
 
 const tableWrap = document.getElementById('inventoryTableWrap');
 if (tableWrap) {
-  tableWrap.addEventListener('scroll', () => {
-    syncDashboardColumns();
-  });
+  tableWrap.addEventListener('scroll', scheduleTableScrollUpdate, { passive: true });
 }
+document.getElementById('tableScrollLeft')?.addEventListener('click', () => scrollInventoryTable(-1));
+document.getElementById('tableScrollRight')?.addEventListener('click', () => scrollInventoryTable(1));
 
 document.addEventListener('click', (event) => {
   const element = event.target.closest('[data-action]');
@@ -1645,6 +1891,14 @@ document.addEventListener('click', (event) => {
 
   if (action === 'select-item') {
     selectItem(element.dataset.id);
+  }
+
+  if (action === 'toggle-filter') {
+    toggleFilter(element.dataset.group, element.dataset.key);
+  }
+
+  if (action === 'clear-filters') {
+    clearFilters();
   }
 
   if (action === 'adjust') {
@@ -1697,7 +1951,7 @@ document.getElementById('msgInput')?.addEventListener('keydown', (event) => {
 });
 
 function addClientFieldRow() {
-  state.newClientFields.push({ label: '', type: 'text', options: '' });
+  state.newClientFields.push({ label: '', type: 'text', options: '', showInInventory: true, showInOrder: true });
   renderClientFieldRows();
 }
 
@@ -1711,6 +1965,41 @@ function updateClientFieldRow(index, key, value) {
   state.newClientFields[index][key] = value;
 }
 
+function fieldRowHtml(field, index, handlers, locked = false) {
+  const lock = locked ? 'disabled' : '';
+  const typeOption = (value, label) => `<option value="${value}" ${field.type === value ? 'selected' : ''}>${label}</option>`;
+  return `
+    <div class="ac-field-row">
+      <input type="text" placeholder="Field label (e.g. UPC)" aria-label="Field label" value="${escapeHtml(field.label || '')}" ${lock} oninput="${handlers.update}(${index}, 'label', this.value)" />
+      <select aria-label="Field type" ${lock} onchange="${handlers.update}(${index}, 'type', this.value); ${handlers.render}()">
+        ${typeOption('text', 'Text')}${typeOption('number', 'Number')}${typeOption('textarea', 'Long text')}${typeOption('select', 'Dropdown')}
+      </select>
+      <input type="text" placeholder="Dropdown options, comma separated" aria-label="Dropdown options" value="${escapeHtml(field.options || '')}" ${lock} style="${field.type === 'select' ? '' : 'visibility:hidden;'}" oninput="${handlers.update}(${index}, 'options', this.value)" />
+      ${locked ? '<span></span>' : `<button type="button" class="ac-field-remove" aria-label="Remove field" onclick="${handlers.remove}(${index})">✕</button>`}
+      <div class="ac-field-toggles">
+        <label class="ac-check"><input type="checkbox" ${field.showInInventory !== false ? 'checked' : ''} onchange="${handlers.update}(${index}, 'showInInventory', this.checked)" /> Add Inventory</label>
+        <label class="ac-check"><input type="checkbox" ${field.showInOrder !== false ? 'checked' : ''} onchange="${handlers.update}(${index}, 'showInOrder', this.checked)" /> Add Order</label>
+      </div>
+    </div>
+  `;
+}
+
+function syncQuickEditPinField(prefix) {
+  const mode = document.getElementById(`${prefix}QuickEditMode`)?.value;
+  const wrap = document.getElementById(`${prefix}QuickEditPinWrap`);
+  if (wrap) wrap.style.display = mode === 'password' ? 'block' : 'none';
+}
+
+function readClientSettingsForm(prefix) {
+  const overstock = Number(document.getElementById(`${prefix}OverstockLevel`)?.value || 0);
+  const mode = document.getElementById(`${prefix}QuickEditMode`)?.value || 'enabled';
+  return {
+    quickEditMode: mode,
+    quickEditPin: mode === 'password' ? String(document.getElementById(`${prefix}QuickEditPin`)?.value || '').trim() : '',
+    overstockLevel: overstock > 0 ? overstock : null
+  };
+}
+
 function renderClientFieldRows() {
   const host = document.getElementById('acFieldsList');
   if (!host) return;
@@ -1720,19 +2009,8 @@ function renderClientFieldRows() {
     return;
   }
 
-  host.innerHTML = state.newClientFields.map((field, index) => `
-    <div class="ac-field-row">
-      <input type="text" placeholder="Field label (e.g. UPC)" value="${field.label.replace(/"/g, '&quot;')}" oninput="updateClientFieldRow(${index}, 'label', this.value)" />
-      <select onchange="updateClientFieldRow(${index}, 'type', this.value)">
-        <option value="text" ${field.type === 'text' ? 'selected' : ''}>Text</option>
-        <option value="number" ${field.type === 'number' ? 'selected' : ''}>Number</option>
-        <option value="textarea" ${field.type === 'textarea' ? 'selected' : ''}>Long text</option>
-        <option value="select" ${field.type === 'select' ? 'selected' : ''}>Dropdown</option>
-      </select>
-      <input type="text" placeholder="Dropdown options, comma separated" value="${(field.options || '').replace(/"/g, '&quot;')}" style="${field.type === 'select' ? '' : 'visibility:hidden;'}" oninput="updateClientFieldRow(${index}, 'options', this.value)" />
-      <button type="button" class="ac-field-remove" onclick="removeClientFieldRow(${index})">✕</button>
-    </div>
-  `).join('');
+  const handlers = { update: 'updateClientFieldRow', remove: 'removeClientFieldRow', render: 'renderClientFieldRows' };
+  host.innerHTML = state.newClientFields.map((field, index) => fieldRowHtml(field, index, handlers)).join('');
 }
 
 function showAddClientMessage(text, type) {
@@ -1759,6 +2037,8 @@ async function submitNewClient() {
     .map((field) => ({
       label: field.label.trim(),
       type: field.type,
+      showInInventory: field.showInInventory !== false,
+      showInOrder: field.showInOrder !== false,
       ...(field.type === 'select' ? { options: field.options.split(',').map((opt) => opt.trim()).filter(Boolean) } : {})
     }));
 
@@ -1766,6 +2046,7 @@ async function submitNewClient() {
     clientId,
     clientName,
     username,
+    ...readClientSettingsForm('ac'),
     email: document.getElementById('acEmail')?.value || '',
     driveFolderUrl: document.getElementById('acDriveFolderUrl')?.value || '',
     portalTitle: document.getElementById('acPortalTitle')?.value || '',
@@ -1781,7 +2062,7 @@ async function submitNewClient() {
   try {
     const response = await fetch(ADMIN_CLIENTS_URL, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: adminHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify(payload)
     });
     const result = await response.json().catch(() => ({ success: false }));
@@ -1792,10 +2073,13 @@ async function submitNewClient() {
     showAddClientMessage(`${clientId} created. Give the client this login info — Username: "${result.username}", Activation Code: "${result.activationCode}". They'll use "Create Account" on the sign-in screen to set their own password.`, 'success');
     state.newClientFields = [];
     renderClientFieldRows();
-    ['acClientId', 'acClientName', 'acUsername', 'acEmail', 'acDriveFolderUrl', 'acPortalTitle', 'acAccentColor'].forEach((id) => {
+    ['acClientId', 'acClientName', 'acUsername', 'acEmail', 'acDriveFolderUrl', 'acPortalTitle', 'acAccentColor', 'acQuickEditPin', 'acOverstockLevel'].forEach((id) => {
       const el = document.getElementById(id);
       if (el) el.value = '';
     });
+    const acMode = document.getElementById('acQuickEditMode');
+    if (acMode) acMode.value = 'enabled';
+    syncQuickEditPinField('ac');
     await fetchClientRoster();
     populateEditClientSelect();
   } catch (error) {
@@ -1803,12 +2087,15 @@ async function submitNewClient() {
   }
 }
 
-const LEGACY_CLIENT_IDS = ['CL-001', 'CL-002', 'CL-003', 'CL-000'];
+function adminHeaders(extra = {}) {
+  return { ...extra, Authorization: `Bearer ${state.session?.notificationToken || ''}` };
+}
 
 function populateEditClientSelect() {
+  populateResetPasswordSelect();
   const select = document.getElementById('ecClientSelect');
   if (!select) return;
-  const editable = state.roster.filter((client) => !LEGACY_CLIENT_IDS.includes(String(client.clientId || '').toUpperCase()));
+  const editable = state.roster.filter((client) => String(client.clientId || '').toUpperCase() !== 'CL-000');
 
   select.innerHTML = '<option value="">— Choose a client —</option>' + editable.map((client) => {
     const id = String(client.clientId || '').toUpperCase();
@@ -1836,6 +2123,12 @@ async function loadClientForEdit(clientId) {
   }
 
   if (form) form.style.display = 'block';
+  const isLegacy = Boolean(profile.legacy);
+  state.editClientLegacy = isLegacy;
+  [['ecGenericSettings', !isLegacy], ['ecAddFieldBtn', !isLegacy], ['ecDeleteBtn', !isLegacy], ['ecLegacyNote', isLegacy]].forEach(([id, show]) => {
+    const el = document.getElementById(id);
+    if (el) el.style.display = show ? '' : 'none';
+  });
   document.getElementById('ecClientName').value = profile.clientName || '';
   document.getElementById('ecDriveFolderUrl').value = profile.driveFolderUrl || '';
   document.getElementById('ecPortalTitle').value = profile.portalTitle || '';
@@ -1846,11 +2139,38 @@ async function loadClientForEdit(clientId) {
   document.getElementById('ecAllowUpdate').checked = Boolean(profile.allowUpdate);
   document.getElementById('ecReadOnly').checked = Boolean(profile.readOnly);
 
+  const modeSelect = document.getElementById('ecQuickEditMode');
+  if (modeSelect) {
+    modeSelect.value = profile.quickEditMode || 'enabled';
+    modeSelect.disabled = state.editClientId === 'CL-002';
+    modeSelect.title = modeSelect.disabled ? 'This client updates quantities through its shipment columns.' : '';
+  }
+  const pinInputField = document.getElementById('ecQuickEditPin');
+  if (pinInputField) {
+    pinInputField.value = '';
+    pinInputField.placeholder = profile.quickEditPinSet ? 'PIN is set — leave blank to keep it' : '4-32 characters';
+  }
+  syncQuickEditPinField('ec');
+  const overstockInput = document.getElementById('ecOverstockLevel');
+  if (overstockInput) overstockInput.value = profile.overstockLevel || '';
+
+  const attributeMap = profile.attributeMap || {};
+  [['ecAttrBundled', 'bundled'], ['ecAttrFragile', 'fragile'], ['ecAttrOversized', 'oversized']].forEach(([id, attribute]) => {
+    const select = document.getElementById(id);
+    if (!select) return;
+    select.replaceChildren(new Option('— None —', ''));
+    (profile.fields || []).forEach((field) => select.append(new Option(field.label || field.key, field.key)));
+    select.value = attributeMap[attribute] || '';
+  });
+
+  const visibility = profile.fieldVisibility || {};
   state.editClientFields = (profile.fields || []).map((field) => ({
     key: field.key,
     label: field.label,
     type: field.type,
-    options: (field.options || []).join(', ')
+    options: (field.options || []).join(', '),
+    showInInventory: visibility[field.key]?.inventory !== false,
+    showInOrder: visibility[field.key]?.order !== false
   }));
   renderEditClientFieldRows();
 }
@@ -1859,7 +2179,7 @@ async function loadClientForEdit(clientId) {
 async function fetchClientProfileForEdit(clientId) {
   try {
     const response = await fetch(`${CLIENT_PROFILE_URL}?clientId=${encodeURIComponent(clientId)}`, {
-      headers: { Accept: 'application/json' }
+      headers: adminHeaders({ Accept: 'application/json' })
     });
     if (!response.ok) return null;
     return await response.json();
@@ -1869,7 +2189,7 @@ async function fetchClientProfileForEdit(clientId) {
 }
 
 function addEditClientFieldRow() {
-  state.editClientFields.push({ key: '', label: '', type: 'text', options: '' });
+  state.editClientFields.push({ key: '', label: '', type: 'text', options: '', showInInventory: true, showInOrder: true });
   renderEditClientFieldRows();
 }
 
@@ -1892,19 +2212,8 @@ function renderEditClientFieldRows() {
     return;
   }
 
-  host.innerHTML = state.editClientFields.map((field, index) => `
-    <div class="ac-field-row">
-      <input type="text" placeholder="Field label" value="${(field.label || '').replace(/"/g, '&quot;')}" oninput="updateEditClientFieldRow(${index}, 'label', this.value)" />
-      <select onchange="updateEditClientFieldRow(${index}, 'type', this.value)">
-        <option value="text" ${field.type === 'text' ? 'selected' : ''}>Text</option>
-        <option value="number" ${field.type === 'number' ? 'selected' : ''}>Number</option>
-        <option value="textarea" ${field.type === 'textarea' ? 'selected' : ''}>Long text</option>
-        <option value="select" ${field.type === 'select' ? 'selected' : ''}>Dropdown</option>
-      </select>
-      <input type="text" placeholder="Dropdown options, comma separated" value="${(field.options || '').replace(/"/g, '&quot;')}" style="${field.type === 'select' ? '' : 'visibility:hidden;'}" oninput="updateEditClientFieldRow(${index}, 'options', this.value)" />
-      <button type="button" class="ac-field-remove" onclick="removeEditClientFieldRow(${index})">✕</button>
-    </div>
-  `).join('');
+  const handlers = { update: 'updateEditClientFieldRow', remove: 'removeEditClientFieldRow', render: 'renderEditClientFieldRows' };
+  host.innerHTML = state.editClientFields.map((field, index) => fieldRowHtml(field, index, handlers, state.editClientLegacy)).join('');
 }
 
 function showEditClientMessage(text, type) {
@@ -1925,10 +2234,19 @@ async function submitClientEdit() {
       key: field.key || undefined,
       label: field.label.trim(),
       type: field.type,
+      showInInventory: field.showInInventory !== false,
+      showInOrder: field.showInOrder !== false,
       ...(field.type === 'select' ? { options: field.options.split(',').map((opt) => opt.trim()).filter(Boolean) } : {})
     }));
 
+  const attributeValue = (id) => document.getElementById(id)?.value || null;
   const payload = {
+    ...readClientSettingsForm('ec'),
+    attributeMap: {
+      bundled: attributeValue('ecAttrBundled'),
+      fragile: attributeValue('ecAttrFragile'),
+      oversized: attributeValue('ecAttrOversized')
+    },
     clientName: document.getElementById('ecClientName')?.value || '',
     driveFolderUrl: document.getElementById('ecDriveFolderUrl')?.value || '',
     portalTitle: document.getElementById('ecPortalTitle')?.value || '',
@@ -1944,7 +2262,7 @@ async function submitClientEdit() {
   try {
     const response = await fetch(`${ADMIN_CLIENTS_URL}/${encodeURIComponent(state.editClientId)}`, {
       method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
+      headers: adminHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify(payload)
     });
     const result = await response.json().catch(() => ({ success: false }));
@@ -1970,7 +2288,7 @@ async function deleteClientPrompt() {
   if (!window.confirm(`Delete ${state.editClientId}? This removes their login and inventory sheet permanently.`)) return;
 
   try {
-    const response = await fetch(`${ADMIN_CLIENTS_URL}/${encodeURIComponent(state.editClientId)}`, { method: 'DELETE' });
+    const response = await fetch(`${ADMIN_CLIENTS_URL}/${encodeURIComponent(state.editClientId)}`, { method: 'DELETE', headers: adminHeaders() });
     const result = await response.json().catch(() => ({ success: false }));
     if (!response.ok || !result.success) {
       throw new Error(result.error || 'Unable to delete client.');
@@ -1986,24 +2304,49 @@ async function deleteClientPrompt() {
   }
 }
 
-async function resetClientAccountPrompt() {
-  if (!state.editClientId) return;
-  if (!window.confirm(`Reset ${state.editClientId}'s account? They'll be logged out everywhere and need a new activation code to sign back in.`)) return;
+function populateResetPasswordSelect() {
+  const select = document.getElementById('rpClientSelect');
+  if (!select) return;
+  const ownUsername = String(state.session?.username || '').trim();
+  const ownClientId = String(state.session?.clientId || '').toUpperCase();
+  const resettable = state.roster.filter((client) =>
+    String(client.clientId || '').toUpperCase() !== ownClientId && client.username !== ownUsername);
+  select.replaceChildren(new Option('— Choose a client —', ''));
+  resettable.forEach((client) => {
+    const id = String(client.clientId || '').toUpperCase();
+    select.append(new Option(`${client.clientName || id} (${id}) — ${client.username || 'no username'}`, id));
+  });
+}
+
+function showResetPasswordMessage(text, type) {
+  const el = document.getElementById('resetPasswordMsg');
+  if (!el) return;
+  el.style.display = 'block';
+  el.style.background = type === 'error' ? '#fef2f2' : '#f0fdf4';
+  el.style.color = type === 'error' ? '#b91c1c' : '#166534';
+  el.textContent = text;
+}
+
+async function resetClientPasswordPrompt() {
+  const clientId = document.getElementById('rpClientSelect')?.value;
+  if (!clientId) {
+    showResetPasswordMessage('Choose a client first.', 'error');
+    return;
+  }
+  if (!window.confirm(`Reset the password for ${clientId}? Their current password and recovery code stop working immediately.`)) return;
 
   try {
-    const response = await fetch(`${ADMIN_CLIENTS_URL}/${encodeURIComponent(state.editClientId)}`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ resetAccount: true })
+    const response = await fetch(`${ADMIN_CLIENTS_URL}/${encodeURIComponent(clientId)}/reset-password`, {
+      method: 'POST',
+      headers: adminHeaders()
     });
     const result = await response.json().catch(() => ({ success: false }));
     if (!response.ok || !result.success) {
-      throw new Error(result.error || 'Unable to reset account.');
+      throw new Error(result.error || 'Unable to reset password.');
     }
-
-    showEditClientMessage(`Account reset. New activation code for this client: "${result.activationCode}"`, 'success');
+    showResetPasswordMessage(`Password reset for ${result.username}. Send them this one-time activation code: ${result.activationCode}. They'll use "Create Account" on the sign-in screen to choose a new password.`, 'success');
   } catch (error) {
-    showEditClientMessage(error.message || 'Unable to reset account.', 'error');
+    showResetPasswordMessage(error.message || 'Unable to reset password.', 'error');
   }
 }
 
