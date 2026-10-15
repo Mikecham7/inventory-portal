@@ -9,7 +9,7 @@
     <link rel="icon" type="image/png" sizes="192x192" href="icons/icon-192.png?v=1" />
     <link rel="apple-touch-icon" sizes="180x180" href="icons/icon-180.png?v=1" />
     <meta name="theme-color" content="#0D1B2A" />
-    <link rel="stylesheet" href="styles.css?v=20261015l" />
+    <link rel="stylesheet" href="styles.css?v=20261015m" />
   </head>
   <body>
     <div class="portal-login-overlay" id="portalLoginWindow">
@@ -465,6 +465,7 @@
           <div>
             <label class="ac-label" for="acClientId">Client ID</label>
             <input type="text" id="acClientId" placeholder="CL-004" style="width:100%;padding:10px 12px;border:1px solid #dfe7f1;border-radius:8px;" />
+            <small style="display:block;margin-top:5px;color:#64748b;">Use a new ID. IDs for removed clients remain reserved and cannot be reused.</small>
           </div>
           <div>
             <label class="ac-label" for="acClientName">Client Name</label>
@@ -551,7 +552,7 @@
         </select>
 
         <div id="editClientForm" style="display:none;">
-          <div id="ecLegacyNote" class="ac-note" style="display:none;">Saving this built-in client's settings will standardize its inventory tab. The original tab will be duplicated as a backup, and existing inventory and shipment data will be carried over.</div>
+          <div id="ecLegacyNote" class="ac-note" style="display:none;">Saving this built-in client's settings will standardize its inventory tab. The original tab will be duplicated as a backup, and existing inventory and shipment data will be carried over. You can also remove this client account; its inventory will be archived and its ID reserved.</div>
           <div style="margin-bottom:10px;">
             <label class="ac-label" for="ecEmail">Email</label>
             <input type="email" id="ecEmail" class="ac-input" maxlength="254" placeholder="client@email.com" autocomplete="off" />
@@ -634,7 +635,7 @@
           <details class="section-panel">
           <summary><span>Inventory fields<small>Manage column names and add-item visibility</small></span></summary>
           <div class="section-body">
-          <p style="color:#666;font-size:12px;margin-bottom:10px;">Rename a field's label to rename its column, or remove it to delete the column (and its data) entirely. Untick "Show on Add New form" to hide a field on that form.</p>
+          <p style="color:#666;font-size:12px;margin-bottom:10px;">Rename a field's label to rename its column, or remove it to archive its existing values. Untick "Show on Add New form" to hide a field on that form.</p>
           <div id="ecFieldsList"></div>
           <button type="button" id="ecAddFieldBtn" class="btn-set" style="margin-top:8px;" onclick="addEditClientFieldRow()">+ Add Field</button>
           </div>
@@ -668,7 +669,7 @@
           <h2>Help &amp; FAQ</h2>
           <p>Answers to common questions about your inventory portal.</p>
         </div>
-        <button type="button" class="help-tour-btn" id="replayTourBtn" onclick="startOnboardingTour()">
+        <button type="button" class="help-tour-btn" id="replayTourBtn" onclick="startHelpTour()">
           <span aria-hidden="true">▶</span> Replay guided tour
         </button>
       </header>
@@ -798,6 +799,6 @@
     <div class="footer">Electric City Logistics LLC &nbsp;|&nbsp; eclsupport@electriccitylogistics.com &nbsp;|&nbsp; (406)-948-2719</div>
     <div class="toast" id="toast"></div>
 
-    <script src="app.js?v=20261015l"></script>
+    <script src="app.js?v=20261015m"></script>
   </body>
 </html>

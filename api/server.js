@@ -603,9 +603,10 @@ async function getClientRoster() {
     const rows = await withRetry(() => sheet.getRows());
     const roster = rows
       .map(normalizeClientRow)
-      .filter((entry) => entry.clientId || entry.username);
+      .filter((entry) => entry.role !== 'retired' && (entry.clientId || entry.username));
 
     if (roster.length) return roster;
+    if (rows.length) return [];
     return [{ clientId: 'CL-001', clientName: 'Primary Client', role: 'client' }];
   } catch (error) {
     console.warn('Unable to load client roster from Google Sheets:', error.message);
@@ -913,6 +914,9 @@ app.post('/api/admin/clients/:clientId/reset-password', async (req, res) => {
     const rows = await withRetry(() => credentialsSheet.getRows());
     const row = rows.find((entry) => normalizeClientId(entry.get('Client_ID')) === clientId);
     if (!row) return res.status(404).json({ success: false, error: `${clientId} was not found.` });
+    if (String(row.get('Role') || '').trim().toLowerCase() === 'retired') {
+      return res.status(404).json({ success: false, error: `${clientId} is retired.` });
+    }
 
     const username = String(row.get('Username') || '').trim();
     if (username === req.adminSession.username) {
@@ -952,6 +956,9 @@ app.post('/api/admin/clients', async (req, res) => {
     if (roster.some((entry) => entry.clientId === clientId)) {
       return res.status(409).json({ success: false, error: `${clientId} already exists.` });
     }
+    if (await findCredentialsRow(clientId)) {
+      return res.status(409).json({ success: false, error: `${clientId} is reserved and cannot be reused.` });
+    }
     if (roster.some((entry) => entry.username.toLowerCase() === username.toLowerCase())) {
       return res.status(409).json({ success: false, error: `Username "${username}" is already taken.` });
     }
@@ -973,10 +980,11 @@ app.post('/api/admin/clients', async (req, res) => {
     // Create the inventory sheet tab first so a failure here (e.g. a bad header)
     // never leaves an orphaned credentials row behind.
     const doc = await getDoc();
-    if (!doc.sheetsByTitle[clientId]) {
-      const headerValues = ['SKU', String(body.titleFieldLabel || '').trim() || 'Product Title', ...fields.map((field) => field.label), 'Qty', 'Status', 'Notes'];
-      await withRetry(() => doc.addSheet({ title: clientId, headerValues }));
+    if (doc.sheetsByTitle[clientId]) {
+      return res.status(409).json({ success: false, error: `${clientId} already has an inventory tab and cannot be reused.` });
     }
+    const headerValues = ['SKU', String(body.titleFieldLabel || '').trim() || 'Product Title', ...fields.map((field) => field.label), 'Qty', 'Status', 'Notes'];
+    await withRetry(() => doc.addSheet({ title: clientId, headerValues }));
 
     const credentialsSheet = await getOrCreateSheet('User_Credentials', USER_CREDENTIALS_HEADERS);
     const quickEditPinHash = quickEditPin ? await hashSecret(quickEditPin) : '';
@@ -1065,6 +1073,9 @@ app.put('/api/admin/clients/:clientId', async (req, res) => {
     const row = rows.find((entry) => normalizeClientId(entry.get('Client_ID')) === clientId);
     if (!row) {
       return res.status(404).json({ success: false, error: `${clientId} was not found.` });
+    }
+    if (String(row.get('Role') || '').trim().toLowerCase() === 'retired') {
+      return res.status(404).json({ success: false, error: `${clientId} is retired.` });
     }
 
     const body = req.body || {};
@@ -1167,20 +1178,32 @@ app.put('/api/admin/clients/:clientId', async (req, res) => {
 app.delete('/api/admin/clients/:clientId', async (req, res) => {
   try {
     const clientId = normalizeClientId(req.params.clientId);
-    if (LEGACY_CLIENT_IDS.includes(clientId) || clientId === 'CL-000') {
-      return res.status(400).json({ success: false, error: 'This client cannot be deleted here.' });
-    }
+    if (clientId === 'CL-000') return res.status(400).json({ success: false, error: 'The admin account cannot be deleted here.' });
 
     const credentialsSheet = await getOrCreateSheet('User_Credentials', USER_CREDENTIALS_HEADERS);
     const rows = await withRetry(() => credentialsSheet.getRows());
     const row = rows.find((entry) => normalizeClientId(entry.get('Client_ID')) === clientId);
-    if (row) await withRetry(() => row.delete());
+    if (!row) return res.status(404).json({ success: false, error: `${clientId} was not found.` });
+    if (String(row.get('Username') || '').trim() === req.adminSession.username) {
+      return res.status(400).json({ success: false, error: 'You cannot delete the account you are signed in with.' });
+    }
 
     const doc = await getDoc();
-    if (doc.sheetsByTitle[clientId]) await withRetry(() => doc.sheetsByTitle[clientId].delete());
+    const inventorySheet = doc.sheetsByTitle[clientId];
+    if (inventorySheet) await archiveInventorySheet(inventorySheet, 'Retired');
+    row.set('Role', 'retired');
+    [
+      'Username', 'Password', 'Email', 'Edit_PIN', 'Activation_Code', 'Recovery_Code_Hash',
+      'Quick_Edit_PIN_Hash', 'Fields_JSON', 'Client_Settings_JSON'
+    ].forEach((field) => row.set(field, ''));
+    await withRetry(() => row.save());
+    if (inventorySheet) {
+      await withRetry(() => inventorySheet.clear());
+      await withRetry(() => inventorySheet.setHeaderRow(['Retired client ID (reserved)']));
+    }
     invalidateReadCache('profile:', 'inventory:');
 
-    return res.json({ success: true });
+    return res.json({ success: true, archived: Boolean(inventorySheet), reserved: true });
   } catch (error) {
     console.error('Delete client error:', error);
     return res.status(500).json({ success: false, error: 'Unable to delete client.' });

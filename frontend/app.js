@@ -1983,6 +1983,12 @@ const ONBOARDING_STEPS = [
     body: 'This quick tour shows where everything is and takes under a minute. You can skip it now and replay it any time from the Help tab.'
   },
   {
+    page: 'page-help',
+    target: '#faqSearch',
+    title: 'Find answers in Help',
+    body: 'Search the Help tab for answers about your account, inventory, shipment updates, and light or dark mode.'
+  },
+  {
     page: 'page-dashboard',
     target: '#mainTabs',
     title: 'Move between sections',
@@ -2184,6 +2190,10 @@ function moveOnboardingTour(delta) {
 
 function skipOnboardingTour() {
   closeOnboardingTour({ markSeen: true });
+}
+
+function startHelpTour() {
+  startOnboardingTour({ returnPage: 'page-help' });
 }
 
 function finishOnboardingTour() {
@@ -3056,7 +3066,7 @@ async function loadClientForEdit(clientId) {
   if (form) form.style.display = 'block';
   const isLegacy = Boolean(profile.legacy);
   state.editClientLegacy = false;
-  [['ecGenericSettings', true], ['ecAddFieldBtn', true], ['ecDeleteBtn', !isLegacy], ['ecLegacyNote', isLegacy]].forEach(([id, show]) => {
+  [['ecGenericSettings', true], ['ecAddFieldBtn', true], ['ecDeleteBtn', true], ['ecLegacyNote', isLegacy]].forEach(([id, show]) => {
     const el = document.getElementById(id);
     if (el) el.style.display = show ? '' : 'none';
   });
@@ -3223,7 +3233,9 @@ async function submitClientEdit() {
 
 async function deleteClientPrompt() {
   if (!state.editClientId) return;
-  if (!window.confirm(`Delete ${state.editClientId}? This removes their login and inventory sheet permanently.`)) return;
+  const deletedClientId = state.editClientId;
+  const confirmation = `Remove ${state.editClientId}? Their login will be disabled, the inventory tab will be archived, and this client ID will be permanently reserved. New clients must use a different ID.`;
+  if (!window.confirm(confirmation)) return;
 
   try {
     const response = await fetch(`${ADMIN_CLIENTS_URL}/${encodeURIComponent(state.editClientId)}`, { method: 'DELETE', headers: adminHeaders() });
@@ -3232,11 +3244,17 @@ async function deleteClientPrompt() {
       throw new Error(result.error || 'Unable to delete client.');
     }
 
-    showEditClientMessage(`${state.editClientId} deleted.`, 'success');
+    showToast(
+      result.archived
+        ? `${state.editClientId} removed; inventory archived and ID reserved.`
+        : `${state.editClientId} removed and ID reserved.`,
+      'success'
+    );
     state.editClientId = '';
     document.getElementById('editClientForm').style.display = 'none';
     await fetchClientRoster();
     populateEditClientSelect();
+    if (state.activeClientId === deletedClientId) await switchClientView('CL-000');
   } catch (error) {
     showEditClientMessage(error.message || 'Unable to delete client.', 'error');
   }

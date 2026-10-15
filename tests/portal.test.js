@@ -842,7 +842,7 @@ test('field toggles, quick-edit PIN protection, and legacy settings edits are en
       sheets[title] = archive;
       return archive;
     },
-    clear: async () => { legacyCl002Rows.splice(1); },
+    clear: async (range) => { legacyCl002Rows.splice(range ? 1 : 0); },
     setHeaderRow: async (headers) => { legacyCl002Rows[0] = [...headers]; },
     addRows: async (rows) => { legacyCl002Rows.push(...rows.map((row) => [...row])); },
     resize: async () => {},
@@ -966,6 +966,23 @@ test('field toggles, quick-edit PIN protection, and legacy settings edits are en
     const withEmail = await (await call('PUT', '/admin/clients/CL-002', { email: 'ecom@example.com' }, adminToken)).json();
     assert.equal(credentialRows[0].values.Email, 'ecom@example.com');
     assert.equal(withEmail.profile.hasEmail, true);
+
+    const retired = await (await call('DELETE', '/admin/clients/CL-002', null, adminToken)).json();
+    assert.equal(retired.success, true);
+    assert.equal(retired.archived, true);
+    assert.equal(retired.reserved, true);
+    assert.equal(credentialRows[0].values.Role, 'retired');
+    assert.equal(credentialRows[0].values.Username, '');
+    assert.equal(credentialRows[0].values.Fields_JSON, '');
+    assert.deepEqual(legacyCl002Rows, [['Retired client ID (reserved)']]);
+    assert.ok(Object.values(sheets).some((sheet) => sheet?.title?.startsWith('CL-002_Retired_')));
+    const activeClients = await (await call('GET', '/clients', null, adminToken)).json();
+    assert.ok(!activeClients.some((client) => client.clientId === 'CL-002'));
+    assert.equal((await call('POST', '/admin/clients', {
+      clientId: 'CL-002', clientName: 'Replacement', username: 'Replacement'
+    }, adminToken)).status, 409);
+    assert.equal((await call('POST', '/admin/clients/CL-002/reset-password', {}, adminToken)).status, 404);
+    assert.equal((await call('PUT', '/admin/clients/CL-002', {}, adminToken)).status, 404);
 
     assert.equal((await call('PUT', '/admin/clients/CL-003', { quickEditMode: 'password' }, adminToken)).status, 200);
     assert.equal((await (await call('PUT', '/inventory/quantity', { clientId: 'CL-003', sku: 'A', qty: 1 }, cjaToken, { 'X-Quick-Edit-Token': unlock.token })).json()).code, 'QUICK_EDIT_PIN_REQUIRED');
@@ -1927,6 +1944,7 @@ test('first-time tour launches once for clients, navigates with back/next, and s
     };
   };
   let focused = null;
+  let activePage = 'page-dashboard';
   const ids = ['tourOverlay', 'tourSpotlight', 'tourCard', 'tourStep', 'tourTitle', 'tourBody', 'tourProgress', 'tourSkip', 'tourBack', 'tourNext', 'tourFinish', 'replayTourBtn', 'toast'];
   const elements = Object.fromEntries(ids.map((id) => [id, makeEl()]));
   elements.tourOverlay.hidden = true;
@@ -1936,7 +1954,7 @@ test('first-time tour launches once for clients, navigates with back/next, and s
     document: {
       hidden: false, body: makeEl(), activeElement: null,
       getElementById: (id) => elements[id] || null,
-      querySelector: (selector) => (selector === '.page.active' ? { id: 'page-dashboard' } : makeEl()),
+      querySelector: (selector) => (selector === '.page.active' ? { id: activePage } : makeEl()),
       querySelectorAll: (selector) => (selector === '#tourCard button' ? [elements.tourSkip, elements.tourBack, elements.tourNext, elements.tourFinish] : []),
       addEventListener: (event, listener) => { if (event === 'keydown') keydown.push(listener); }
     },
@@ -1948,7 +1966,8 @@ test('first-time tour launches once for clients, navigates with back/next, and s
   vm.runInContext(fs.readFileSync(require.resolve('../frontend/app.js'), 'utf8'), context);
   const visited = [];
   context.__visit = (page) => visited.push(page);
-  vm.runInContext('showTourPage = (page) => { if (page) __visit(page); };', context);
+  context.__setPage = (page) => { activePage = page; };
+  vm.runInContext('showTourPage = (page) => { if (page) { __visit(page); __setPage(page); } };', context);
   const total = vm.runInContext('ONBOARDING_STEPS.length', context);
   const themeStep = vm.runInContext("ONBOARDING_STEPS.find((step) => step.target === '#themeToggle')", context);
   assert.equal(themeStep.title, 'Choose light or dark mode');
@@ -1985,6 +2004,7 @@ test('first-time tour launches once for clients, navigates with back/next, and s
   assert.equal(elements.tourNext.hidden, true);
   assert.equal(elements.tourSkip.hidden, true);
   assert.ok(visited.includes('page-logs'), 'tour visits the activity log');
+  assert.ok(visited.includes('page-help'), 'tour introduces the Help tab');
   assert.equal(storage.has('has_seen_onboarding'), false, 'flag is not set until the tour ends');
 
   vm.runInContext('finishOnboardingTour()', context);
@@ -1992,6 +2012,16 @@ test('first-time tour launches once for clients, navigates with back/next, and s
   assert.equal(storage.get('has_seen_onboarding'), 'true');
   assert.equal(visited.at(-1), 'page-dashboard');
   assert.equal(vm.runInContext('maybeStartOnboarding()', context), false, 'does not relaunch once seen');
+
+  activePage = 'page-help';
+  vm.runInContext('startHelpTour()', context);
+  assert.equal(vm.runInContext('tourState.returnPage', context), 'page-help');
+  assert.equal(activePage, 'page-help', 'Help tour begins without switching to the dashboard');
+  vm.runInContext('moveOnboardingTour(1)', context);
+  assert.equal(elements.tourTitle.textContent, 'Find answers in Help');
+  assert.equal(activePage, 'page-help');
+  vm.runInContext('skipOnboardingTour()', context);
+  assert.equal(activePage, 'page-help', 'dismissing the Help tour returns to Help');
 
   vm.runInContext('startOnboardingTour()', context);
   assert.equal(elements.tourOverlay.hidden, false, 'replay works even after the flag is set');
