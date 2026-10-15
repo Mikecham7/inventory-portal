@@ -113,6 +113,144 @@ test('account endpoints use bcrypt, hashed single-use recovery codes, admin-only
   }
 });
 
+test('client password reset accepts the latest admin-issued code and rotates it into a single-use recovery code', async () => {
+  const bcrypt = require('bcryptjs');
+  const values = {
+    Client_ID: 'CL-RESET', Username: 'ResetClient', Password: await bcrypt.hash('OriginalPass1', 4),
+    Recovery_Code_Hash: await bcrypt.hash('OLD1-CODE', 4), Activation_Code: ''
+  };
+  const row = { get: (key) => values[key] || '', set: (key, value) => { values[key] = value; }, save: async () => {} };
+  const sheet = {
+    headerValues: [], loadHeaderRow: async () => {}, setHeaderRow: async () => {}, getRows: async () => [row]
+  };
+  const titleDescriptor = Object.getOwnPropertyDescriptor(GoogleSpreadsheet.prototype, 'sheetsByTitle');
+  const indexDescriptor = Object.getOwnPropertyDescriptor(GoogleSpreadsheet.prototype, 'sheetsByIndex');
+  const oldLoadInfo = GoogleSpreadsheet.prototype.loadInfo;
+  GoogleSpreadsheet.prototype.loadInfo = async () => {};
+  Object.defineProperty(GoogleSpreadsheet.prototype, 'sheetsByTitle', { configurable: true, get: () => ({ User_Credentials: sheet }) });
+  Object.defineProperty(GoogleSpreadsheet.prototype, 'sheetsByIndex', { configurable: true, get: () => [sheet] });
+  const server = require('../api/server.js').app.listen(0);
+  const base = `http://127.0.0.1:${server.address().port}/api`;
+  const post = (path, body, token) => fetch(`${base}${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-nf-client-connection-ip': 'reset-flow-test', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+    body: JSON.stringify(body)
+  });
+  try {
+    const adminToken = signNotificationSession('ResetAdmin', 'CL-000', 'admin');
+    const reset = async () => {
+      const response = await post('/admin/clients/CL-RESET/reset-password', {}, adminToken);
+      assert.equal(response.status, 200);
+      return response.json();
+    };
+    const obsolete = await reset();
+    const latest = await reset();
+    const payload = { username: 'ResetClient', recoveryCode: latest.activationCode, newPassword: 'NewClientPass1' };
+    assert.equal((await post('/account/recover', { ...payload, recoveryCode: 'OLD1-CODE' })).status, 400);
+    assert.equal((await post('/account/recover', { ...payload, recoveryCode: obsolete.activationCode })).status, 400);
+    assert.equal((await post('/account/recover', { ...payload, recoveryCode: [latest.activationCode] })).status, 400);
+    assert.equal((await post('/account/recover', { ...payload, newPassword: { length: 10 } })).status, 400);
+
+    const elements = Object.fromEntries([
+      'portalUser', 'recoverUsername', 'recoverCode', 'recoverPassword', 'recoverPasswordConfirm',
+      'recoverErrorMsg', 'recoverSubmit', 'recoverFormFields', 'recoverSuccessPanel', 'recoverRecoveryCode'
+    ].map((id) => [id, { value: '', textContent: '', style: {}, disabled: false, addEventListener() {} }]));
+    elements.recoverUsername.value = ' ResetClient ';
+    elements.recoverCode.value = ` ${latest.activationCode.toLowerCase()} `;
+    elements.recoverPassword.value = elements.recoverPasswordConfirm.value = 'NewClientPass1';
+    const requests = [];
+    const context = vm.createContext({
+      document: { hidden: false, getElementById: (id) => elements[id] || null, querySelectorAll: () => [], addEventListener() {} },
+      window: { location: { protocol: 'http:', hostname: 'localhost', port: '5500' }, addEventListener() {} },
+      AbortController, setTimeout, clearTimeout,
+      fetch: async (url, options) => {
+        requests.push({ url, body: JSON.parse(options.body) });
+        assert.equal(elements.recoverSubmit.disabled, true);
+        return post('/account/recover', JSON.parse(options.body));
+      }
+    });
+    vm.runInContext(fs.readFileSync(require.resolve('../frontend/app.js'), 'utf8'), context);
+    await context.submitRecoverAccount();
+    assert.equal(requests[0].url, 'http://localhost:3001/api/account/recover');
+    assert.deepEqual(requests[0].body, { ...payload, recoveryCode: latest.activationCode.toLowerCase() });
+    assert.equal(elements.recoverSuccessPanel.style.display, 'block');
+    assert.equal(elements.recoverSubmit.disabled, false);
+    assert.equal(elements.recoverErrorMsg.textContent, '');
+    assert.equal(elements.portalUser.value, 'ResetClient');
+    assert.equal(elements.recoverPassword.value, '');
+    assert.equal(elements.recoverCode.value, '');
+    const recoveryCode = elements.recoverRecoveryCode.textContent;
+    assert.match(recoveryCode, /^[A-Z0-9]{4}-[A-Z0-9]{4}$/);
+    assert.equal(values.Activation_Code, '');
+    assert.equal(await bcrypt.compare('NewClientPass1', values.Password), true);
+    assert.equal(await bcrypt.compare(recoveryCode, values.Recovery_Code_Hash), true);
+    assert.equal((await post('/account/recover', payload)).status, 400, 'admin code cannot be reused');
+    assert.equal((await post('/account/activate', { username: payload.username, activationCode: latest.activationCode, password: 'AnotherPass1' })).status, 400);
+    const recovered = await post('/account/recover', { ...payload, recoveryCode: recoveryCode.toLowerCase(), newPassword: 'RecoveredPass1' });
+    assert.equal(recovered.status, 200);
+    assert.equal(await bcrypt.compare('RecoveredPass1', values.Password), true);
+    assert.equal((await post('/account/recover', { ...payload, recoveryCode })).status, 400, 'old recovery code cannot be reused');
+    const login = await post('/login', { username: 'ResetClient', password: 'RecoveredPass1' });
+    assert.equal(login.status, 200);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+    GoogleSpreadsheet.prototype.loadInfo = oldLoadInfo;
+    Object.defineProperty(GoogleSpreadsheet.prototype, 'sheetsByTitle', titleDescriptor);
+    Object.defineProperty(GoogleSpreadsheet.prototype, 'sheetsByIndex', indexDescriptor);
+  }
+});
+
+test('client reset reports validation, server, rate-limit and network failures without duplicate submissions', async () => {
+  const elements = Object.fromEntries([
+    'recoverUsername', 'recoverCode', 'recoverPassword', 'recoverPasswordConfirm', 'recoverErrorMsg',
+    'recoverSubmit', 'recoverFormFields', 'recoverSuccessPanel', 'recoverRecoveryCode'
+  ].map((id) => [id, { value: '', textContent: '', style: {}, disabled: false }]));
+  elements.recoverUsername.value = 'Client';
+  elements.recoverCode.value = 'CODE-1234';
+  elements.recoverPassword.value = 'NewPassword1';
+  elements.recoverPasswordConfirm.value = 'Mismatch1';
+  let calls = 0;
+  const context = vm.createContext({
+    document: { hidden: false, getElementById: (id) => elements[id] || null, querySelectorAll: () => [], addEventListener() {} },
+    window: { location: { hostname: 'localhost' }, addEventListener() {} },
+    AbortController, setTimeout, clearTimeout, TypeError,
+    fetch: async () => { calls += 1; throw new TypeError('Failed to fetch'); }
+  });
+  vm.runInContext(fs.readFileSync(require.resolve('../frontend/app.js'), 'utf8'), context);
+  await context.submitRecoverAccount();
+  assert.equal(calls, 0);
+  assert.equal(elements.recoverErrorMsg.textContent, 'Passwords do not match.');
+  elements.recoverPasswordConfirm.value = 'NewPassword1';
+  await context.submitRecoverAccount();
+  assert.match(elements.recoverErrorMsg.textContent, /Check your connection/);
+  assert.equal(elements.recoverSubmit.disabled, false);
+  for (const [status, body, message] of [
+    [400, { success: false, error: 'Invalid username or reset code.' }, /Invalid username or reset code/],
+    [429, null, /Too many attempts/],
+    [503, null, /unreadable response/],
+    [200, { success: true }, /did not include a new recovery code/]
+  ]) {
+    context.fetch = async () => ({
+      ok: status === 200, status, json: async () => { if (!body) throw new SyntaxError('Not JSON'); return body; }
+    });
+    await context.submitRecoverAccount();
+    assert.match(elements.recoverErrorMsg.textContent, message);
+    assert.notEqual(elements.recoverSuccessPanel.style.display, 'block');
+    assert.equal(elements.recoverSubmit.disabled, false);
+  }
+  let finish;
+  calls = 0;
+  context.fetch = () => { calls += 1; return new Promise((resolve) => { finish = resolve; }); };
+  const pending = context.submitRecoverAccount();
+  await context.submitRecoverAccount();
+  assert.equal(calls, 1);
+  finish({ ok: true, status: 200, json: async () => ({ success: true, recoveryCode: 'NEW1-CODE' }) });
+  await pending;
+  assert.equal(elements.recoverSuccessPanel.style.display, 'block');
+  assert.equal(elements.recoverErrorMsg.style.display, 'none');
+  assert.equal(elements.recoverSubmit.disabled, false);
+});
+
 test('rapid admin client switching loads only the final client and ignores late responses', async () => {
   const timers = [];
   const requests = [];
@@ -1163,6 +1301,256 @@ test('old chat messages are archived to Chat_Archive and removed from Chat_log i
   }
 });
 
+test('activity history is authenticated, client-scoped, newest first, and includes own and previously read events', async () => {
+  const values = [
+    ...Array.from({ length: 12 }, (_, index) => ({
+      Timestamp: new Date(Date.UTC(2026, 8, index + 1)).toISOString(),
+      ClientID: 'CL-002', Description: `Updated item ${index}`, ActorUsername: 'EcomElite'
+    })),
+    { Timestamp: '2026-10-01T12:00:00Z', ClientID: 'CL-003', Description: 'Other client', ActorUsername: 'ADMIN' },
+    { Timestamp: '', ClientID: 'CL-002', Description: 'Legacy event', ActorUsername: '' }
+  ];
+  let fail = false;
+  const sheet = { getRows: async () => {
+    if (fail) throw new Error('Sheet unavailable');
+    return values.map((value) => ({ get: (key) => value[key] || '' }));
+  } };
+  const titleDescriptor = Object.getOwnPropertyDescriptor(GoogleSpreadsheet.prototype, 'sheetsByTitle');
+  const indexDescriptor = Object.getOwnPropertyDescriptor(GoogleSpreadsheet.prototype, 'sheetsByIndex');
+  const oldLoadInfo = GoogleSpreadsheet.prototype.loadInfo;
+  GoogleSpreadsheet.prototype.loadInfo = async () => {};
+  Object.defineProperty(GoogleSpreadsheet.prototype, 'sheetsByTitle', { configurable: true, get: () => ({ Inventory_Events: sheet }) });
+  Object.defineProperty(GoogleSpreadsheet.prototype, 'sheetsByIndex', { configurable: true, get: () => [sheet] });
+  invalidateReadCache('rows:Inventory_Events');
+  const server = require('../api/server.js').app.listen(0);
+  const url = `http://127.0.0.1:${server.address().port}/api/activity`;
+  const get = (clientId, token) => fetch(`${url}?clientId=${clientId}`, { headers: { Authorization: `Bearer ${token}` } });
+  try {
+    assert.equal((await fetch(url)).status, 401);
+    assert.equal((await get('CL-002', 'invalid')).status, 401);
+    const clientToken = signNotificationSession('EcomElite', 'CL-002', 'client');
+    const response = await get('CL-003', clientToken);
+    assert.equal(response.status, 200);
+    const history = await response.json();
+    assert.equal(history.length, 13, 'history is not truncated to the unread-notification limit');
+    assert.ok(history.every((entry) => entry.clientId === 'CL-002'));
+    assert.equal(history[0].description, 'Updated item 11');
+    assert.equal(history.at(-1).description, 'Legacy event');
+    assert.deepEqual(Object.keys(history[0]), ['timestamp', 'clientId', 'action', 'actorUsername', 'description']);
+    assert.equal(history[0].actorUsername, 'EcomElite', 'own events remain visible');
+    const adminToken = signNotificationSession('ADMIN', 'CL-000', 'admin');
+    assert.equal((await (await get('CL-003', adminToken)).json()).length, 1);
+    assert.equal((await (await get('CL-000', adminToken)).json()).length, 14);
+    fail = true;
+    invalidateReadCache('rows:Inventory_Events');
+    assert.equal((await get('CL-002', clientToken)).status, 500);
+    fail = false;
+    values.length = 0;
+    invalidateReadCache('rows:Inventory_Events');
+    assert.deepEqual(await (await get('CL-002', clientToken)).json(), []);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+    GoogleSpreadsheet.prototype.loadInfo = oldLoadInfo;
+    Object.defineProperty(GoogleSpreadsheet.prototype, 'sheetsByTitle', titleDescriptor);
+    Object.defineProperty(GoogleSpreadsheet.prototype, 'sheetsByIndex', indexDescriptor);
+    invalidateReadCache('rows:Inventory_Events');
+  }
+});
+
+test('activity table uses recorded data, escapes content, and searches all audit columns independently of inventory filters', async () => {
+  const host = { innerHTML: '', setAttribute(name, value) { this[name] = value; } };
+  const search = { value: '' };
+  const context = vm.createContext({
+    document: { hidden: false, getElementById: (id) => ({ logTableWrap: host, logSearch: search })[id] || null, querySelectorAll: () => [], addEventListener() {} },
+    window: { location: { hostname: 'localhost' }, addEventListener() {} },
+    AbortController, setTimeout, clearTimeout,
+    console: { error() {} }
+  });
+  vm.runInContext(fs.readFileSync(require.resolve('../frontend/app.js'), 'utf8'), context);
+  const entries = [
+    { timestamp: '2026-09-12T12:30:00Z', clientId: 'CL-002', action: 'Inventory update', actorUsername: '<staff>', description: 'Added <script>alert(1)</script>\nLong details' },
+    { timestamp: '', clientId: 'CL-002', action: 'Inventory update', actorUsername: '', description: 'Legacy adjustment' }
+  ];
+  context.__entries = entries;
+  vm.runInContext("state.auth = true; state.activeClientId = 'CL-002'; state.session = { notificationToken: 'signed' }; state.activity = { clientId: 'CL-002', entries: __entries, loading: false, error: '' }; state.query = 'unrelated dashboard filter'; renderLogs();", context);
+  assert.match(host.innerHTML, /<table class="activity-table">/);
+  assert.equal((host.innerHTML.match(/scope="col"/g) || []).length, 4);
+  assert.match(host.innerHTML, /&lt;script&gt;/);
+  assert.doesNotMatch(host.innerHTML, /<script>/);
+  assert.match(host.innerHTML, /&lt;staff&gt;/);
+  assert.match(host.innerHTML, /Not recorded/);
+  assert.match(host.innerHTML, /Long details/);
+  const recordedTime = vm.runInContext("formatActivityTimestamp('2026-09-12T12:30:00Z')", context);
+  assert.ok(host.innerHTML.includes(recordedTime));
+  assert.equal(vm.runInContext("formatActivityTimestamp('bad-date')", context), 'Not recorded');
+  for (const query of ['staff', '2026-09-12', 'inventory update', 'long details', 'cl-002', recordedTime.toLowerCase()]) {
+    search.value = query;
+    context.renderLogs();
+    assert.match(host.innerHTML, /Long details/, `search matches ${query}`);
+  }
+  search.value = 'missing';
+  context.renderLogs();
+  assert.match(host.innerHTML, /No matching log entries/);
+  search.value = '';
+  context.fetch = async () => ({ ok: false, status: 500 });
+  assert.equal(await context.loadActivity('CL-002'), 500);
+  assert.match(host.innerHTML, /role="alert"/);
+  assert.match(host.innerHTML, /Retry/);
+  assert.match(host.innerHTML, /Showing previously loaded activity/);
+  assert.equal(host['aria-busy'], 'false');
+  context.fetch = async () => ({ ok: true, status: 200, json: async () => [] });
+  assert.equal(await context.loadActivity('CL-002'), 200);
+  assert.match(host.innerHTML, /No activity to display/);
+  assert.doesNotMatch(host.innerHTML, /role="alert"/);
+
+  let finish;
+  context.fetch = () => new Promise((resolve) => { finish = resolve; });
+  const pending = context.loadActivity('CL-002');
+  assert.match(host.innerHTML, /Loading activity history|<table/);
+  assert.equal(host['aria-busy'], 'true');
+  vm.runInContext("state.activeClientId = 'CL-003'; state.activity = { clientId: null, entries: null, loading: false, error: '' }; renderLogs();", context);
+  finish({ ok: true, status: 200, json: async () => entries });
+  await pending;
+  assert.doesNotMatch(host.innerHTML, /Long details/);
+  assert.equal(vm.runInContext('state.activity.entries', context), null, 'late responses cannot leak previous client activity');
+});
+
+test('inventory rendering avoids unchanged DOM writes and coalesces search events without stale results', () => {
+  const elements = {};
+  for (const id of ['inventoryBody', 'inventoryHeaderRow', 'filterGroups', 'activeFilters']) {
+    let markup = '';
+    elements[id] = {
+      writes: 0,
+      get innerHTML() { return markup; },
+      set innerHTML(value) { markup = value; this.writes += 1; }
+    };
+  }
+  elements.tableSearch = { value: '' };
+  const listeners = {};
+  const frames = [];
+  const context = vm.createContext({
+    document: { hidden: false, getElementById: (id) => elements[id] || null, querySelectorAll: () => [], addEventListener: (event, listener) => { listeners[event] = listener; } },
+    window: { location: { hostname: 'localhost' }, addEventListener() {} },
+    requestAnimationFrame: (callback) => { frames.push(callback); return frames.length; },
+    AbortController, setTimeout, clearTimeout
+  });
+  vm.runInContext(fs.readFileSync(require.resolve('../frontend/app.js'), 'utf8'), context);
+  vm.runInContext("state.activeClientId = 'CL-001'; state.items = [{ id: 'a', title: 'Copper marker', sku: 'C', qty: 10 }, { id: 'b', title: 'Steel marker', sku: 'S', qty: 0 }]; renderTable();", context);
+  const writes = Object.fromEntries(Object.entries(elements).map(([id, element]) => [id, element.writes]));
+  context.renderTable();
+  for (const id of ['inventoryBody', 'inventoryHeaderRow', 'filterGroups', 'activeFilters']) {
+    assert.equal(elements[id].writes, writes[id], `${id} is untouched when markup is unchanged`);
+  }
+  for (const value of ['C', 'Co', 'Copper']) {
+    elements.tableSearch.value = value;
+    listeners.input({ target: elements.tableSearch });
+  }
+  assert.equal(frames.length, 1, 'three input events schedule only one table render');
+  assert.equal(elements.inventoryBody.writes, writes.inventoryBody);
+  frames.shift()();
+  assert.match(elements.inventoryBody.innerHTML, /Copper marker/);
+  assert.doesNotMatch(elements.inventoryBody.innerHTML, /Steel marker/);
+  assert.equal(elements.inventoryBody.writes, writes.inventoryBody + 1);
+  assert.equal(elements.filterGroups.writes, writes.filterGroups, 'search keeps filter button nodes intact');
+  assert.equal(elements.inventoryHeaderRow.writes, writes.inventoryHeaderRow);
+  vm.runInContext("state.items[0].qty = 0; renderTable();", context);
+  assert.match(elements.inventoryBody.innerHTML, /Out of Stock/);
+  assert.equal(elements.inventoryBody.writes, writes.inventoryBody + 2, 'in-place quantity updates remain visible');
+  vm.runInContext("state.clientProfile = { clientId: 'CL-001', dashboardColumns: ['CUSTOM TITLE', 'STATUS'], hideQtyColumn: true, hideQuickEdit: true }; renderTable();", context);
+  assert.match(elements.inventoryHeaderRow.innerHTML, /CUSTOM TITLE/);
+  assert.doesNotMatch(elements.inventoryBody.innerHTML, /qty-cell|data-action="adjust"/);
+  vm.runInContext("state.query = ''; state.filters.stock = ['out']; renderTable();", context);
+  assert.match(elements.activeFilters.innerHTML, /Out of Stock/);
+  vm.runInContext("state.activeClientId = 'CL-003'; state.items = []; renderTable();", context);
+  assert.doesNotMatch(elements.inventoryBody.innerHTML, /Copper marker/);
+  assert.match(elements.inventoryBody.innerHTML, /No items match/);
+});
+
+test('inventory polling normalizes changed rows once, reuses unchanged rows, and honors forced refreshes', async () => {
+  let payload = [{ id: 'a', title: 'Original', qty: 5 }, { id: 'b', title: 'Other', qty: 0 }];
+  const context = vm.createContext({
+    document: { hidden: false, getElementById: () => null, querySelectorAll: () => [], addEventListener() {} },
+    window: { location: { hostname: 'localhost' }, addEventListener() {} },
+    AbortController, setTimeout, clearTimeout,
+    fetch: async () => ({ ok: true, status: 200, json: async () => payload })
+  });
+  vm.runInContext(fs.readFileSync(require.resolve('../frontend/app.js'), 'utf8'), context);
+  vm.runInContext("state.auth = true; state.session = {}; state.activeClientId = 'CL-001'; let normalizedCount = 0; const originalNormalize = normalizeInventoryItem; normalizeInventoryItem = (...args) => { normalizedCount += 1; return originalNormalize(...args); };", context);
+  await context.fetchInventory('CL-001');
+  assert.equal(vm.runInContext('normalizedCount', context), 2, 'changed inventory is normalized once, not once per consumer');
+  assert.equal(vm.runInContext("state.items === clientViewCache.get('CL-001').items", context), true);
+  const first = vm.runInContext('state.items', context);
+  await context.fetchInventory('CL-001');
+  assert.equal(vm.runInContext('normalizedCount', context), 2, 'unchanged polls perform no normalization');
+  assert.equal(vm.runInContext('state.items', context), first);
+  vm.runInContext("state.items[0].qty = 99; inventorySignature = null;", context);
+  await context.fetchInventory('CL-001');
+  assert.equal(vm.runInContext('state.items[0].qty', context), 5, 'forced refresh restores authoritative server data');
+  assert.equal(vm.runInContext('normalizedCount', context), 4);
+  payload = [{ id: 'a', title: 'Changed', qty: 2 }];
+  await context.fetchInventory('CL-001');
+  assert.equal(vm.runInContext('state.items[0].title', context), 'Changed');
+  assert.equal(vm.runInContext('normalizedCount', context), 5);
+});
+
+test('inventory summary evaluates each row once for stock and shipment modes', () => {
+  const elements = Object.fromEntries(['s-total', 's-low', 's-partial', 's-out', 's-partial-card'].map((id) => [id, { textContent: '', style: {} }]));
+  const context = vm.createContext({
+    document: { hidden: false, getElementById: (id) => elements[id] || null, querySelectorAll: () => [], addEventListener() {} },
+    window: { location: { hostname: 'localhost' }, addEventListener() {} },
+    AbortController, setTimeout, clearTimeout
+  });
+  vm.runInContext(fs.readFileSync(require.resolve('../frontend/app.js'), 'utf8'), context);
+  vm.runInContext("let statusCalls = 0; const originalStatus = getItemStatus; getItemStatus = (item) => { statusCalls += 1; return originalStatus(item); }; state.activeClientId = 'CL-001'; state.items = [{ qty: 0 }, { qty: 2, reorderLevel: 5 }, { qty: 10 }]; updateSummary();", context);
+  assert.equal(vm.runInContext('statusCalls', context), 3);
+  assert.deepEqual(['s-total', 's-low', 's-out'].map((id) => elements[id].textContent), [3, 1, 1]);
+  vm.runInContext("statusCalls = 0; state.activeClientId = 'CL-002'; state.items = [{ quantityReceived: 10, quantityShipped: 10 }, { quantityReceived: 10, quantityShipped: 5 }, { quantityReceived: 10, quantityShipped: 0 }, { quantityReceived: 0, quantityShipped: 0 }]; updateSummary();", context);
+  assert.equal(vm.runInContext('statusCalls', context), 4);
+  assert.deepEqual(['s-total', 's-low', 's-partial', 's-out'].map((id) => elements[id].textContent), [4, 1, 1, 1]);
+  assert.equal(elements['s-partial-card'].style.display, 'block');
+});
+
+test('portal navigation identifies the current page and client responses expand collapsed sections', () => {
+  const makeTab = () => {
+    const attrs = {};
+    const classes = new Set();
+    return {
+      attrs, classes,
+      classList: { add: (value) => classes.add(value), remove: (value) => classes.delete(value) },
+      setAttribute: (name, value) => { attrs[name] = value; },
+      removeAttribute: (name) => { delete attrs[name]; }
+    };
+  };
+  const tabs = Array.from({ length: 7 }, makeTab);
+  const outer = { open: false, parentElement: null };
+  const inner = { open: false, parentElement: { closest: () => outer } };
+  const messages = Object.fromEntries(['addClientMsg', 'editClientMsg', 'resetPasswordMsg'].map((id) => [
+    id, { style: {}, textContent: '', closest: () => inner }
+  ]));
+  const context = vm.createContext({
+    document: { hidden: false, getElementById: (id) => messages[id] || null, querySelectorAll: (selector) => selector === '.tab' ? tabs : [], addEventListener() {} },
+    window: { location: { hostname: 'localhost' }, addEventListener() {} },
+    AbortController, setTimeout, clearTimeout
+  });
+  vm.runInContext(fs.readFileSync(require.resolve('../frontend/app.js'), 'utf8'), context);
+  context.setPage('page-clients');
+  assert.equal(tabs[6].attrs['aria-current'], 'page');
+  context.setPage('page-billing');
+  assert.equal(tabs[5].attrs['aria-current'], 'page');
+  assert.equal(tabs[6].attrs['aria-current'], undefined);
+  assert.equal(tabs.filter((tab) => tab.classes.has('active')).length, 1);
+  for (const [functionName, id] of [
+    ['showAddClientMessage', 'addClientMsg'], ['showEditClientMessage', 'editClientMsg'], ['showResetPasswordMessage', 'resetPasswordMsg']
+  ]) {
+    inner.open = outer.open = false;
+    context[functionName]('Operation complete', 'success');
+    assert.equal(inner.open, true);
+    assert.equal(outer.open, true);
+    assert.equal(messages[id].textContent, 'Operation complete');
+    assert.equal(messages[id].style.display, 'block');
+  }
+});
+
 test('dashboard filters combine stock, fulfillment, and attribute selections', () => {
   const context = vm.createContext({
     document: { hidden: false, getElementById: () => null, querySelectorAll: () => [], addEventListener() {} },
@@ -1212,4 +1600,186 @@ test('dashboard filters combine stock, fulfillment, and attribute selections', (
   assert.equal(folderFor({ clientId: 'CL-004', driveFolderUrl: folder, driveAccessReady: true }, 'CL-005'), '');
   assert.equal(folderFor({ clientId: 'CL-004', driveFolderUrl: folder, driveAccessReady: false }, 'CL-004'), '');
   assert.equal(folderFor(null, 'CL-001'), '');
+});
+
+test('API requests stay same-origin when Express serves the portal on any local port', () => {
+  const urlsFor = (location) => {
+    const context = vm.createContext({
+      document: { hidden: false, getElementById: () => null, querySelectorAll: () => [], addEventListener() {} },
+      window: { location, addEventListener() {} },
+      AbortController, setTimeout, clearTimeout, fetch: async () => ({ ok: true, json: async () => ({}) })
+    });
+    vm.runInContext(fs.readFileSync(require.resolve('../frontend/app.js'), 'utf8'), context);
+    return JSON.parse(vm.runInContext('JSON.stringify([LOGIN_URL, API_URL])', context));
+  };
+  assert.deepEqual(urlsFor({ protocol: 'http:', hostname: 'localhost', port: '3015' }), ['/api/login', '/api/inventory']);
+  assert.deepEqual(urlsFor({ protocol: 'http:', hostname: 'localhost', port: '3001' }), ['/api/login', '/api/inventory']);
+  assert.deepEqual(urlsFor({ protocol: 'https:', hostname: 'portal.example.com', port: '' }), ['/api/login', '/api/inventory']);
+  assert.deepEqual(urlsFor({ protocol: 'http:', hostname: '127.0.0.1', port: '5500' }), ['http://localhost:3001/api/login', 'http://localhost:3001/api/inventory']);
+  assert.deepEqual(urlsFor({ protocol: 'file:', hostname: '', port: '' }), ['http://localhost:3001/api/login', 'http://localhost:3001/api/inventory']);
+});
+
+test('dashboard welcome banner greets the signed-in client and resets on sign-out', () => {
+  const ids = ['welcomeBanner', 'welcomeGreeting', 'welcomeTitle', 'welcomeSubtitle', 'welcomeDate', 'activeClientHeader'];
+  const elements = Object.fromEntries(ids.map((id) => {
+    const classes = new Set();
+    return [id, { textContent: '', style: {}, addEventListener() {}, classList: { add: (c) => classes.add(c), remove: (c) => classes.delete(c), contains: (c) => classes.has(c) } }];
+  }));
+  const context = vm.createContext({
+    document: { hidden: false, getElementById: (id) => elements[id] || null, querySelectorAll: () => [], addEventListener() {} },
+    window: { location: { protocol: 'http:', hostname: 'localhost', port: '3001' }, addEventListener() {} },
+    AbortController, setTimeout, clearTimeout, fetch: async () => ({ ok: true, json: async () => ({}) })
+  });
+  vm.runInContext(fs.readFileSync(require.resolve('../frontend/app.js'), 'utf8'), context);
+
+  vm.runInContext("state.session = { clientId: 'CL-004', clientName: 'Ecom Elite 2.0', role: 'client' }; state.isAdmin = false; state.activeClientId = 'CL-004'; renderClientHeader();", context);
+  assert.equal(elements.welcomeTitle.textContent, 'Welcome back, Ecom Elite 2.0');
+  assert.match(elements.welcomeGreeting.textContent, /^Good (morning|afternoon|evening)$/);
+  assert.notEqual(elements.welcomeDate.textContent, '');
+  assert.equal(elements.welcomeBanner.classList.contains('is-personalized'), true);
+
+  vm.runInContext("state.session = { clientId: 'CL-000', clientName: 'Admin', role: 'admin' }; state.isAdmin = true; state.activeClientId = 'CL-004'; state.roster = [{ clientId: 'CL-004', clientName: 'Ecom Elite 2.0' }]; renderClientHeader();", context);
+  assert.equal(elements.welcomeTitle.textContent, 'Welcome back, Admin');
+  assert.match(elements.welcomeSubtitle.textContent, /viewing Ecom Elite 2\.0's inventory/);
+
+  vm.runInContext('state.session = null; renderWelcomeBanner();', context);
+  assert.equal(elements.welcomeTitle.textContent, 'Inventory overview');
+  assert.equal(elements.welcomeDate.textContent, '');
+  assert.equal(elements.welcomeBanner.classList.contains('is-personalized'), false);
+  assert.equal(vm.runInContext('getTimeOfDayGreeting(new Date(2026, 0, 1, 9))', context), 'Good morning');
+  assert.equal(vm.runInContext('getTimeOfDayGreeting(new Date(2026, 0, 1, 14))', context), 'Good afternoon');
+  assert.equal(vm.runInContext('getTimeOfDayGreeting(new Date(2026, 0, 1, 20))', context), 'Good evening');
+});
+
+test('first-time tour launches once for clients, navigates with back/next, and saves the seen flag on skip or finish', () => {
+  const makeEl = (extra = {}) => {
+    const classes = new Set();
+    return {
+      textContent: '', innerHTML: '', hidden: false, style: {}, isConnected: true,
+      addEventListener() {}, focus() { focused = this; }, getClientRects: () => [1],
+      getBoundingClientRect: () => ({ top: 200, bottom: 260, left: 40, right: 400, width: 360, height: 60 }),
+      scrollIntoView() {},
+      classList: { add: (c) => classes.add(c), remove: (c) => classes.delete(c), contains: (c) => classes.has(c) },
+      ...extra
+    };
+  };
+  let focused = null;
+  const ids = ['tourOverlay', 'tourSpotlight', 'tourCard', 'tourStep', 'tourTitle', 'tourBody', 'tourProgress', 'tourSkip', 'tourBack', 'tourNext', 'tourFinish', 'replayTourBtn', 'toast'];
+  const elements = Object.fromEntries(ids.map((id) => [id, makeEl()]));
+  elements.tourOverlay.hidden = true;
+  const storage = new Map();
+  const keydown = [];
+  const context = vm.createContext({
+    document: {
+      hidden: false, body: makeEl(), activeElement: null,
+      getElementById: (id) => elements[id] || null,
+      querySelector: (selector) => (selector === '.page.active' ? { id: 'page-dashboard' } : makeEl()),
+      querySelectorAll: (selector) => (selector === '#tourCard button' ? [elements.tourSkip, elements.tourBack, elements.tourNext, elements.tourFinish] : []),
+      addEventListener: (event, listener) => { if (event === 'keydown') keydown.push(listener); }
+    },
+    window: { location: { protocol: 'http:', hostname: 'localhost', port: '3001' }, innerWidth: 1200, innerHeight: 800, scrollY: 0, addEventListener() {}, removeEventListener() {}, scrollTo() {} },
+    localStorage: { getItem: (key) => storage.get(key) ?? null, setItem: (key, value) => storage.set(key, String(value)), removeItem: (key) => storage.delete(key) },
+    requestAnimationFrame: (fn) => { fn(); return 1; }, cancelAnimationFrame() {},
+    AbortController, setTimeout, clearTimeout, fetch: async () => ({ ok: true, json: async () => ({}) })
+  });
+  vm.runInContext(fs.readFileSync(require.resolve('../frontend/app.js'), 'utf8'), context);
+  const visited = [];
+  context.__visit = (page) => visited.push(page);
+  vm.runInContext('showTourPage = (page) => { if (page) __visit(page); };', context);
+  const total = vm.runInContext('ONBOARDING_STEPS.length', context);
+
+  vm.runInContext('state.auth = true; state.isAdmin = true;', context);
+  assert.equal(vm.runInContext('maybeStartOnboarding()', context), false, 'admins are not auto-toured');
+
+  vm.runInContext('state.isAdmin = false;', context);
+  assert.equal(vm.runInContext('maybeStartOnboarding()', context), true);
+  assert.equal(elements.tourOverlay.hidden, false);
+  assert.equal(elements.tourStep.textContent, `Step 1 of ${total}`);
+  assert.equal(elements.tourBack.hidden, true);
+  assert.equal(elements.tourFinish.hidden, true);
+  assert.equal(elements.tourOverlay.classList.contains('is-centered'), true, 'welcome step is centered');
+
+  vm.runInContext('moveOnboardingTour(1)', context);
+  assert.equal(elements.tourStep.textContent, `Step 2 of ${total}`);
+  assert.equal(elements.tourBack.hidden, false);
+  assert.equal(elements.tourSpotlight.hidden, false);
+  assert.equal(elements.tourSpotlight.style.top, '194px');
+  vm.runInContext('moveOnboardingTour(-1); moveOnboardingTour(-1);', context);
+  assert.equal(elements.tourStep.textContent, `Step 1 of ${total}`, 'back stops at the first step');
+
+  keydown.forEach((listener) => listener({ key: 'ArrowRight', preventDefault() {} }));
+  assert.equal(elements.tourStep.textContent, `Step 2 of ${total}`);
+  for (let i = 0; i < total + 2; i += 1) vm.runInContext('moveOnboardingTour(1)', context);
+  assert.equal(elements.tourStep.textContent, `Step ${total} of ${total}`);
+  assert.equal(elements.tourFinish.hidden, false);
+  assert.equal(elements.tourNext.hidden, true);
+  assert.equal(elements.tourSkip.hidden, true);
+  assert.ok(visited.includes('page-logs'), 'tour visits the activity log');
+  assert.equal(storage.has('has_seen_onboarding'), false, 'flag is not set until the tour ends');
+
+  vm.runInContext('finishOnboardingTour()', context);
+  assert.equal(elements.tourOverlay.hidden, true);
+  assert.equal(storage.get('has_seen_onboarding'), 'true');
+  assert.equal(visited.at(-1), 'page-dashboard');
+  assert.equal(vm.runInContext('maybeStartOnboarding()', context), false, 'does not relaunch once seen');
+
+  vm.runInContext('startOnboardingTour()', context);
+  assert.equal(elements.tourOverlay.hidden, false, 'replay works even after the flag is set');
+  keydown.forEach((listener) => listener({ key: 'Escape', preventDefault() {} }));
+  assert.equal(elements.tourOverlay.hidden, true, 'Escape skips');
+
+  storage.clear();
+  vm.runInContext('maybeStartOnboarding(); skipOnboardingTour();', context);
+  assert.equal(storage.get('has_seen_onboarding'), 'true', 'skip saves the flag');
+
+  storage.clear();
+  vm.runInContext('maybeStartOnboarding(); closeOnboardingTour({ markSeen: false, restorePage: false });', context);
+  assert.equal(storage.has('has_seen_onboarding'), false, 'signing out mid-tour does not mark it seen');
+});
+
+test('help FAQ search filters by question, answer, and keywords and keeps one answer open at a time', () => {
+  const makeItem = (text, keywords) => ({ textContent: text, dataset: { keywords }, hidden: false, open: false, classList: { contains: (c) => c === 'faq-item' } });
+  const items = [
+    makeItem('How do I add a new inventory item? Open the Add item tab.', 'new item create sku'),
+    makeItem('How do I reset my password? Use Forgot Password.', 'password reset forgot recovery code'),
+    makeItem('Where is the activity log? Open Activity.', 'audit history')
+  ];
+  const list = { querySelectorAll: () => items };
+  items.forEach((item) => { item.parentElement = { querySelectorAll: () => items.filter((other) => other.open) }; });
+  const elements = { faqSearch: { value: '' }, faqList: list, faqCount: { textContent: '' }, faqEmpty: { hidden: true } };
+  const listeners = {};
+  const context = vm.createContext({
+    document: { hidden: false, getElementById: (id) => elements[id] || null, querySelectorAll: () => [], addEventListener: (event, listener) => { listeners[event] = listener; } },
+    window: { location: { protocol: 'http:', hostname: 'localhost', port: '3001' }, addEventListener() {} },
+    AbortController, setTimeout, clearTimeout, fetch: async () => ({ ok: true, json: async () => ({}) })
+  });
+  vm.runInContext(fs.readFileSync(require.resolve('../frontend/app.js'), 'utf8'), context);
+  assert.equal(elements.faqCount.textContent, '3 common questions');
+
+  elements.faqSearch.value = 'recovery';
+  vm.runInContext('filterFaq()', context);
+  assert.deepEqual(items.map((item) => item.hidden), [true, false, true]);
+  assert.equal(items[1].open, true, 'a single match opens automatically');
+  assert.equal(elements.faqCount.textContent, '1 of 3 questions match');
+
+  elements.faqSearch.value = 'AUDIT activity';
+  vm.runInContext('filterFaq()', context);
+  assert.deepEqual(items.map((item) => item.hidden), [true, true, false]);
+
+  elements.faqSearch.value = 'zebra';
+  vm.runInContext('filterFaq()', context);
+  assert.equal(items.every((item) => item.hidden), true);
+  assert.equal(elements.faqEmpty.hidden, false);
+
+  elements.faqSearch.value = '';
+  vm.runInContext('filterFaq()', context);
+  assert.equal(items.every((item) => !item.hidden), true);
+  assert.equal(elements.faqEmpty.hidden, true);
+
+  items.forEach((item) => { item.open = false; });
+  items[0].open = true;
+  listeners.toggle({ target: items[0] });
+  items[2].open = true;
+  listeners.toggle({ target: items[2] });
+  assert.deepEqual(items.map((item) => item.open), [false, false, true]);
 });

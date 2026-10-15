@@ -1213,6 +1213,26 @@ function loadNotificationRows(sheetName) {
   });
 }
 
+app.get('/api/activity', async (req, res) => {
+  const session = readNotificationSession(req);
+  if (!session) return res.status(401).json({ message: 'Sign in again to view activity.' });
+  const clientId = normalizeClientId(isStaffSession(session) ? req.query.clientId || session.clientId : session.clientId);
+  try {
+    const events = (await loadNotificationRows('Inventory_Events')).map((row) => ({
+      timestamp: row.get('Timestamp') || '',
+      clientId: normalizeClientId(row.get('ClientID')),
+      action: 'Inventory update',
+      actorUsername: String(row.get('ActorUsername') || ''),
+      description: String(row.get('Description') || '')
+    })).filter((event) => event.clientId && (clientId === 'CL-000' || event.clientId === clientId));
+    events.sort((a, b) => (Date.parse(b.timestamp) || 0) - (Date.parse(a.timestamp) || 0));
+    return res.json(events);
+  } catch (error) {
+    console.error('Activity fetch error:', error.message);
+    return res.status(error?.response?.status === 429 ? 429 : 500).json({ message: 'Unable to load activity history.' });
+  }
+});
+
 app.get('/api/notifications', async (req, res) => {
   try {
     const session = readNotificationSession(req);
@@ -1820,25 +1840,31 @@ app.post('/api/account/activate', authRateLimit, async (req, res) => {
 app.post('/api/account/recover', authRateLimit, async (req, res) => {
   try {
     const { username, recoveryCode, newPassword } = req.body || {};
-    const safeUsername = String(username || '').trim();
-    const safePassword = String(newPassword || '');
+    const safeUsername = typeof username === 'string' ? username.trim() : '';
+    const safePassword = typeof newPassword === 'string' ? newPassword : '';
+    const safeCode = typeof recoveryCode === 'string' ? normalizeCode(recoveryCode) : '';
 
-    if (!safeUsername || !recoveryCode || safePassword.length < 8) {
-      return res.status(400).json({ success: false, error: 'Username, recovery code, and an 8+ character new password are required.' });
+    if (!safeUsername || !safeCode || safePassword.length < 8) {
+      return res.status(400).json({ success: false, error: 'Username, recovery or administrator-issued reset code, and an 8+ character new password are required.' });
     }
 
     const sheet = await getSheetByName('User_Credentials');
     const rows = await withRetry(() => sheet.getRows());
     const user = rows.find((row) => String(row.get('Username') || '').trim() === safeUsername);
 
-    const invalid = () => res.status(400).json({ success: false, error: 'Invalid username or recovery code.' });
+    const invalid = () => res.status(400).json({ success: false, error: 'Invalid username or reset code. Use the exact username and the latest recovery or administrator-issued code; each code works only once.' });
 
     if (!user) return invalid();
-    if (!(await verifySecret(normalizeCode(recoveryCode), user.get('Recovery_Code_Hash')))) return invalid();
+    const awaitingActivation = !String(user.get('Password') || '').trim();
+    const codeMatches = awaitingActivation
+      ? codesMatch(safeCode, user.get('Activation_Code'))
+      : await verifySecret(safeCode, user.get('Recovery_Code_Hash'));
+    if (!codeMatches) return invalid();
 
-    // Rotate the recovery code so each one only works once.
+    // Admin resets clear the password and issue an activation code instead of a recovery hash.
     const newRecoveryCode = `${generateCode(4)}-${generateCode(4)}`;
     user.set('Password', await hashSecret(safePassword));
+    user.set('Activation_Code', '');
     user.set('Recovery_Code_Hash', await hashSecret(newRecoveryCode));
     await withRetry(() => user.save());
 

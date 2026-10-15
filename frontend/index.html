@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
     <title>ECL Inventory & Chat Portal</title>
-    <link rel="stylesheet" href="styles.css" />
+    <link rel="stylesheet" href="styles.css?v=20261015f" />
   </head>
   <body>
     <div class="portal-login-overlay" id="portalLoginWindow">
@@ -73,13 +73,13 @@
       <div class="portal-login-box">
         <img src="https://static.wixstatic.com/media/32ab39_dfd6e4b0422f4d30ac72594477453225~mv2.png" alt="ECL Logo" />
         <h2>RESET YOUR PASSWORD</h2>
-        <p>Enter your username and recovery code.</p>
-        <div class="login-error" id="recoverErrorMsg"></div>
+        <p>Enter your exact username and either your saved recovery code or the latest reset code from your administrator. Codes are single-use.</p>
+        <div class="login-error" id="recoverErrorMsg" role="alert"></div>
         <div id="recoverFormFields">
           <div class="portal-login-form">
             <label>Username</label>
             <input type="text" id="recoverUsername" placeholder="Your username..." autocomplete="username" />
-            <label>Recovery Code</label>
+            <label for="recoverCode">Recovery or Administrator Reset Code</label>
             <input type="text" id="recoverCode" placeholder="XXXX-XXXX" autocomplete="off" />
             <label>New Password</label>
             <div class="password-field">
@@ -92,7 +92,7 @@
               <button type="button" class="password-toggle" data-action="toggle-password" data-target="recoverPasswordConfirm" aria-label="Show password" aria-pressed="false" title="Show password"><svg class="eye-open" viewBox="0 0 24 24" aria-hidden="true"><path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7S1 12 1 12z"/><circle cx="12" cy="12" r="3"/></svg><svg class="eye-closed" viewBox="0 0 24 24" aria-hidden="true"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 19c-7 0-11-7-11-7a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 7 11 7a18.5 18.5 0 0 1-2.16 3.19"/><path d="M1 1l22 22"/></svg></button>
             </div>
           </div>
-          <button class="portal-login-btn" onclick="submitRecoverAccount()">Reset Password</button>
+          <button id="recoverSubmit" class="portal-login-btn" onclick="submitRecoverAccount()">Reset Password</button>
         </div>
         <div id="recoverSuccessPanel" style="display:none;">
           <div class="recovery-code-box">
@@ -136,21 +136,30 @@
       <div id="adminSwitcherBtns" style="display:flex;gap:6px;flex-wrap:wrap;"></div>
     </div>
 
-    <div class="tabs" id="mainTabs">
-      <div class="tab active" onclick="goToDashboard()">📊 Dashboard</div>
-      <div class="tab" id="tabUpdate" onclick="requestUpdatePage()">✏️ Update</div>
-      <div class="tab" id="tabOrder" onclick="goToAddOrder()" style="display:none;">📦 Add New</div>
-      <div class="tab" onclick="goToLogs()">📋 Logs</div>
-      <div class="tab" onclick="showPage('chat')">💬 Chat</div>
-      <div class="tab" id="tabBilling" onclick="showPage('billing')" style="display:none;">💵 Billing</div>
-      <div class="tab" id="tabClients" onclick="showPage('clients')" style="display:none;">🏷️ Clients</div>
-    </div>
+    <nav class="tabs" id="mainTabs" aria-label="Portal navigation">
+      <button type="button" class="tab active" aria-current="page" onclick="goToDashboard()">Dashboard</button>
+      <button type="button" class="tab" id="tabUpdate" onclick="requestUpdatePage()">Updates</button>
+      <button type="button" class="tab" id="tabOrder" onclick="goToAddOrder()" style="display:none;">Add item</button>
+      <button type="button" class="tab" onclick="goToLogs()">Activity</button>
+      <button type="button" class="tab" onclick="showPage('chat')">Chat</button>
+      <button type="button" class="tab" id="tabBilling" onclick="showPage('billing')" style="display:none;">Billing</button>
+      <button type="button" class="tab" id="tabClients" onclick="showPage('clients')" style="display:none;">Client setup</button>
+      <button type="button" class="tab" id="tabHelp" onclick="showPage('help')">Help</button>
+    </nav>
 
     <div id="loadingScreen" class="content" style="display:none;">
       <div class="loading-screen"><div class="spinner"></div>Loading portal...</div>
     </div>
 
     <div id="page-dashboard" class="page content active" style="display:block;">
+      <header class="page-heading welcome-banner" id="welcomeBanner">
+        <div class="welcome-copy">
+          <p class="welcome-greeting" id="welcomeGreeting">Welcome</p>
+          <h2 id="welcomeTitle">Inventory overview</h2>
+          <p id="welcomeSubtitle">Stock levels, fulfillment progress, and quick actions in one place.</p>
+        </div>
+        <p class="welcome-date" id="welcomeDate"></p>
+      </header>
       <div class="summary-grid">
         <div class="summary-card"><div class="num" id="s-total">—</div><div class="lbl">TOTAL SKUs</div></div>
         <div class="summary-card warn"><div class="num" id="s-low">—</div><div class="lbl">LOW STOCK</div></div>
@@ -159,7 +168,7 @@
       </div>
       <div class="filter-bar">
         <div class="filter-toolbar">
-          <input type="text" id="tableSearch" placeholder="🔍 Search SKU or product..." oninput="renderTable()" />
+          <input type="text" id="tableSearch" aria-label="Search inventory" placeholder="Search SKU or product..." />
           <button type="button" class="filter-toggle" id="filterToggle" data-action="toggle-filter-panel" aria-expanded="false" aria-controls="filterPanel">
             <span aria-hidden="true">☰</span> Filters <span class="filter-count" id="filterCount" hidden></span>
           </button>
@@ -199,9 +208,10 @@
     </div>
 
     <div id="page-update" class="page content" style="display:none;">
+      <header class="page-heading"><h2>Inventory updates</h2><p>Find an item, then update its quantities, shipment progress, or details.</p></header>
       <div class="update-card">
-        <h2>🔍 Find Item</h2>
-        <label>Search by SKU or Product Name:</label>
+        <h3>Find an item</h3>
+        <label for="searchInput">Search by SKU or product name</label>
         <div class="search-wrap">
           <input type="text" id="searchInput" placeholder="e.g. C-15-Zn or Copper..." autocomplete="off" oninput="filterSearch()" />
           <div class="search-results" id="searchResults" style="display:none;"></div>
@@ -212,19 +222,21 @@
             <div class="ss" id="selSku"></div>
             <div class="st" id="selTitle"></div>
           </div>
-          <div id="detailsEditor" hidden>
-            <h2>✏️ Product Details</h2>
+          <details id="detailsEditor" class="section-panel" hidden>
+            <summary><span>Product details<small>Edit item information and custom fields</small></span></summary>
+            <div class="section-body">
             <div id="detailFields" class="ac-settings-grid detail-grid"></div>
             <button type="button" class="btn-set" style="margin-top:10px;" onclick="saveItemDetails()">Save details</button>
-            <hr class="divider" />
-          </div>
-          <div id="shipmentEditor" hidden>
+            </div>
+          </details>
+          <details id="shipmentEditor" class="section-panel" open hidden>
+            <summary><span>Received &amp; shipped<small>Track warehouse arrivals and fulfillment</small></span></summary>
+            <div class="section-body">
             <div class="qty-display">
               <div><div class="ql">CURRENT STATUS</div></div>
               <span class="badge" id="shipCurrent"></span>
             </div>
             <hr class="divider" />
-            <h2>📦 Received &amp; Shipped</h2>
             <p class="billing-hint" id="shipmentHint">Enter how many have arrived at the warehouse, then how many have shipped out.</p>
             <div class="shipment-grid">
               <div>
@@ -238,14 +250,15 @@
             </div>
             <div class="shipment-preview">Status after saving: <span class="badge" id="shipPreview"></span></div>
             <button type="button" class="big-btn plus" id="shipSave" onclick="saveShipment()">Save</button>
-          </div>
+            </div>
+          </details>
           <div id="stockEditor">
           <div class="qty-display">
             <div><div class="ql">CURRENT QTY ON HAND</div><div class="qv" id="selQty">—</div></div>
             <span class="badge" id="selBadge"></span>
           </div>
           <hr class="divider" />
-          <h2>⚡ Quick Adjust</h2>
+          <h3>Quick adjust</h3>
           <div class="amt-row">
             <label>Amount:</label>
             <input type="number" id="adjustAmt" value="1" min="1" />
@@ -254,23 +267,27 @@
             <button class="big-btn minus" onclick="adjustQty(-1)">− Remove</button>
             <button class="big-btn plus" onclick="adjustQty(1)">+ Add</button>
           </div>
-          <hr class="divider" />
-          <h2>✏️ Set Exact Quantity</h2>
+          <details class="section-panel">
+          <summary><span>Set exact quantity<small>Replace the current on-hand count</small></span></summary>
+          <div class="section-body">
           <div class="set-row">
             <button class="btn-set" onclick="setExactQty()">Set</button>
             <input type="number" id="setQtyVal" min="0" placeholder="Enter new qty..." />
           </div>
+          </div>
+          </details>
           </div>
         </div>
       </div>
     </div>
 
     <div id="page-order" class="page content" style="display:none;">
+      <header class="page-heading"><h2>Add an item</h2><p>Create a new inventory record for the selected client.</p></header>
       <div class="update-card" id="addProductCard">
-        <h2>📦 Add New</h2>
+        <h3>Item information</h3>
         <p style="color:#666;font-size:12px;margin-bottom:12px;">Adds a new item for this client. Items that track received and shipped quantities start as "Not Received" — update them from the Update tab as they arrive and ship.</p>
         <div id="createProductReadOnlyNotice" style="display:none; color:#b45309; background:#fff7ed; border:1px solid #fed7aa; padding:8px 10px; border-radius:8px; margin-bottom:12px; font-size:12px; font-weight:700;"></div>
-        <div class="set-row" style="display:grid;grid-template-columns:1fr 1fr 110px auto;gap:8px;align-items:end;">
+        <div class="item-create-grid">
           <div id="newProductSkuWrap">
             <label class="ac-label" for="newProductSku">SKU (optional)</label>
             <input type="text" id="newProductSku" class="ac-input" placeholder="A-25-Cu-01" />
@@ -290,19 +307,21 @@
     </div>
 
     <div id="page-logs" class="page content" style="display:none;">
+      <header class="page-heading"><h2>Activity history</h2><p>A clear record of inventory changes and who made them.</p></header>
       <div class="update-card">
-        <h2>📋 Activity Log</h2>
-        <p style="color:#666;font-size:12px;margin-bottom:12px;">Stock adjustment history — most recent first.</p>
+        <h3>Activity log</h3>
+        <p class="activity-description">Recorded inventory changes, including your own activity and previously read updates. Most recent first; missing timestamps or users are marked as not recorded.</p>
         <div class="filter-bar" style="margin-bottom:10px;">
-          <input type="text" id="logSearch" placeholder="🔍 Filter..." oninput="filterLogs()" />
+          <input type="search" id="logSearch" aria-label="Filter activity by timestamp, action, user, or details" placeholder="Filter activity..." oninput="filterLogs()" />
         </div>
-        <div class="table-wrap" id="logTableWrap" style="display:block;">
+        <div class="table-wrap activity-wrap" id="logTableWrap" tabindex="0" role="region" aria-label="Activity history">
           <div class="no-results" style="padding:30px;">Loading log...</div>
         </div>
       </div>
     </div>
 
     <div id="page-chat" class="page content" style="display:none;">
+      <header class="page-heading"><h2>Messages</h2><p>Keep client conversations and shared files together.</p></header>
       <div class="chat-container">
         <div class="chat-subheading">
           <h2>SECURE PORTAL CHAT</h2>
@@ -331,17 +350,19 @@
     </div>
 
     <div id="page-billing" class="page content" style="display:none;">
+      <header class="page-heading"><h2>Billing</h2><p>Review the monthly estimate. Expand a section to manage entries, invoices, or rates.</p></header>
       <div class="update-card">
         <div class="billing-head">
-          <h2>💵 Billing Estimate</h2>
+          <h3>Monthly estimate</h3>
           <label class="billing-month" for="billingMonth">Month <input type="month" id="billingMonth" class="ac-input" onchange="onBillingMonthChange()" /></label>
         </div>
         <div id="billingMsg" class="ac-note" hidden></div>
         <div id="billingSummary"></div>
       </div>
 
-      <div class="update-card" id="billingAdminEntry" hidden>
-        <h2>🧾 Daily Billing Log</h2>
+      <details class="update-card section-panel" id="billingAdminEntry" open hidden>
+        <summary><span>Daily billing log<small>Add charges and review entries for the selected month</small></span></summary>
+        <div class="section-body">
         <div class="billing-entry-form">
           <div>
             <label class="ac-label" for="billingDate">Date</label>
@@ -371,10 +392,12 @@
         <button type="button" class="btn-set" style="margin-top:10px;" onclick="submitBillingEntry()">Add entry</button>
         <h3 class="billing-subhead">Entries this month</h3>
         <div id="billingEntries"></div>
-      </div>
+        </div>
+      </details>
 
-      <div class="update-card" id="billingAdminHistory" hidden>
-        <h2>🗂️ Past Invoices</h2>
+      <details class="update-card section-panel" id="billingAdminHistory" hidden>
+        <summary><span>Past invoices<small>Maintain invoice history used in billing estimates</small></span></summary>
+        <div class="section-body">
         <p class="billing-hint">Totals from invoices you've already sent this client. The month-end estimate uses their last 6 months. Saved in the Billing_History sheet tab.</p>
         <div class="billing-entry-form history-form">
           <div>
@@ -400,10 +423,12 @@
         </div>
         <button type="button" class="btn-set" style="margin-top:10px;" onclick="submitBillingHistory()">Add past invoice</button>
         <div id="billingHistory" style="margin-top:12px;"></div>
-      </div>
+        </div>
+      </details>
 
-      <div class="update-card" id="billingAdminRates" hidden>
-        <h2>⚙️ Rate Card</h2>
+      <details class="update-card section-panel" id="billingAdminRates" hidden>
+        <summary><span>Rate card &amp; visibility<small>Configure service prices, tax, and client access</small></span></summary>
+        <div class="section-body">
         <p class="billing-hint">The services you bill this client for and their price each. Add the same service twice with a different description for a second rate (e.g. Bundling / Oversized Bundle). Saved in the Billing_Rate_Cards sheet tab.</p>
         <div class="rc-service-row rc-service-head" aria-hidden="true"><span>Service</span><span>Price each ($)</span><span>Description (optional)</span><span></span></div>
         <div id="rcServices"></div>
@@ -418,46 +443,52 @@
         <div style="margin-top:14px;">
           <button type="button" class="big-btn plus" onclick="saveRateCard()">Save Rate Card</button>
         </div>
-      </div>
+        </div>
+      </details>
     </div>
 
     <div id="page-clients" class="page content" style="display:none;">
-      <div class="update-card">
-        <h2>🏷️ Add New Client</h2>
+      <header class="page-heading"><h2>Client setup</h2><p>Manage existing clients, onboard a new account, or reset access. Expand only what you need.</p></header>
+      <details class="update-card section-panel">
+        <summary><span>Add a new client<small>Create an account, inventory sheet, and portal settings</small></span></summary>
+        <div class="section-body">
         <p style="color:#666;font-size:12px;margin-bottom:12px;">Creates the login, portal settings, and a ready-to-use inventory sheet — no code changes needed.</p>
-        <div id="addClientMsg" style="display:none;margin-bottom:12px;padding:8px 10px;border-radius:8px;font-size:12px;font-weight:700;"></div>
+        <div id="addClientMsg" role="status" style="display:none;margin-bottom:12px;padding:8px 10px;border-radius:8px;font-size:12px;font-weight:700;"></div>
 
-        <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+        <div class="portal-form-grid">
           <div>
-            <label class="ac-label">Client ID</label>
+            <label class="ac-label" for="acClientId">Client ID</label>
             <input type="text" id="acClientId" placeholder="CL-004" style="width:100%;padding:10px 12px;border:1px solid #dfe7f1;border-radius:8px;" />
           </div>
           <div>
-            <label class="ac-label">Client Name</label>
+            <label class="ac-label" for="acClientName">Client Name</label>
             <input type="text" id="acClientName" placeholder="New Client Co" style="width:100%;padding:10px 12px;border:1px solid #dfe7f1;border-radius:8px;" />
           </div>
           <div>
-            <label class="ac-label">Username</label>
+            <label class="ac-label" for="acUsername">Username</label>
             <input type="text" id="acUsername" placeholder="newclient" style="width:100%;padding:10px 12px;border:1px solid #dfe7f1;border-radius:8px;" />
           </div>
           <div>
-            <label class="ac-label">Email (optional)</label>
+            <label class="ac-label" for="acEmail">Email (optional)</label>
             <input type="text" id="acEmail" placeholder="client@email.com" style="width:100%;padding:10px 12px;border:1px solid #dfe7f1;border-radius:8px;" />
           </div>
           <div>
-            <label class="ac-label">Drive Folder URL (optional)</label>
+            <label class="ac-label" for="acDriveFolderUrl">Drive Folder URL (optional)</label>
             <input type="text" id="acDriveFolderUrl" placeholder="https://drive.google.com/..." style="width:100%;padding:10px 12px;border:1px solid #dfe7f1;border-radius:8px;" />
           </div>
           <div>
-            <label class="ac-label">Portal Title (optional)</label>
+            <label class="ac-label" for="acPortalTitle">Portal Title (optional)</label>
             <input type="text" id="acPortalTitle" placeholder="ECL Inventory Portal" style="width:100%;padding:10px 12px;border:1px solid #dfe7f1;border-radius:8px;" />
           </div>
           <div>
-            <label class="ac-label">Accent Color (optional)</label>
+            <label class="ac-label" for="acAccentColor">Accent Color (optional)</label>
             <input type="text" id="acAccentColor" placeholder="#F5C518" style="width:100%;padding:10px 12px;border:1px solid #dfe7f1;border-radius:8px;" />
           </div>
         </div>
 
+        <details class="section-panel">
+        <summary><span>Access &amp; inventory settings<small>Permissions, quick edit protection, and stock thresholds</small></span></summary>
+        <div class="section-body">
         <div style="margin-top:14px;display:flex;gap:16px;flex-wrap:wrap;">
           <label class="ac-check"><input type="checkbox" id="acEnableAddItem" checked /> Client can add items</label>
           <label class="ac-check"><input type="checkbox" id="acAllowChat" checked /> Allow chat</label>
@@ -485,23 +516,30 @@
           </div>
         </div>
 
-        <hr class="divider" />
-        <h2>📋 Dashboard / Add-Item Fields</h2>
+        </div>
+        </details>
+        <details class="section-panel">
+        <summary><span>Inventory fields<small>Choose dashboard columns and add-item form fields</small></span></summary>
+        <div class="section-body">
         <p style="color:#666;font-size:12px;margin-bottom:10px;">Every field you add here becomes a dashboard column. Untick "Show on Add New form" to hide it on that form.</p>
         <div id="acFieldsList"></div>
         <button type="button" class="btn-set" style="margin-top:8px;" onclick="addClientFieldRow()">+ Add Field</button>
+        </div>
+        </details>
 
         <div style="margin-top:18px;">
           <button type="button" class="big-btn plus" onclick="submitNewClient()">Create Client</button>
         </div>
-      </div>
+        </div>
+      </details>
 
-      <div class="update-card">
-        <h2>✏️ Edit Existing Client</h2>
+      <details class="update-card section-panel" open>
+        <summary><span>Edit an existing client<small>Update account settings and inventory configuration</small></span></summary>
+        <div class="section-body">
         <p style="color:#666;font-size:12px;margin-bottom:12px;">Change settings or add/rename/remove fields any time — the sheet columns update to match.</p>
-        <div id="editClientMsg" style="display:none;margin-bottom:12px;padding:8px 10px;border-radius:8px;font-size:12px;font-weight:700;"></div>
+        <div id="editClientMsg" role="status" style="display:none;margin-bottom:12px;padding:8px 10px;border-radius:8px;font-size:12px;font-weight:700;"></div>
 
-        <label class="ac-label">Select Client</label>
+        <label class="ac-label" for="ecClientSelect">Select Client</label>
         <select id="ecClientSelect" style="width:100%;padding:10px 12px;border:1px solid #dfe7f1;border-radius:8px;margin-bottom:14px;" onchange="loadClientForEdit(this.value)">
           <option value="">— Choose a client —</option>
         </select>
@@ -514,21 +552,24 @@
             <p class="billing-hint" style="margin:4px 0 0;">Needed for the client's Drive folder button to work.</p>
           </div>
           <div id="ecGenericSettings">
-          <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+          <details class="section-panel" open>
+          <summary><span>Portal appearance &amp; access<small>Client identity, branding, and feature permissions</small></span></summary>
+          <div class="section-body">
+          <div class="portal-form-grid">
             <div>
-              <label class="ac-label">Client Name</label>
+              <label class="ac-label" for="ecClientName">Client Name</label>
               <input type="text" id="ecClientName" style="width:100%;padding:10px 12px;border:1px solid #dfe7f1;border-radius:8px;" />
             </div>
             <div>
-              <label class="ac-label">Drive Folder URL</label>
+              <label class="ac-label" for="ecDriveFolderUrl">Drive Folder URL</label>
               <input type="text" id="ecDriveFolderUrl" style="width:100%;padding:10px 12px;border:1px solid #dfe7f1;border-radius:8px;" />
             </div>
             <div>
-              <label class="ac-label">Portal Title</label>
+              <label class="ac-label" for="ecPortalTitle">Portal Title</label>
               <input type="text" id="ecPortalTitle" style="width:100%;padding:10px 12px;border:1px solid #dfe7f1;border-radius:8px;" />
             </div>
             <div>
-              <label class="ac-label">Accent Color</label>
+              <label class="ac-label" for="ecAccentColor">Accent Color</label>
               <input type="text" id="ecAccentColor" style="width:100%;padding:10px 12px;border:1px solid #dfe7f1;border-radius:8px;" />
             </div>
           </div>
@@ -540,6 +581,8 @@
             <label class="ac-check"><input type="checkbox" id="ecAllowUpdate" /> Allow update</label>
             <label class="ac-check"><input type="checkbox" id="ecReadOnly" /> Read-only dashboard</label>
           </div>
+          </div>
+          </details>
           </div>
 
           <div class="ac-settings-grid">
@@ -561,7 +604,9 @@
             </div>
           </div>
 
-          <h2 style="margin-top:14px;">🏷️ Filter Attribute Mapping</h2>
+          <details class="section-panel">
+          <summary><span>Filter attribute mapping<small>Connect dashboard filters to inventory fields</small></span></summary>
+          <div class="section-body">
           <p style="color:#666;font-size:12px;margin-bottom:10px;">Pick the field that holds a Y/N value for each dashboard filter. Aged Orders and Dead Stock use the activity log automatically.</p>
           <div class="ac-settings-grid">
             <div>
@@ -578,28 +623,145 @@
             </div>
           </div>
 
-          <hr class="divider" />
-          <h2>📋 Dashboard / Add-Item Fields</h2>
+          </div>
+          </details>
+          <details class="section-panel">
+          <summary><span>Inventory fields<small>Manage column names and add-item visibility</small></span></summary>
+          <div class="section-body">
           <p style="color:#666;font-size:12px;margin-bottom:10px;">Rename a field's label to rename its column, or remove it to delete the column (and its data) entirely. Untick "Show on Add New form" to hide a field on that form.</p>
           <div id="ecFieldsList"></div>
           <button type="button" id="ecAddFieldBtn" class="btn-set" style="margin-top:8px;" onclick="addEditClientFieldRow()">+ Add Field</button>
+          </div>
+          </details>
 
           <div style="margin-top:18px;display:flex;gap:10px;">
             <button type="button" class="big-btn plus" onclick="submitClientEdit()">Save Changes</button>
             <button type="button" id="ecDeleteBtn" class="big-btn minus" onclick="deleteClientPrompt()">Delete Client</button>
           </div>
         </div>
-      </div>
+        </div>
+      </details>
 
-      <div class="update-card">
-        <h2>🔑 Reset Client Password</h2>
-        <p style="color:#666;font-size:12px;margin-bottom:12px;">Passwords and recovery codes are stored hashed and can't be read from the sheet. Resetting signs the client out of their old password and gives you a one-time activation code to send them; they then choose a new password with "Create Account".</p>
-        <div id="resetPasswordMsg" style="display:none;margin-bottom:12px;padding:8px 10px;border-radius:8px;font-size:12px;font-weight:700;"></div>
+      <details class="update-card section-panel">
+        <summary><span>Reset client access<small>Issue a one-time password reset code</small></span></summary>
+        <div class="section-body">
+        <p style="color:#666;font-size:12px;margin-bottom:12px;">Passwords and recovery codes are stored hashed and can't be read from the sheet. Resetting invalidates the old password and recovery code and gives you a one-time reset code to send with the exact username; the client then chooses a new password using "Forgot Password?". "Create Account" also accepts this code.</p>
+        <div id="resetPasswordMsg" role="status" style="display:none;margin-bottom:12px;padding:8px 10px;border-radius:8px;font-size:12px;font-weight:700;"></div>
         <label class="ac-label" for="rpClientSelect">Client</label>
         <select id="rpClientSelect" style="width:100%;padding:10px 12px;border:1px solid #dfe7f1;border-radius:8px;margin-bottom:12px;">
           <option value="">— Choose a client —</option>
         </select>
         <button type="button" class="btn-set" onclick="resetClientPasswordPrompt()">Reset Password</button>
+        </div>
+      </details>
+    </div>
+
+    <div id="page-help" class="page content" style="display:none;">
+      <header class="page-heading help-heading">
+        <div>
+          <h2>Help &amp; FAQ</h2>
+          <p>Answers to common questions about your inventory portal.</p>
+        </div>
+        <button type="button" class="help-tour-btn" id="replayTourBtn" onclick="startOnboardingTour()">
+          <span aria-hidden="true">▶</span> Replay guided tour
+        </button>
+      </header>
+      <div class="update-card help-card">
+        <label for="faqSearch" class="help-search-label">Search questions</label>
+        <input type="search" id="faqSearch" class="ac-input" placeholder="e.g. password, add item, activity..." autocomplete="off" oninput="filterFaq()" aria-describedby="faqCount" />
+        <p class="faq-count" id="faqCount" role="status" aria-live="polite"></p>
+        <div class="faq-list" id="faqList">
+          <details class="faq-item" data-keywords="new item create sku product add inventory">
+            <summary>How do I add a new inventory item?</summary>
+            <div class="faq-answer">
+              <p>Open the <strong>Add item</strong> tab, enter the product title and starting quantity (the SKU is optional), fill in any extra fields for your account, then select <strong>Add</strong>.</p>
+              <p>If you don't see an Add item tab, your account is view-only or PIN-protected. Message the ECL team in <strong>Chat</strong> and they can add it for you.</p>
+            </div>
+          </details>
+          <details class="faq-item" data-keywords="update quantity adjust received shipped edit stock count pin">
+            <summary>How do I update quantities or shipment progress?</summary>
+            <div class="faq-answer">
+              <p>Open <strong>Updates</strong>, search for the item by SKU or product name, and select it. You can then:</p>
+              <ul>
+                <li>Enter quantities received and shipped under <strong>Received &amp; shipped</strong>.</li>
+                <li>Use <strong>+ Add</strong> / <strong>− Remove</strong> for quick adjustments.</li>
+                <li>Open <strong>Set exact quantity</strong> to replace the on-hand count.</li>
+              </ul>
+              <p>Some accounts ask for a PIN before changes can be made.</p>
+            </div>
+          </details>
+          <details class="faq-item" data-keywords="search filter find dashboard inventory status sort">
+            <summary>How do I find or filter items on my dashboard?</summary>
+            <div class="faq-answer">
+              <p>Type a SKU or product name in the dashboard search box — results update as you type. Select <strong>Filters</strong> to narrow the list by status, such as low stock or partially shipped.</p>
+            </div>
+          </details>
+          <details class="faq-item" data-keywords="status badge meaning low stock out of stock not received partially fully shipped">
+            <summary>What do the status labels mean?</summary>
+            <div class="faq-answer">
+              <p><strong>In Stock</strong>, <strong>Low Stock</strong>, and <strong>Out of Stock</strong> describe items counted on hand. For shipment-tracked items, <strong>Not Received</strong> means nothing has arrived yet, <strong>Partially Shipped</strong> means some units have shipped out, and <strong>Fully Shipped</strong> means everything received has shipped.</p>
+            </div>
+          </details>
+          <details class="faq-item" data-keywords="activity log history audit changes who when record">
+            <summary>Where can I see a history of changes?</summary>
+            <div class="faq-answer">
+              <p>Open the <strong>Activity</strong> tab. Each row shows the timestamp, action, user, and details, with the most recent first. Use the filter box to search any column; the list refreshes automatically while it's open.</p>
+            </div>
+          </details>
+          <details class="faq-item" data-keywords="password reset forgot change recovery code sign in login">
+            <summary>How do I reset or change my password?</summary>
+            <div class="faq-answer">
+              <p>Sign out, then select <strong>Forgot Password?</strong> on the sign-in screen. Enter your username, your recovery code, and a new password.</p>
+              <p>You'll receive a new recovery code afterwards — save it somewhere safe, because the old one stops working.</p>
+            </div>
+          </details>
+          <details class="faq-item" data-keywords="lost recovery code reset code admin locked out forgot">
+            <summary>I lost my recovery code. What should I do?</summary>
+            <div class="faq-answer">
+              <p>Contact ECL through <strong>Chat</strong>, at <a href="mailto:eclsupport@electriccitylogistics.com">eclsupport@electriccitylogistics.com</a>, or at (406) 948-2719. We'll send you a one-time reset code to use in place of your recovery code on the <strong>Forgot Password?</strong> screen.</p>
+            </div>
+          </details>
+          <details class="faq-item" data-keywords="chat message contact support files drive folder upload">
+            <summary>How do I contact the ECL team or share files?</summary>
+            <div class="faq-answer">
+              <p>Use the <strong>Chat</strong> tab to message the team directly. The chat page also links to your shared Drive folder for documents and labels. The bell icon at the top shows unread replies and inventory updates.</p>
+            </div>
+          </details>
+          <details class="faq-item" data-keywords="billing invoice charges estimate cost month">
+            <summary>Where can I see my billing?</summary>
+            <div class="faq-answer">
+              <p>If billing is enabled for your account, the <strong>Billing</strong> tab shows this month's charges and an end-of-month estimate. If you don't see it, ask the ECL team to turn it on.</p>
+            </div>
+          </details>
+          <details class="faq-item" data-keywords="signed out session expired logged out security timeout">
+            <summary>Why was I signed out?</summary>
+            <div class="faq-answer">
+              <p>For security, sessions expire after a set time. Sign in again to continue — your data is unaffected.</p>
+            </div>
+          </details>
+        </div>
+        <div class="faq-empty" id="faqEmpty" hidden>
+          <p><strong>No questions match your search.</strong></p>
+          <p>Try a different word, or message us in <strong>Chat</strong> and we'll help.</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="tour-overlay" id="tourOverlay" hidden>
+      <div class="tour-spotlight" id="tourSpotlight" aria-hidden="true"></div>
+      <div class="tour-card" id="tourCard" role="dialog" aria-modal="true" aria-labelledby="tourTitle" aria-describedby="tourBody">
+        <p class="tour-step" id="tourStep"></p>
+        <h3 class="tour-title" id="tourTitle"></h3>
+        <p class="tour-body" id="tourBody"></p>
+        <div class="tour-progress" id="tourProgress" aria-hidden="true"></div>
+        <div class="tour-actions">
+          <button type="button" class="tour-btn tour-skip" id="tourSkip" onclick="skipOnboardingTour()">Skip tour</button>
+          <div class="tour-nav">
+            <button type="button" class="tour-btn tour-back" id="tourBack" onclick="moveOnboardingTour(-1)">Back</button>
+            <button type="button" class="tour-btn tour-next" id="tourNext" onclick="moveOnboardingTour(1)">Next</button>
+            <button type="button" class="tour-btn tour-next" id="tourFinish" onclick="finishOnboardingTour()" hidden>Finish</button>
+          </div>
+        </div>
       </div>
     </div>
 
@@ -618,6 +780,6 @@
     <div class="footer">Electric City Logistics LLC &nbsp;|&nbsp; eclsupport@electriccitylogistics.com &nbsp;|&nbsp; (406)-948-2719</div>
     <div class="toast" id="toast"></div>
 
-    <script src="app.js"></script>
+    <script src="app.js?v=20261015f"></script>
   </body>
 </html>

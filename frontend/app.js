@@ -1,61 +1,40 @@
-const API_URL = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
-  ? 'http://localhost:3001/api/inventory'
-  : '/api/inventory';
+// Same-origin when Express serves the page (any port); only standalone static previews
+// (file:// or Live Server) need to reach the local API server on port 3001.
+const API_BASE = (() => {
+  const { protocol, hostname, port } = window.location;
+  const isLocalHost = hostname === 'localhost' || hostname === '127.0.0.1';
+  const isStaticPreview = protocol === 'file:' || (isLocalHost && ['5500', '5501'].includes(port));
+  return isStaticPreview ? 'http://localhost:3001' : '';
+})();
 
-const LOGIN_URL = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
-  ? 'http://localhost:3001/api/login'
-  : '/api/login';
+const API_URL = `${API_BASE}/api/inventory`;
 
-const CLIENTS_URL = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
-  ? 'http://localhost:3001/api/clients'
-  : '/api/clients';
+const LOGIN_URL = `${API_BASE}/api/login`;
 
-const CHAT_URL = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
-  ? 'http://localhost:3001/api/chat'
-  : '/api/chat';
+const CLIENTS_URL = `${API_BASE}/api/clients`;
 
-const CREATE_ITEM_URL = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
-  ? 'http://localhost:3001/api/inventory/create'
-  : '/api/inventory/create';
+const CHAT_URL = `${API_BASE}/api/chat`;
 
-const CLIENT_PROFILE_URL = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
-  ? 'http://localhost:3001/api/client-profile'
-  : '/api/client-profile';
+const CREATE_ITEM_URL = `${API_BASE}/api/inventory/create`;
 
-const ADMIN_CLIENTS_URL = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
-  ? 'http://localhost:3001/api/admin/clients'
-  : '/api/admin/clients';
+const CLIENT_PROFILE_URL = `${API_BASE}/api/client-profile`;
 
-const ACTIVATE_ACCOUNT_URL = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
-  ? 'http://localhost:3001/api/account/activate'
-  : '/api/account/activate';
+const ADMIN_CLIENTS_URL = `${API_BASE}/api/admin/clients`;
 
-const RECOVER_ACCOUNT_URL = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
-  ? 'http://localhost:3001/api/account/recover'
-  : '/api/account/recover';
+const ACTIVATE_ACCOUNT_URL = `${API_BASE}/api/account/activate`;
 
-const NOTIFICATIONS_URL = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
-  ? 'http://localhost:3001/api/notifications'
-  : '/api/notifications';
+const RECOVER_ACCOUNT_URL = `${API_BASE}/api/account/recover`;
 
-const UPDATE_QUANTITY_URL = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
-  ? 'http://localhost:3001/api/inventory/quantity'
-  : '/api/inventory/quantity';
-const QUICK_EDIT_UNLOCK_URL = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
-  ? 'http://localhost:3001/api/quick-edit/unlock'
-  : '/api/quick-edit/unlock';
-const UPDATE_SHIPMENT_URL = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
-  ? 'http://localhost:3001/api/inventory/shipment'
-  : '/api/inventory/shipment';
-const UPDATE_ITEM_URL = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
-  ? 'http://localhost:3001/api/inventory/item'
-  : '/api/inventory/item';
-const BILLING_URL = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
-  ? 'http://localhost:3001/api/billing/summary'
-  : '/api/billing/summary';
-const ADMIN_BILLING_URL = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
-  ? 'http://localhost:3001/api/admin/billing'
-  : '/api/admin/billing';
+const NOTIFICATIONS_URL = `${API_BASE}/api/notifications`;
+
+const ACTIVITY_URL = `${API_BASE}/api/activity`;
+
+const UPDATE_QUANTITY_URL = `${API_BASE}/api/inventory/quantity`;
+const QUICK_EDIT_UNLOCK_URL = `${API_BASE}/api/quick-edit/unlock`;
+const UPDATE_SHIPMENT_URL = `${API_BASE}/api/inventory/shipment`;
+const UPDATE_ITEM_URL = `${API_BASE}/api/inventory/item`;
+const BILLING_URL = `${API_BASE}/api/billing/summary`;
+const ADMIN_BILLING_URL = `${API_BASE}/api/admin/billing`;
 
 const defaultInventory = [];
 
@@ -262,12 +241,14 @@ const state = {
   newClientFields: [],
   editClientId: '',
   editClientFields: [],
+  activity: { clientId: null, entries: null, loading: false, error: '' },
   notifications: { chat: 0, inventory: 0, total: 0, items: [] }
 };
 
 let chatRequestId = 0;
 let inventoryRequestId = 0;
 let notificationRequestId = 0;
+let activityRequestId = 0;
 let chatSignature = null;
 let inventorySignature = null;
 let syncGeneration = 0;
@@ -293,9 +274,9 @@ function cacheClientView(clientId, values) {
   if (!clientId) return;
   clientViewCache.set(clientId, { ...(clientViewCache.get(clientId) || {}), ...values });
 }
-const syncTimers = { chat: null, inventory: null, notifications: null, billing: null };
-const syncFailures = { chat: 0, inventory: 0, notifications: 0, billing: 0 };
-const syncIntervals = { chat: 12000, inventory: 30000, notifications: 60000, billing: 30000 };
+const syncTimers = { chat: null, inventory: null, notifications: null, billing: null, activity: null };
+const syncFailures = { chat: 0, inventory: 0, notifications: 0, billing: 0, activity: 0 };
+const syncIntervals = { chat: 12000, inventory: 30000, notifications: 60000, billing: 30000, activity: 30000 };
 // Every open tab shares the same Google Sheets read allowance, so idle tabs stop polling until used again.
 const IDLE_PAUSE_MS = 5 * 60 * 1000;
 let lastInteractionAt = Date.now();
@@ -335,6 +316,7 @@ function scheduleBackgroundSync(kind, delay, generation = syncGeneration) {
     }
     if (kind === 'chat' && !document.getElementById('page-chat')?.classList.contains('active')) return;
     if (kind === 'billing' && !isPageActive('page-billing')) return;
+    if (kind === 'activity' && !isPageActive('page-logs')) return;
 
     const clientId = state.activeClientId;
     let status = 0;
@@ -342,7 +324,8 @@ function scheduleBackgroundSync(kind, delay, generation = syncGeneration) {
     try {
       status = kind === 'chat' ? await loadChatMessages(clientId)
         : kind === 'billing' ? await loadBillingSummary(clientId)
-          : kind === 'inventory' ? await fetchInventory(clientId) : await fetchNotifications(clientId);
+          : kind === 'activity' ? await loadActivity(clientId)
+            : kind === 'inventory' ? await fetchInventory(clientId) : await fetchNotifications(clientId);
     } catch (error) {
       console.error(`Background ${kind} refresh failed:`, error);
     }
@@ -369,6 +352,9 @@ function startBackgroundSync(immediate = false) {
   }
   if (isPageActive('page-billing')) {
     scheduleBackgroundSync('billing', immediate ? 500 : syncIntervals.billing);
+  }
+  if (isPageActive('page-logs')) {
+    scheduleBackgroundSync('activity', immediate ? 0 : syncIntervals.activity);
   }
 }
 
@@ -544,7 +530,10 @@ function setPage(pageId) {
   });
 
   const tabs = document.querySelectorAll('.tab');
-  tabs.forEach((tab) => tab.classList.remove('active'));
+  tabs.forEach((tab) => {
+    tab.classList.remove('active');
+    tab.removeAttribute('aria-current');
+  });
 
   const tabMap = {
     'page-dashboard': 0,
@@ -553,14 +542,23 @@ function setPage(pageId) {
     'page-logs': 3,
     'page-chat': 4,
     'page-billing': 5,
-    'page-clients': 6
+    'page-clients': 6,
+    'page-help': 7
   };
 
   const tabIndex = tabMap[pageId];
   if (tabIndex !== undefined && tabs[tabIndex]) {
     tabs[tabIndex].classList.add('active');
+    tabs[tabIndex].setAttribute('aria-current', 'page');
   }
   if (state.auth && !document.hidden) {
+    if (pageId === 'page-logs') {
+      renderLogs();
+      scheduleBackgroundSync('activity', 0);
+    } else {
+      clearTimeout(syncTimers.activity);
+      syncTimers.activity = null;
+    }
     if (pageId === 'page-chat') scheduleBackgroundSync('chat', 0);
     else {
       clearTimeout(syncTimers.chat);
@@ -583,7 +581,8 @@ function showPage(pageName, markChatRead = true) {
     logs: 'page-logs',
     chat: 'page-chat',
     billing: 'page-billing',
-    clients: 'page-clients'
+    clients: 'page-clients',
+    help: 'page-help'
   };
 
   const targetPage = routeMap[pageName] || pageName;
@@ -763,6 +762,15 @@ function getItemAttributes(item, profile = state.clientProfile, now = Date.now()
   return attributes;
 }
 
+const inventoryMarkup = new WeakMap();
+
+function updateInventoryMarkup(element, markup) {
+  if (!element || inventoryMarkup.get(element) === markup) return false;
+  element.innerHTML = markup;
+  inventoryMarkup.set(element, markup);
+  return true;
+}
+
 function renderFilterControls(resultCount = getFilteredItems().length) {
   const filters = state.filters || emptyFilters();
   const selected = FILTER_GROUPS.flatMap((group) => group.options
@@ -772,16 +780,16 @@ function renderFilterControls(resultCount = getFilteredItems().length) {
   const host = document.getElementById('filterGroups');
   if (host) {
     const focused = document.activeElement?.dataset?.key ? `${document.activeElement.dataset.group}:${document.activeElement.dataset.key}` : '';
-    host.innerHTML = FILTER_GROUPS.map((group) => `
+    const changed = updateInventoryMarkup(host, FILTER_GROUPS.map((group) => `
       <div class="filter-section" role="group" aria-label="${group.label}">
         <div class="filter-section-title">${group.label}</div>
         <div class="filter-options">
           ${group.options.map(([key, label]) => `<button class="filter-option" type="button" aria-pressed="${filters[group.key].includes(key)}" data-action="toggle-filter" data-group="${group.key}" data-key="${key}">${label}</button>`).join('')}
         </div>
       </div>
-    `).join('');
+    `).join(''));
     // Re-rendering replaces the buttons, so keep keyboard focus on the option that was toggled.
-    if (focused) {
+    if (changed && focused) {
       const [groupKey, optionKey] = focused.split(':');
       host.querySelector(`[data-group="${groupKey}"][data-key="${optionKey}"]`)?.focus();
     }
@@ -789,10 +797,10 @@ function renderFilterControls(resultCount = getFilteredItems().length) {
 
   const chips = document.getElementById('activeFilters');
   if (chips) {
-    chips.innerHTML = selected.length
+    updateInventoryMarkup(chips, selected.length
       ? selected.map((entry) => `<button class="active-filter-chip" type="button" data-action="toggle-filter" data-group="${entry.group}" data-key="${entry.key}" aria-label="Remove filter ${entry.label}">${entry.label} <span aria-hidden="true">✕</span></button>`).join('')
         + '<button class="active-filter-clear" type="button" data-action="clear-filters">Clear</button>'
-      : '';
+      : '');
   }
 
   const count = document.getElementById('filterCount');
@@ -839,13 +847,16 @@ function updateSummary() {
   const partialEl = document.getElementById('s-partial');
   const partialCard = document.getElementById('s-partial-card');
   const outEl = document.getElementById('s-out');
+  const counts = { fully: 0, partial: 0, not: 0, low: 0, out: 0 };
+  for (const item of state.items) {
+    const status = getItemStatus(item);
+    if (Object.hasOwn(counts, status)) counts[status] += 1;
+  }
 
   if (totalEl) totalEl.textContent = total;
 
   if (config.mode === 'shipping') {
-    const fully = state.items.filter((item) => getItemStatus(item) === 'fully').length;
-    const partial = state.items.filter((item) => getItemStatus(item) === 'partial').length;
-    const not = state.items.filter((item) => getItemStatus(item) === 'not').length;
+    const { fully, partial, not } = counts;
 
     if (lowEl) {
       lowEl.textContent = fully;
@@ -862,8 +873,7 @@ function updateSummary() {
     }
   } else {
     if (partialCard) partialCard.style.display = 'none';
-    const low = state.items.filter((item) => getItemStatus(item) === 'low').length;
-    const out = state.items.filter((item) => getItemStatus(item) === 'out').length;
+    const { low, out } = counts;
 
     if (lowEl) lowEl.textContent = low;
     if (outEl) outEl.textContent = out;
@@ -881,8 +891,7 @@ function getFilteredItems() {
 
   // OR within a group, AND across groups; an empty group doesn't filter.
   return state.items.filter((item) => {
-    const text = `${item.sku || ''} ${item.title || ''} ${item.category || ''} ${item.location || ''}`.toLowerCase();
-    if (query && !text.includes(query)) return false;
+    if (query && !`${item.sku || ''} ${item.title || ''} ${item.category || ''} ${item.location || ''}`.toLowerCase().includes(query)) return false;
     if (filters.stock.length && !filters.stock.includes(getStockLevel(item))) return false;
     if (filters.stage.length && !filters.stage.includes(getFulfillmentStage(item))) return false;
     if (filters.attr.length) {
@@ -902,10 +911,10 @@ function syncDashboardColumns() {
       ? profile.dashboardColumns
       : ['PRODUCT TITLE', 'QTY', 'STATUS', 'EDIT'];
 
-    headerRow.innerHTML = columns.map((label) => {
+    updateInventoryMarkup(headerRow, columns.map((label) => {
       const centered = ['QTY', 'STATUS', 'EDIT'].includes(label);
       return `<th${centered ? ' class="center"' : ''}>${label}</th>`;
-    }).join('');
+    }).join(''));
   }
 
   scheduleTableScrollUpdate();
@@ -960,19 +969,19 @@ function renderTable() {
   const showQty = !(profile && profile.hideQtyColumn);
   const showEdit = !(profile && (profile.readOnly || profile.hideQuickEdit));
   const columnCount = (profile && profile.dashboardColumns && profile.dashboardColumns.length) || (2 + fields.length);
+  const metaFields = dashboardFieldKeys.length ? [] : fields.slice(0, 2);
 
   if (!items.length) {
-    inventoryBody.innerHTML = `<tr><td colspan="${columnCount}" class="no-results">No items match your filters.</td></tr>`;
+    updateInventoryMarkup(inventoryBody, `<tr><td colspan="${columnCount}" class="no-results">No items match your filters.</td></tr>`);
     return;
   }
 
-  inventoryBody.innerHTML = items.map((item) => {
+  updateInventoryMarkup(inventoryBody, items.map((item) => {
     const status = getItemStatus(item);
     const badgeClass = getStatusBadgeClass(status);
 
     // Clients whose custom fields aren't broken out into their own dashboard columns
     // (e.g. CL-003's tracking/carrier) still get a quick summary under the title.
-    const metaFields = dashboardFieldKeys.length ? [] : fields.slice(0, 2);
     const metaText = metaFields.length
       ? `<div style="font-size:10px;color:#64748b;margin-top:4px;">${metaFields.map((field) => `${field.label}: ${item[field.key] || '—'}`).join(' • ')}</div>`
       : '';
@@ -997,7 +1006,18 @@ function renderTable() {
         ${editCell}
       </tr>
     `;
-  }).join('');
+  }).join(''));
+}
+
+let inventorySearchFrame = null;
+
+function scheduleInventorySearch() {
+  if (inventorySearchFrame !== null) return;
+  const nextFrame = typeof requestAnimationFrame === 'function' ? requestAnimationFrame : (callback) => setTimeout(callback, 16);
+  inventorySearchFrame = nextFrame(() => {
+    inventorySearchFrame = null;
+    renderTable();
+  });
 }
 
 function renderChatMessages() {
@@ -1151,14 +1171,17 @@ function finishActivateAccount() {
   showAuthScreen('login');
 }
 
+let recoverySubmitting = false;
+
 async function submitRecoverAccount() {
+  if (recoverySubmitting) return;
   const username = String(document.getElementById('recoverUsername')?.value || '').trim();
   const recoveryCode = String(document.getElementById('recoverCode')?.value || '').trim();
   const newPassword = String(document.getElementById('recoverPassword')?.value || '');
   const confirmPassword = String(document.getElementById('recoverPasswordConfirm')?.value || '');
 
   if (!username || !recoveryCode || !newPassword) {
-    showAuthError('recoverErrorMsg', 'Fill in your username, recovery code, and a new password.');
+    showAuthError('recoverErrorMsg', 'Fill in your username, recovery or administrator-issued reset code, and a new password.');
     return;
   }
   if (newPassword.length < 8) {
@@ -1170,23 +1193,52 @@ async function submitRecoverAccount() {
     return;
   }
 
+  recoverySubmitting = true;
+  const submitButton = document.getElementById('recoverSubmit');
+  if (submitButton) submitButton.disabled = true;
+  const errorElement = document.getElementById('recoverErrorMsg');
+  if (errorElement) {
+    errorElement.textContent = '';
+    errorElement.style.display = 'none';
+  }
   try {
     const response = await fetch(RECOVER_ACCOUNT_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ username, recoveryCode, newPassword })
     });
-    const result = await response.json().catch(() => ({ success: false }));
-    if (!response.ok || !result.success) {
-      throw new Error(result.error || 'Unable to reset password.');
+    let result;
+    try {
+      result = await response.json();
+    } catch (error) {
+      throw new Error(response.status === 429
+        ? 'Too many attempts. Please wait a few minutes and try again.'
+        : 'The reset service returned an unreadable response. Please try again later.');
+    }
+    if (!response.ok || !result || result.success !== true) {
+      throw new Error(result?.error || (response.status === 429
+        ? 'Too many attempts. Please wait a few minutes and try again.'
+        : 'Unable to reset password. Please try again later.'));
+    }
+    if (typeof result.recoveryCode !== 'string' || !result.recoveryCode.trim()) {
+      throw new Error('The reset response did not include a new recovery code. Contact support before trying again.');
     }
 
     document.getElementById('recoverFormFields').style.display = 'none';
     document.getElementById('recoverSuccessPanel').style.display = 'block';
     document.getElementById('recoverRecoveryCode').textContent = result.recoveryCode;
+    ['recoverCode', 'recoverPassword', 'recoverPasswordConfirm'].forEach((id) => {
+      const el = document.getElementById(id);
+      if (el) el.value = '';
+    });
     if (portalUser) portalUser.value = username;
   } catch (error) {
-    showAuthError('recoverErrorMsg', error.message || 'Unable to reset password.');
+    showAuthError('recoverErrorMsg', error instanceof TypeError
+      ? 'Unable to reach the reset service. Check your connection and try again.'
+      : error.message || 'Unable to reset password.');
+  } finally {
+    recoverySubmitting = false;
+    if (submitButton) submitButton.disabled = false;
   }
 }
 
@@ -1216,16 +1268,16 @@ async function fetchInventory(clientId = state.activeClientId || state.session?.
 
     const result = await response.json();
     if (Array.isArray(result)) {
-      cacheClientView(targetClientId, {
-        items: result.map((item) => normalizeInventoryItem(item, targetClientId)),
-        itemsSignature: JSON.stringify(result)
-      });
-    }
-    if (requestId === inventoryRequestId && state.auth && state.session === session && state.activeClientId === targetClientId && Array.isArray(result)) {
       const signature = JSON.stringify(result);
-      if (signature !== inventorySignature) {
+      const current = requestId === inventoryRequestId && state.auth && state.session === session && state.activeClientId === targetClientId;
+      const cached = clientViewCache.get(targetClientId);
+      const changed = current && signature !== inventorySignature;
+      const items = !changed && cached?.itemsSignature === signature
+        ? cached.items : result.map((item) => normalizeInventoryItem(item, targetClientId));
+      cacheClientView(targetClientId, { items, itemsSignature: signature });
+      if (changed) {
         inventorySignature = signature;
-        state.items = result.map((item) => normalizeInventoryItem(item, targetClientId));
+        state.items = items;
         updateSummary();
         renderTable();
       }
@@ -1308,6 +1360,42 @@ function renderClientHeader() {
     const role = state.session?.role || (state.isAdmin ? 'admin' : 'client');
     identity.textContent = `${clientLabel || clientId || 'Client'} (${role})`;
   }
+
+  renderWelcomeBanner(clientLabel || clientId || 'Client');
+}
+
+function getTimeOfDayGreeting(date = new Date()) {
+  const hour = date.getHours();
+  if (hour < 12) return 'Good morning';
+  if (hour < 17) return 'Good afternoon';
+  return 'Good evening';
+}
+
+function renderWelcomeBanner(clientLabel) {
+  const banner = document.getElementById('welcomeBanner');
+  if (!banner) return;
+  const set = (id, text) => {
+    const el = document.getElementById(id);
+    if (el) el.textContent = text;
+  };
+  if (!state.session) {
+    banner.classList.remove('is-personalized');
+    set('welcomeGreeting', 'Welcome');
+    set('welcomeTitle', 'Inventory overview');
+    set('welcomeSubtitle', 'Stock levels, fulfillment progress, and quick actions in one place.');
+    set('welcomeDate', '');
+    return;
+  }
+  const now = new Date();
+  const viewingOwnAccount = !state.isAdmin
+    || String(state.activeClientId || '').toUpperCase() === String(state.session.clientId || '').toUpperCase();
+  banner.classList.add('is-personalized');
+  set('welcomeGreeting', getTimeOfDayGreeting(now));
+  set('welcomeTitle', state.isAdmin ? 'Welcome back, Admin' : `Welcome back, ${clientLabel}`);
+  set('welcomeSubtitle', state.isAdmin && !viewingOwnAccount
+    ? `You're viewing ${clientLabel}'s inventory, fulfillment progress, and quick actions.`
+    : "Here's your inventory overview — stock levels, fulfillment progress, and quick actions in one place.");
+  set('welcomeDate', now.toLocaleDateString(undefined, { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' }));
 }
 
 function renderDriveFolderLink() {
@@ -1465,11 +1553,13 @@ function switchClientView(clientId) {
   stopBackgroundSync();
   resetViewRequests();
   notificationRequestId += 1;
+  activityRequestId += 1;
   inventoryRequestId += 1;
   chatRequestId += 1;
 
   const cached = clientViewCache.get(nextClientId) || {};
   state.activeClientId = nextClientId;
+  state.activity = { clientId: null, entries: null, loading: false, error: '' };
   state.filters = emptyFilters();
   state.quickEditUnlock = null;
   state.billing = null;
@@ -1519,6 +1609,7 @@ function switchClientView(clientId) {
           renderTable();
         }),
         fetchInventory(nextClientId),
+        isPageActive('page-logs') ? loadActivity(nextClientId) : null,
         chatOpen ? loadChatMessages(nextClientId) : null,
         isPageActive('page-billing') ? loadBillingSummary(nextClientId) : null
       ]);
@@ -1567,7 +1658,7 @@ async function executePortalAuth() {
 }
 
 const SAVED_SESSION_KEY = 'eclPortalSession';
-const RESTORABLE_PAGES = ['page-dashboard', 'page-logs', 'page-chat', 'page-billing', 'page-clients'];
+const RESTORABLE_PAGES = ['page-dashboard', 'page-logs', 'page-chat', 'page-billing', 'page-clients', 'page-help'];
 
 function readTokenExpiry(token) {
   try {
@@ -1663,6 +1754,7 @@ async function startSession(result, saved = null) {
     && (page !== 'page-billing' || billingTab?.style.display !== 'none');
   if (allowed && page !== 'page-dashboard') showPage(page.replace('page-', ''));
   saveSession();
+  maybeStartOnboarding();
 }
 
 async function restoreSavedSession() {
@@ -1677,6 +1769,7 @@ async function restoreSavedSession() {
 
 function executePortalLogout(message = '') {
   clearSavedSession();
+  closeOnboardingTour({ markSeen: false, restorePage: false });
   stopBackgroundSync();
   resetViewRequests();
   clearTimeout(switchTimer);
@@ -1685,6 +1778,7 @@ function executePortalLogout(message = '') {
   chatRequestId += 1;
   inventoryRequestId += 1;
   notificationRequestId += 1;
+  activityRequestId += 1;
   chatSignature = null;
   inventorySignature = null;
   state.auth = false;
@@ -1692,6 +1786,8 @@ function executePortalLogout(message = '') {
   state.isAdmin = false;
   state.roster = [];
   state.activeClientId = null;
+  state.activity = { clientId: null, entries: null, loading: false, error: '' };
+  renderLogs();
   state.selectedItemId = null;
   state.pinUnlocked = false;
   state.quickEditUnlock = null;
@@ -1721,6 +1817,7 @@ function executePortalLogout(message = '') {
   if (tabClients) tabClients.style.display = 'none';
   const header = document.getElementById('activeClientHeader');
   if (header) header.textContent = 'CLIENT: —';
+  renderWelcomeBanner();
   if (document.getElementById('displayIdentity')) {
     document.getElementById('displayIdentity').textContent = '—';
   }
@@ -1859,21 +1956,363 @@ function goToLogs() {
   renderLogs();
 }
 
-// Re-run from renderTable so the log always reflects the client currently selected.
+// ---- First-time guided tour ----
+const ONBOARDING_KEY = 'has_seen_onboarding';
+const ONBOARDING_STEPS = [
+  {
+    title: 'Welcome to your ECL portal',
+    body: 'This quick tour shows where everything is and takes under a minute. You can skip it now and replay it any time from the Help tab.'
+  },
+  {
+    page: 'page-dashboard',
+    target: '#mainTabs',
+    title: 'Move between sections',
+    body: 'Use these tabs to switch between your inventory, updates, activity history, chat with the ECL team, and help.'
+  },
+  {
+    page: 'page-dashboard',
+    target: '#page-dashboard .table-shell',
+    title: 'Your inventory at a glance',
+    body: 'Every item and its status lives here. Search by SKU or product name, or use Filters to narrow the list.'
+  },
+  {
+    page: 'page-logs',
+    target: '#logTableWrap',
+    title: 'Track every change',
+    body: 'The Activity tab records each inventory change with the time, action, who made it, and details. Filter it by any column for quick audits.'
+  },
+  {
+    page: 'page-dashboard',
+    target: '.header-right',
+    title: 'Your account & password',
+    body: 'Your account name and Sign Out live here. To change your password, sign out and choose "Forgot Password?" on the sign-in screen with your recovery code.'
+  },
+  {
+    page: 'page-dashboard',
+    target: '#tabHelp',
+    title: 'Help is always here',
+    body: 'Find answers to common questions in Help, and replay this tour whenever you like.'
+  }
+];
+const tourState = { active: false, index: 0, returnPage: 'page-dashboard', lastFocus: null, frame: 0, observer: null };
+
+// When storage is blocked, treat the tour as seen so it doesn't reappear on every sign-in.
+function hasSeenOnboarding() {
+  try {
+    return localStorage.getItem(ONBOARDING_KEY) === 'true';
+  } catch (error) {
+    return true;
+  }
+}
+
+function markOnboardingSeen() {
+  try {
+    localStorage.setItem(ONBOARDING_KEY, 'true');
+  } catch (error) {
+    // Ignore storage failures.
+  }
+}
+
+function maybeStartOnboarding() {
+  if (!state.auth || state.isAdmin || hasSeenOnboarding()) return false;
+  startOnboardingTour({ returnPage: 'page-dashboard' });
+  return true;
+}
+
+function startOnboardingTour(options = {}) {
+  const overlay = document.getElementById('tourOverlay');
+  if (!overlay || !state.auth) return;
+  const currentPage = document.querySelector('.page.active')?.id || 'page-dashboard';
+  tourState.active = true;
+  tourState.index = 0;
+  tourState.returnPage = options.returnPage || currentPage;
+  tourState.lastFocus = document.activeElement;
+  overlay.hidden = false;
+  document.body.classList.add('tour-open');
+  window.addEventListener('resize', scheduleTourPosition);
+  window.addEventListener('scroll', scheduleTourPosition, { passive: true });
+  renderOnboardingStep();
+}
+
+function showTourPage(pageId) {
+  if (!pageId || document.getElementById(pageId)?.classList.contains('active')) return;
+  if (pageId === 'page-logs') goToLogs();
+  else if (pageId === 'page-dashboard') goToDashboard();
+  else setPage(pageId);
+}
+
+function renderOnboardingStep() {
+  const step = ONBOARDING_STEPS[tourState.index];
+  if (!tourState.active || !step) return;
+  const total = ONBOARDING_STEPS.length;
+  const isFirst = tourState.index === 0;
+  const isLast = tourState.index === total - 1;
+  const set = (id, text) => {
+    const el = document.getElementById(id);
+    if (el) el.textContent = text;
+  };
+  set('tourStep', `Step ${tourState.index + 1} of ${total}`);
+  set('tourTitle', step.title);
+  set('tourBody', step.body);
+  const progress = document.getElementById('tourProgress');
+  if (progress) {
+    progress.innerHTML = ONBOARDING_STEPS.map((_, i) => `<span class="${i === tourState.index ? 'is-active' : i < tourState.index ? 'is-done' : ''}"></span>`).join('');
+  }
+  const back = document.getElementById('tourBack');
+  const next = document.getElementById('tourNext');
+  const finish = document.getElementById('tourFinish');
+  const skip = document.getElementById('tourSkip');
+  if (back) back.hidden = isFirst;
+  if (next) next.hidden = isLast;
+  if (finish) finish.hidden = !isLast;
+  if (skip) skip.hidden = isLast;
+
+  showTourPage(step.page);
+  const target = getTourTarget(step);
+  if (target) {
+    const rect = target.getBoundingClientRect();
+    if (rect.height > window.innerHeight * 0.55) {
+      window.scrollTo({ top: Math.max(0, window.scrollY + rect.top - 150), behavior: 'auto' });
+    } else if (rect.top < 120 || rect.bottom > window.innerHeight - 20) {
+      target.scrollIntoView({ block: 'center', behavior: 'auto' });
+    }
+  } else if (!step.target) {
+    window.scrollTo({ top: 0, behavior: 'auto' });
+  }
+  positionOnboardingTour();
+  observeTourTarget(target);
+  (isLast ? finish : next)?.focus();
+}
+
+// Async content (e.g. the activity log) can resize the highlighted area after the step renders.
+function observeTourTarget(target) {
+  tourState.observer?.disconnect();
+  tourState.observer = null;
+  if (!target || typeof ResizeObserver === 'undefined') return;
+  tourState.observer = new ResizeObserver(scheduleTourPosition);
+  tourState.observer.observe(target);
+}
+
+function getTourTarget(step) {
+  if (!step?.target) return null;
+  const target = document.querySelector(step.target);
+  return target && target.getClientRects().length ? target : null;
+}
+
+function scheduleTourPosition() {
+  if (!tourState.active || tourState.frame) return;
+  tourState.frame = requestAnimationFrame(() => {
+    tourState.frame = 0;
+    positionOnboardingTour();
+  });
+}
+
+function positionOnboardingTour() {
+  const overlay = document.getElementById('tourOverlay');
+  const spotlight = document.getElementById('tourSpotlight');
+  const card = document.getElementById('tourCard');
+  if (!tourState.active || !overlay || !spotlight || !card) return;
+  const target = getTourTarget(ONBOARDING_STEPS[tourState.index]);
+  card.style.top = '';
+  card.style.left = '';
+  if (!target) {
+    overlay.classList.add('is-centered');
+    spotlight.hidden = true;
+    return;
+  }
+  overlay.classList.remove('is-centered');
+  spotlight.hidden = false;
+  const pad = 6;
+  const viewW = window.innerWidth;
+  const viewH = window.innerHeight;
+  const rect = target.getBoundingClientRect();
+  const top = Math.max(rect.top - pad, 4);
+  const left = Math.max(rect.left - pad, 4);
+  const bottom = Math.min(rect.bottom + pad, viewH - 4);
+  const right = Math.min(rect.right + pad, viewW - 4);
+  Object.assign(spotlight.style, {
+    top: `${top}px`,
+    left: `${left}px`,
+    width: `${Math.max(right - left, 0)}px`,
+    height: `${Math.max(bottom - top, 0)}px`
+  });
+  // Small screens dock the card to the bottom via CSS.
+  if (viewW < 600) return;
+  const cardRect = card.getBoundingClientRect();
+  const gap = 14;
+  let cardTop;
+  if (viewH - bottom >= cardRect.height + gap + 8) cardTop = bottom + gap;
+  else if (top >= cardRect.height + gap + 8) cardTop = top - cardRect.height - gap;
+  else cardTop = viewH - cardRect.height - 16;
+  const cardLeft = Math.min(Math.max(left, 16), viewW - cardRect.width - 16);
+  card.style.top = `${Math.max(cardTop, 16)}px`;
+  card.style.left = `${Math.max(cardLeft, 16)}px`;
+}
+
+function moveOnboardingTour(delta) {
+  if (!tourState.active) return;
+  const nextIndex = tourState.index + delta;
+  if (nextIndex < 0 || nextIndex >= ONBOARDING_STEPS.length) return;
+  tourState.index = nextIndex;
+  renderOnboardingStep();
+}
+
+function skipOnboardingTour() {
+  closeOnboardingTour({ markSeen: true });
+}
+
+function finishOnboardingTour() {
+  closeOnboardingTour({ markSeen: true });
+  showToast("You're all set! Visit Help any time.", 'success');
+}
+
+function closeOnboardingTour({ markSeen = true, restorePage = true } = {}) {
+  if (!tourState.active) return;
+  tourState.active = false;
+  if (tourState.frame) cancelAnimationFrame(tourState.frame);
+  tourState.frame = 0;
+  tourState.observer?.disconnect();
+  tourState.observer = null;
+  window.removeEventListener('resize', scheduleTourPosition);
+  window.removeEventListener('scroll', scheduleTourPosition);
+  const overlay = document.getElementById('tourOverlay');
+  if (overlay) overlay.hidden = true;
+  document.body?.classList.remove('tour-open');
+  if (markSeen) markOnboardingSeen();
+  if (!restorePage) return;
+  showTourPage(tourState.returnPage);
+  const focusTarget = tourState.returnPage === 'page-help' ? document.getElementById('replayTourBtn') : tourState.lastFocus;
+  if (focusTarget && focusTarget.isConnected && focusTarget.getClientRects?.().length) focusTarget.focus();
+}
+
+document.addEventListener('keydown', (event) => {
+  if (!tourState.active) return;
+  if (event.key === 'Escape') {
+    event.preventDefault();
+    skipOnboardingTour();
+  } else if (event.key === 'ArrowRight') {
+    moveOnboardingTour(1);
+  } else if (event.key === 'ArrowLeft') {
+    moveOnboardingTour(-1);
+  } else if (event.key === 'Tab') {
+    const buttons = [...document.querySelectorAll('#tourCard button')].filter((button) => !button.hidden);
+    if (!buttons.length) return;
+    const index = buttons.indexOf(document.activeElement);
+    const nextIndex = event.shiftKey ? (index <= 0 ? buttons.length - 1 : index - 1) : (index + 1) % buttons.length;
+    event.preventDefault();
+    buttons[nextIndex].focus();
+  }
+});
+
+// ---- Help & FAQ ----
+function filterFaq() {
+  const input = document.getElementById('faqSearch');
+  const list = document.getElementById('faqList');
+  if (!input || !list) return;
+  const terms = String(input.value || '').toLowerCase().split(/\s+/).filter(Boolean);
+  const items = [...list.querySelectorAll('.faq-item')];
+  let shown = 0;
+  items.forEach((item) => {
+    const haystack = `${item.textContent} ${item.dataset.keywords || ''}`.toLowerCase();
+    const match = terms.every((term) => haystack.includes(term));
+    item.hidden = !match;
+    if (match) shown += 1;
+  });
+  const count = document.getElementById('faqCount');
+  if (count) {
+    count.textContent = terms.length
+      ? `${shown} of ${items.length} question${items.length === 1 ? '' : 's'} match`
+      : `${items.length} common questions`;
+  }
+  const empty = document.getElementById('faqEmpty');
+  if (empty) empty.hidden = shown > 0;
+  if (terms.length && shown === 1) items.find((item) => !item.hidden).open = true;
+}
+
+// One answer open at a time keeps the FAQ compact; toggle doesn't bubble, so listen in the capture phase.
+document.addEventListener('toggle', (event) => {
+  const item = event.target;
+  if (!item?.classList?.contains('faq-item') || !item.open) return;
+  item.parentElement?.querySelectorAll('.faq-item[open]').forEach((other) => {
+    if (other !== item) other.open = false;
+  });
+}, true);
+
+filterFaq();
+
+async function loadActivity(clientId = state.activeClientId) {
+  if (!state.auth || !state.session?.notificationToken) return 401;
+  const requestId = ++activityRequestId;
+  const session = state.session;
+  if (state.activity.clientId !== clientId) {
+    state.activity = { clientId, entries: null, loading: false, error: '' };
+  }
+  state.activity.loading = true;
+  state.activity.error = '';
+  renderLogs();
+  const isCurrent = () => requestId === activityRequestId && state.auth && state.session === session && state.activeClientId === clientId;
+  let status = 0;
+  try {
+    const response = await fetch(`${ACTIVITY_URL}?clientId=${encodeURIComponent(clientId || session.clientId)}`, {
+      headers: { Authorization: `Bearer ${session.notificationToken}`, Accept: 'application/json' },
+      signal: viewSignal()
+    });
+    status = response.status;
+    if (!response.ok) throw new Error(`Activity request failed (${status})`);
+    const entries = await response.json();
+    if (!Array.isArray(entries)) throw new Error('Invalid activity response');
+    if (isCurrent()) state.activity.entries = entries;
+    return 200;
+  } catch (error) {
+    if (error.name === 'AbortError' || !isCurrent()) return 0;
+    console.error('Activity fetch failed:', error);
+    state.activity.error = status === 401 ? 'Sign in again to view activity history.' : 'Unable to load activity history. Please retry.';
+    return status === 200 ? 0 : status;
+  } finally {
+    if (isCurrent()) {
+      state.activity.loading = false;
+      renderLogs();
+    }
+  }
+}
+
+function formatActivityTimestamp(timestamp) {
+  const date = new Date(timestamp);
+  return timestamp && Number.isFinite(date.getTime()) ? date.toLocaleString() : 'Not recorded';
+}
+
 function renderLogs() {
   if (!logTableWrap) return;
-  const value = (document.getElementById('logSearch')?.value || '').trim().toLowerCase();
-  const rows = getFilteredItems().filter((item) => !value || `${item.sku} ${item.title}`.toLowerCase().includes(value));
-  logTableWrap.innerHTML = rows.length
-    ? rows.map((item) => `
-        <div class="log-entry">
-          <span class="log-ts">${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
-          <span class="log-sku">${escapeHtml(item.sku || 'N/A')}</span>
-          <span class="log-desc">${escapeHtml(item.title || 'Inventory update')}</span>
-          <span class="log-change ${getItemStatus(item) === 'out' ? 'rem' : 'add'}">${getStatusText(getItemStatus(item))}</span>
-        </div>
-      `).join('')
-    : `<div class="no-results" style="padding:30px;">${value ? 'No matching log entries.' : 'No activity to display.'}</div>`;
+  const activity = state.activity;
+  const value = (logSearch?.value || '').trim().toLowerCase();
+  const entries = activity.clientId === state.activeClientId ? activity.entries || [] : [];
+  const rows = entries.filter((entry) => !value || [
+    entry.timestamp, formatActivityTimestamp(entry.timestamp), entry.action, entry.actorUsername, entry.description, entry.clientId
+  ].join(' ').toLowerCase().includes(value));
+  logTableWrap.setAttribute('aria-busy', String(activity.loading));
+  const notice = activity.error
+    ? `<div class="activity-notice" role="alert">${escapeHtml(activity.error)} <button type="button" class="btn-set" onclick="loadActivity()">Retry</button>${entries.length ? ' Showing previously loaded activity.' : ''}</div>`
+    : '';
+  const emptyMessage = activity.error ? 'Activity history is unavailable.'
+    : activity.loading || activity.entries === null ? 'Loading activity history...'
+      : value ? 'No matching log entries.' : 'No activity to display.';
+  logTableWrap.innerHTML = `${notice}
+    <table class="activity-table">
+      <caption class="activity-caption">Recorded inventory activity, newest first. Times are shown in your local time zone.</caption>
+      <thead><tr>
+        <th scope="col">Timestamp</th>
+        <th scope="col">Action</th>
+        <th scope="col">User</th>
+        <th scope="col">Details</th>
+      </tr></thead>
+      <tbody>${rows.length ? rows.map((entry) => `
+        <tr>
+          <td>${escapeHtml(formatActivityTimestamp(entry.timestamp))}</td>
+          <td>${escapeHtml(entry.action)}</td>
+          <td>${escapeHtml(entry.actorUsername || 'Not recorded')}</td>
+          <td>${state.isAdmin ? `<span class="activity-client">${escapeHtml(entry.clientId)}</span>` : ''}${escapeHtml(entry.description || 'No details recorded')}</td>
+        </tr>`).join('') : `<tr><td colspan="4" class="no-results" role="status">${emptyMessage}</td></tr>`}</tbody>
+    </table>`;
 }
 
 function insertEmoji(emoji) {
@@ -2358,7 +2797,7 @@ document.addEventListener('input', (event) => {
   const target = event.target;
   if (target === tableSearch) {
     state.query = tableSearch.value;
-    renderTable();
+    scheduleInventorySearch();
   }
   if (target === searchInput) {
     filterSearch();
@@ -2463,9 +2902,16 @@ function renderClientFieldRows() {
   host.innerHTML = state.newClientFields.map((field, index) => fieldRowHtml(field, index, handlers)).join('');
 }
 
+function revealContainingSections(element) {
+  for (let section = element.closest('details'); section; section = section.parentElement?.closest('details')) {
+    section.open = true;
+  }
+}
+
 function showAddClientMessage(text, type) {
   const el = document.getElementById('addClientMsg');
   if (!el) return;
+  revealContainingSections(el);
   el.style.display = 'block';
   el.style.background = type === 'error' ? '#fef2f2' : '#f0fdf4';
   el.style.color = type === 'error' ? '#b91c1c' : '#166534';
@@ -2671,6 +3117,7 @@ function renderEditClientFieldRows() {
 function showEditClientMessage(text, type) {
   const el = document.getElementById('editClientMsg');
   if (!el) return;
+  revealContainingSections(el);
   el.style.display = 'block';
   el.style.background = type === 'error' ? '#fef2f2' : '#f0fdf4';
   el.style.color = type === 'error' ? '#b91c1c' : '#166534';
@@ -2774,6 +3221,7 @@ function populateResetPasswordSelect() {
 function showResetPasswordMessage(text, type) {
   const el = document.getElementById('resetPasswordMsg');
   if (!el) return;
+  revealContainingSections(el);
   el.style.display = 'block';
   el.style.background = type === 'error' ? '#fef2f2' : '#f0fdf4';
   el.style.color = type === 'error' ? '#b91c1c' : '#166534';
@@ -2797,7 +3245,7 @@ async function resetClientPasswordPrompt() {
     if (!response.ok || !result.success) {
       throw new Error(result.error || 'Unable to reset password.');
     }
-    showResetPasswordMessage(`Password reset for ${result.username}. Send them this one-time activation code: ${result.activationCode}. They'll use "Create Account" on the sign-in screen to choose a new password.`, 'success');
+    showResetPasswordMessage(`Password reset for ${result.username}. Send them this one-time reset code: ${result.activationCode}. They'll use "Forgot Password?" on the sign-in screen with this exact username to choose a new password. "Create Account" also accepts this code.`, 'success');
   } catch (error) {
     showResetPasswordMessage(error.message || 'Unable to reset password.', 'error');
   }
