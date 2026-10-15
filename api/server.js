@@ -7,6 +7,7 @@ const { GoogleSpreadsheet } = require('google-spreadsheet');
 const { JWT } = require('google-auth-library');
 const { normalizeInventoryRow, getSheetNameForClient, isAdminClient, getChatSenderRole, getClientInventoryFields, getDashboardColumns, getCreateFormTitleConfig, getChatDriveFolderForClient, isGoogleDriveUrl, normalizeDriveFolderUrl, getShipmentStage, findShipmentFieldKeys, SHIPMENT_STATUS_TEXT } = require('./portalLogic');
 const { mapClientSettings, settingsFromInput, isValidQuickEditPin, planClientSettingsMigration } = require('./clientSchema');
+const { toGenericRows } = require('./inventoryLayout');
 const { RATE_SHEET, ENTRY_SHEET, HISTORY_SHEET, BILLING_RATE_HEADERS, BILLING_ENTRY_HEADERS, BILLING_HISTORY_HEADERS, MONTH_PATTERN, sanitizeRateCard, rateCardFromRow, entryFromRow, sanitizeEntry, historyFromRow, sanitizeHistory, currentMonth, summarizeBilling } = require('./billing');
 
 dotenv.config();
@@ -301,14 +302,25 @@ async function getOrCreateSheet(sheetName, headers = []) {
   return sheet;
 }
 
+function columnIndexToLetter(columnIndex) {
+  let remainder = Number(columnIndex);
+  let letters = '';
+  while (remainder > 0) {
+    const digit = (remainder - 1) % 26;
+    letters = String.fromCharCode(65 + digit) + letters;
+    remainder = Math.floor((remainder - 1) / 26);
+  }
+  return letters;
+}
+
 async function loadSheetRows(sheetName, rowLimitOverride = null) {
   const sheet = await getSheetByName(sheetName);
   const rowCount = Math.max(Number(sheet.rowCount) || 25, 25);
   const colCount = Math.max(Number(sheet.columnCount) || 9, 9);
   const effectiveRowLimit = rowLimitOverride ? Math.min(rowCount, Number(rowLimitOverride)) : rowCount;
-  const effectiveColCount = Math.min(colCount, 26);
+  const effectiveColCount = colCount;
 
-  await withRetry(() => sheet.loadCells(`A1:${String.fromCharCode(64 + effectiveColCount)}${effectiveRowLimit}`));
+  await withRetry(() => sheet.loadCells(`A1:${columnIndexToLetter(effectiveColCount)}${effectiveRowLimit}`));
 
   const rows = [];
   for (let rowIndex = 0; rowIndex < effectiveRowLimit; rowIndex += 1) {
@@ -420,11 +432,8 @@ async function autoDetectFieldsFromSheet(sheetName) {
   }
 }
 
-// Resolves full display/behavior config for a client: dashboard columns, add-item form
-// fields, drive folder, feature toggles, etc. CL-001/002/003 keep their existing static
-// configuration (unchanged behavior); any other client is driven entirely by the
-// User_Credentials sheet row plus (if Fields_JSON is blank) auto-detected sheet columns,
-// so new clients "just work" once a row + sheet tab exist — no code changes required.
+// Resolves full display/behavior config for a client. Built-in clients use their original
+// layout until their first field save migrates them to the configurable sheet schema.
 function getClientProfile(clientId) {
   const safeClientId = normalizeClientId(clientId) || 'CL-001';
   return cachedRead(`profile:${safeClientId}`, PROFILE_CACHE_MS, () => loadClientProfile(safeClientId));
@@ -464,46 +473,47 @@ function withEditColumn(columns, profile) {
 
 async function loadClientProfile(clientId) {
   const safeClientId = normalizeClientId(clientId) || 'CL-001';
+  const isBuiltInClient = LEGACY_CLIENT_IDS.includes(safeClientId);
+  let builtInCredentialsRow = null;
 
-  if (LEGACY_CLIENT_IDS.includes(safeClientId) || safeClientId === 'CL-000') {
+  if (isBuiltInClient || safeClientId === 'CL-000') {
     const configClientId = safeClientId === 'CL-000' ? 'CL-001' : safeClientId;
     const inventoryConfig = getClientInventoryFields(configClientId);
     const titleConfig = getCreateFormTitleConfig(configClientId);
-    let row = null;
     try {
-      row = await findCredentialsRow(safeClientId);
+      builtInCredentialsRow = await findCredentialsRow(safeClientId);
     } catch (error) {
       console.warn(`Unable to load settings for ${safeClientId}:`, error.message);
     }
-    const profile = applyClientSettings({
-      clientId: safeClientId,
-      clientName: inventoryConfig.label,
-      portalTitle: 'ECL Inventory Portal',
-      portalSubtitle: 'Professional Prep & Fulfillment Services',
-      accentColor: '#F5C518',
-      inventoryMode: inventoryConfig.fields.length ? 'custom' : 'legacy',
-      enableAddItem: !inventoryConfig.readOnly,
-      allowChat: true,
-      allowLogs: true,
-      allowUpdate: true,
-      readOnly: Boolean(inventoryConfig.readOnly),
-      requirePin: Boolean(inventoryConfig.requirePin),
-      // CL-002 already expresses quantity via its own Quantity Ordered/Received/Shipped
-      // fields, so the generic QTY column would be redundant there.
-      hideQtyColumn: configClientId === 'CL-002',
-      legacy: true,
-      driveFolderUrl: safeClientId === 'CL-000' ? '' : getChatDriveFolderForClient(safeClientId),
-      titleField: titleConfig,
-      fields: inventoryConfig.fields || [],
-      dashboardFieldKeys: LEGACY_DASHBOARD_FIELD_KEYS[configClientId] || []
-    }, row);
-    profile.dashboardColumns = withEditColumn(getDashboardColumns(configClientId), profile);
-    return profile;
+    if (!parseFieldsJson(builtInCredentialsRow?.get('Fields_JSON'))) {
+      const profile = applyClientSettings({
+        clientId: safeClientId,
+        clientName: inventoryConfig.label,
+        portalTitle: 'ECL Inventory Portal',
+        portalSubtitle: 'Professional Prep & Fulfillment Services',
+        accentColor: '#F5C518',
+        inventoryMode: inventoryConfig.fields.length ? 'custom' : 'legacy',
+        enableAddItem: !inventoryConfig.readOnly,
+        allowChat: true,
+        allowLogs: true,
+        allowUpdate: true,
+        readOnly: Boolean(inventoryConfig.readOnly),
+        requirePin: Boolean(inventoryConfig.requirePin),
+        hideQtyColumn: configClientId === 'CL-002',
+        legacy: true,
+        driveFolderUrl: safeClientId === 'CL-000' ? '' : getChatDriveFolderForClient(safeClientId),
+        titleField: titleConfig,
+        fields: inventoryConfig.fields || [],
+        dashboardFieldKeys: LEGACY_DASHBOARD_FIELD_KEYS[configClientId] || []
+      }, builtInCredentialsRow);
+      profile.dashboardColumns = withEditColumn(getDashboardColumns(configClientId), profile);
+      return profile;
+    }
   }
 
   const profile = {
     clientId: safeClientId,
-    clientName: safeClientId,
+    clientName: isBuiltInClient ? getClientInventoryFields(safeClientId).label : safeClientId,
     portalTitle: 'ECL Inventory Portal',
     portalSubtitle: 'Professional Prep & Fulfillment Services',
     accentColor: '#F5C518',
@@ -514,16 +524,19 @@ async function loadClientProfile(clientId) {
     allowUpdate: true,
     readOnly: false,
     requirePin: false,
-    hideQtyColumn: false,
+    hideQtyColumn: safeClientId === 'CL-002',
     hideQuickEdit: false,
-    driveFolderUrl: '',
-    titleField: { visible: true, label: 'Product Title', placeholder: 'Enter product name' },
+    driveFolderUrl: isBuiltInClient ? getChatDriveFolderForClient(safeClientId) : '',
+    titleField: {
+      ...getCreateFormTitleConfig(safeClientId),
+      label: safeClientId === 'CL-003' ? 'Product Description / Name' : safeClientId === 'CL-002' ? 'Product Description' : 'Product Title'
+    },
     fields: []
   };
 
-  let credentialsRow = null;
+  let credentialsRow = builtInCredentialsRow;
   try {
-    const row = await findCredentialsRow(safeClientId);
+    const row = credentialsRow || await findCredentialsRow(safeClientId);
     credentialsRow = row;
 
     if (row) {
@@ -538,7 +551,7 @@ async function loadClientProfile(clientId) {
       profile.allowUpdate = parseBoolCell(row.get('Allow_Update'), profile.allowUpdate);
       profile.readOnly = parseBoolCell(row.get('Read_Only'), profile.readOnly);
       profile.requirePin = parseBoolCell(row.get('Require_Pin'), profile.requirePin);
-      profile.driveFolderUrl = String(row.get('Drive_Folder_URL') || '').trim();
+      profile.driveFolderUrl = String(row.get('Drive_Folder_URL') || '').trim() || profile.driveFolderUrl;
 
       const titleLabel = String(row.get('Title_Field_Label') || '').trim();
       const titlePlaceholder = String(row.get('Title_Field_Placeholder') || '').trim();
@@ -616,6 +629,7 @@ async function loadInventoryForClient(targetClientId) {
 
     const rows = await loadSheetRows(sheetName, sheetName === 'CL-001' ? null : 500);
     const result = [];
+    const profile = await getClientProfile(targetClientId);
 
     const parseGenericSheetRow = (row) => {
       const rowText = String((row || []).slice(0, 8).join(' ')).toLowerCase();
@@ -648,7 +662,7 @@ async function loadInventoryForClient(targetClientId) {
       return item;
     };
 
-    if (sheetName === 'CL-002') {
+    if (sheetName === 'CL-002' && profile.legacy) {
       const headerRow = rows[0] || [];
       const normalizedHeaders = headerRow.map((cell) => String(cell || '').trim().toLowerCase());
       const columnIndexes = {
@@ -708,7 +722,7 @@ async function loadInventoryForClient(targetClientId) {
       return result;
     }
 
-    if (sheetName === 'CL-003') {
+    if (sheetName === 'CL-003' && profile.legacy) {
       const headerRow = rows[0] || [];
       const headerText = headerRow.map((cell) => String(cell || '').trim().toLowerCase());
       const map = {
@@ -750,7 +764,7 @@ async function loadInventoryForClient(targetClientId) {
       return result;
     }
 
-    if (sheetName === 'CL-001') {
+    if (sheetName === 'CL-001' && profile.legacy) {
       const headerRowIndex = rows.findIndex((row) => String(row.join(' ')).toLowerCase().includes('sku code'));
       const startIndex = headerRowIndex >= 0 ? headerRowIndex + 1 : 0;
 
@@ -789,8 +803,7 @@ async function loadInventoryForClient(targetClientId) {
     // Any client provisioned through the "Add Client" admin flow gets a sheet laid out as
     // SKU | Product Title | ...custom fields (in the order configured)... | Qty | Status | Notes.
     // Reading it generically here means new clients need zero code changes to appear correctly.
-    if (!LEGACY_CLIENT_IDS.includes(sheetName)) {
-      const profile = await getClientProfile(targetClientId);
+    if (!profile.legacy) {
       if (profile.fields.length || profile.inventoryMode === 'custom') {
         const customFieldCount = profile.fields.length;
         const qtyCol = 2 + customFieldCount;
@@ -1004,35 +1017,39 @@ app.post('/api/admin/clients', async (req, res) => {
   }
 });
 
-// Adds/removes/renames the actual sheet columns so a client's field layout can be
-// changed after the fact instead of being locked in permanently at creation time.
-async function syncClientFieldColumns(sheet, oldFields, orderedFields, titleLabel) {
-  const newKeys = orderedFields.map((field) => field.key);
+async function archiveInventorySheet(sheet, suffix) {
+  const doc = await getDoc();
+  const timestamp = new Date().toISOString().replace(/[-:.TZ]/g, '').slice(0, 17);
+  const title = `${sheet.title}_${suffix}_${timestamp}`.slice(0, 100);
+  if (doc.sheetsByTitle[title]) return doc.sheetsByTitle[title];
+  return withRetry(() => sheet.duplicate({ title }));
+}
 
-  const removedIndexes = oldFields
-    .map((field, idx) => ({ field, idx }))
-    .filter(({ field }) => !newKeys.includes(field.key))
-    .map(({ idx }) => idx)
-    .sort((a, b) => b - a);
+async function syncClientFieldColumns(sheet, oldFields, orderedFields, titleLabel, legacyClientId = '') {
+  const rows = await loadSheetRows(sheet.title, null);
+  const removedFields = oldFields.filter((field) => !orderedFields.some((next) => next.key === field.key));
+  if (legacyClientId) {
+    await archiveInventorySheet(sheet, 'Original');
+  } else if (removedFields.length) {
+    await archiveInventorySheet(sheet, 'FieldsArchive');
+  }
 
-  for (const idx of removedIndexes) {
-    const columnIndex = 2 + idx;
-    await withRetry(() => sheet._makeSingleUpdateRequest('deleteDimension', {
-      range: { sheetId: sheet.sheetId, dimension: 'COLUMNS', startIndex: columnIndex, endIndex: columnIndex + 1 }
+  const layout = toGenericRows({
+    rows,
+    oldFields,
+    newFields: orderedFields,
+    titleLabel,
+    legacyClientId
+  });
+  if (layout.headers.length > sheet.columnCount || layout.rows.length + 1 > sheet.rowCount) {
+    await withRetry(() => sheet.resize({
+      rowCount: Math.max(sheet.rowCount, layout.rows.length + 1),
+      columnCount: Math.max(sheet.columnCount, layout.headers.length)
     }));
   }
-
-  const oldKeys = oldFields.map((field) => field.key);
-  const addedCount = orderedFields.filter((field) => !oldKeys.includes(field.key)).length;
-  const keptCount = oldFields.filter((field) => newKeys.includes(field.key)).length;
-
-  for (let i = 0; i < addedCount; i += 1) {
-    const insertAt = 2 + keptCount + i;
-    await withRetry(() => sheet.insertDimension('COLUMNS', { startIndex: insertAt, endIndex: insertAt + 1 }));
-  }
-
-  const headerValues = ['SKU', titleLabel || 'Product Title', ...orderedFields.map((field) => field.label), 'Qty', 'Status', 'Notes'];
-  await withRetry(() => sheet.setHeaderRow(headerValues));
+  await withRetry(() => sheet.clear(`A2:${columnIndexToLetter(Math.max(sheet.columnCount, layout.headers.length))}`));
+  await withRetry(() => sheet.setHeaderRow(layout.headers));
+  if (layout.rows.length) await withRetry(() => sheet.addRows(layout.rows));
 }
 
 app.put('/api/admin/clients/:clientId', async (req, res) => {
@@ -1041,7 +1058,7 @@ app.put('/api/admin/clients/:clientId', async (req, res) => {
     if (clientId === 'CL-000') {
       return res.status(400).json({ success: false, error: 'The admin account has no client settings.' });
     }
-    const isLegacy = LEGACY_CLIENT_IDS.includes(clientId);
+    const isBuiltIn = LEGACY_CLIENT_IDS.includes(clientId);
 
     const credentialsSheet = await getOrCreateSheet('User_Credentials', USER_CREDENTIALS_HEADERS);
     const rows = await withRetry(() => credentialsSheet.getRows());
@@ -1059,57 +1076,78 @@ app.put('/api/admin/clients/:clientId', async (req, res) => {
     if (quickEditPin && !isValidQuickEditPin(quickEditPin)) {
       return res.status(400).json({ success: false, error: 'Quick Edit PIN must be 4-32 characters with no spaces.' });
     }
-    if (!isLegacy && String(body.driveFolderUrl || '').trim() && !normalizeDriveFolderUrl(body.driveFolderUrl)) {
+    if (String(body.driveFolderUrl || '').trim() && !normalizeDriveFolderUrl(body.driveFolderUrl)) {
       return res.status(400).json({ success: false, error: 'Drive folder must be a Google Drive folder link or folder ID.' });
     }
 
-    let settings;
-    let orderedFields = null;
-    if (isLegacy) {
-      // Built-in layouts keep their sheet columns; only the per-client settings are stored.
-      settings = settingsFromInput(body, getClientInventoryFields(clientId).fields || [], clientId);
-    } else {
-      const oldFields = parseFieldsJson(row.get('Fields_JSON')) || [];
-      const { fields: submittedFields, fieldVisibility } = splitFieldVisibility(sanitizeFieldDefs(body.fields));
-      const submittedKeys = submittedFields.map((field) => field.key);
-
-      // Keep existing fields in their original column order (renames only change the label);
-      // anything brand new is appended at the end. This guarantees the header row we write
-      // always lines up with the sheet's actual column order, regardless of what order the
-      // fields arrived in from the client.
-      orderedFields = oldFields
-        .filter((field) => submittedKeys.includes(field.key))
-        .map((field) => submittedFields.find((updated) => updated.key === field.key) || field)
-        .concat(submittedFields.filter((field) => !oldFields.some((old) => old.key === field.key)));
-      settings = settingsFromInput({ ...body, fields: [], fieldVisibility }, orderedFields, clientId);
+    const legacyLayout = isBuiltIn && !parseFieldsJson(row.get('Fields_JSON'));
+    const oldFields = legacyLayout
+      ? getClientInventoryFields(clientId).fields.filter((field) => !['upc', 'productDescription', 'productName', 'notes'].includes(field.key))
+      : parseFieldsJson(row.get('Fields_JSON')) || [];
+    const rawFields = Array.isArray(body.fields)
+      ? body.fields.map((field) => ({ ...(oldFields.find((existing) => existing.key === field?.key) || {}), ...field }))
+      : oldFields;
+    const parsedSubmittedFields = splitFieldVisibility(sanitizeFieldDefs(rawFields));
+    const submittedFields = parsedSubmittedFields.fields;
+    const priorSettings = mapClientSettings(row.get('Client_Settings_JSON'), { fields: oldFields, clientId });
+    const fieldVisibility = Array.isArray(body.fields)
+      ? parsedSubmittedFields.fieldVisibility
+      : priorSettings.fieldVisibility;
+    if (isBuiltIn && ['CL-002', 'CL-003'].includes(clientId)) {
+      ['quantityReceived', 'quantityShipped'].forEach((key) => {
+        const requiredField = oldFields.find((field) => field.key === key);
+        if (!requiredField) return;
+        const submittedField = submittedFields.find((field) => field.key === key);
+        if (submittedField) submittedField.readOnly = Boolean(requiredField.readOnly);
+        else submittedFields.push(requiredField);
+      });
     }
+    const submittedKeys = submittedFields.map((field) => field.key);
+
+    const orderedFields = oldFields
+      .filter((field) => submittedKeys.includes(field.key))
+      .map((field) => submittedFields.find((updated) => updated.key === field.key) || field)
+      .concat(submittedFields.filter((field) => !oldFields.some((old) => old.key === field.key)));
+    const settings = settingsFromInput({ ...priorSettings, ...body, fields: [], fieldVisibility }, orderedFields, clientId);
 
     if (settings.quickEditMode === 'password' && !quickEditPin && !hasQuickEditPin(row)) {
       return res.status(400).json({ success: false, error: 'Set a Quick Edit PIN to use Password Protected mode.' });
     }
 
-    if (!isLegacy) {
-      const oldFields = parseFieldsJson(row.get('Fields_JSON')) || [];
-      const titleLabel = String(body.titleFieldLabel || row.get('Title_Field_Label') || '').trim() || 'Product Title';
-      const inventorySheet = await getSheetByName(clientId);
-      await withRetry(() => inventorySheet.loadHeaderRow());
-      await syncClientFieldColumns(inventorySheet, oldFields, orderedFields, titleLabel);
-
-      row.set('Client_Name', String(body.clientName || row.get('Client_Name') || clientId).trim());
-      row.set('Portal_Title', String(body.portalTitle ?? row.get('Portal_Title') ?? '').trim());
-      row.set('Portal_Subtitle', String(body.portalSubtitle ?? row.get('Portal_Subtitle') ?? '').trim());
-      row.set('Accent_Color', String(body.accentColor ?? row.get('Accent_Color') ?? '').trim());
-      row.set('Drive_Folder_URL', normalizeDriveFolderUrl(body.driveFolderUrl ?? row.get('Drive_Folder_URL')));
-      row.set('Enable_Add_Item', body.enableAddItem === false ? 'false' : 'true');
-      row.set('Allow_Chat', body.allowChat === false ? 'false' : 'true');
-      row.set('Allow_Logs', body.allowLogs === false ? 'false' : 'true');
-      row.set('Allow_Update', body.allowUpdate === false ? 'false' : 'true');
-      row.set('Read_Only', body.readOnly === true ? 'true' : 'false');
-      row.set('Require_Pin', body.requirePin === true ? 'true' : 'false');
-      row.set('Title_Field_Label', titleLabel);
-      row.set('Title_Field_Placeholder', String(body.titleFieldPlaceholder ?? row.get('Title_Field_Placeholder') ?? '').trim());
-      row.set('Fields_JSON', JSON.stringify(orderedFields));
+    const titleConfig = getCreateFormTitleConfig(clientId);
+    const titleLabel = String(body.titleFieldLabel || row.get('Title_Field_Label') || (
+      legacyLayout ? (clientId === 'CL-002' ? 'Product Description' : clientId === 'CL-003' ? 'Product Description / Name' : 'Product Title') : titleConfig.label
+    )).trim() || 'Product Title';
+    const inventorySheet = await getSheetByName(clientId);
+    const schemaChanged = oldFields.length !== orderedFields.length || orderedFields.some((field, index) =>
+      field.key !== oldFields[index]?.key || field.label !== oldFields[index]?.label
+    );
+    const titleLabelChanged = Boolean(body.titleFieldLabel) && String(body.titleFieldLabel).trim() !== String(row.get('Title_Field_Label') || '').trim();
+    if (legacyLayout || schemaChanged || titleLabelChanged) {
+      await syncClientFieldColumns(inventorySheet, oldFields, orderedFields, titleLabel, legacyLayout ? clientId : '');
     }
+
+    row.set('Client_Name', String(body.clientName || row.get('Client_Name') || clientId).trim());
+    row.set('Inventory_Mode', 'custom');
+    row.set('Portal_Title', String(body.portalTitle ?? row.get('Portal_Title') ?? '').trim());
+    row.set('Portal_Subtitle', String(body.portalSubtitle ?? row.get('Portal_Subtitle') ?? '').trim());
+    row.set('Accent_Color', String(body.accentColor ?? row.get('Accent_Color') ?? '').trim());
+    row.set('Drive_Folder_URL', normalizeDriveFolderUrl(body.driveFolderUrl ?? row.get('Drive_Folder_URL')));
+    row.set('Enable_Add_Item', body.enableAddItem === undefined
+      ? String(row.get('Enable_Add_Item') || String(clientId !== 'CL-001'))
+      : body.enableAddItem === true ? 'true' : 'false');
+    row.set('Allow_Chat', body.allowChat === undefined ? String(row.get('Allow_Chat') || 'true') : body.allowChat === true ? 'true' : 'false');
+    row.set('Allow_Logs', body.allowLogs === undefined ? String(row.get('Allow_Logs') || 'true') : body.allowLogs === true ? 'true' : 'false');
+    row.set('Allow_Update', body.allowUpdate === undefined ? String(row.get('Allow_Update') || 'true') : body.allowUpdate === true ? 'true' : 'false');
+    row.set('Read_Only', body.readOnly === undefined
+      ? String(row.get('Read_Only') || String(clientId === 'CL-001'))
+      : body.readOnly === true ? 'true' : 'false');
+    row.set('Require_Pin', body.requirePin === undefined
+      ? String(row.get('Require_Pin') || 'false')
+      : body.requirePin === true ? 'true' : 'false');
+    row.set('Title_Field_Label', titleLabel);
+    row.set('Title_Field_Placeholder', String(body.titleFieldPlaceholder ?? row.get('Title_Field_Placeholder') ?? '').trim());
+    row.set('Fields_JSON', JSON.stringify(orderedFields));
 
     row.set('Client_Settings_JSON', JSON.stringify(settings));
     if (email !== null) row.set('Email', email);
@@ -1375,12 +1413,13 @@ app.post('/api/inventory/create', async (req, res) => {
     const itemSku = String(sku || '').trim();
     const itemTitle = String(title || '').trim();
     const values = extraFields && typeof extraFields === 'object' ? { ...extraFields } : {};
+    const profile = await getClientProfile(targetClientId);
     // Staff status comes from the signed session, never from what the browser claims.
     const adminAccess = isStaffSession(readNotificationSession(req));
 
     // Fields the admin switched off for this form are dropped server-side too, not just hidden.
     if (!isStaffSession(readNotificationSession(req))) {
-      const { fieldVisibility = {}, fields: profileFields = [] } = await getClientProfile(targetClientId);
+      const { fieldVisibility = {}, fields: profileFields = [] } = profile;
       const shipmentKeys = findShipmentFieldKeys(profileFields);
       Object.keys(values).forEach((key) => {
         if (fieldVisibility[key] && fieldVisibility[key][kind] === false) delete values[key];
@@ -1392,7 +1431,7 @@ app.post('/api/inventory/create', async (req, res) => {
     const sheet = await getSheetByName(sheetName);
 
     let row = [];
-    if (targetClientId === 'CL-002') {
+    if (profile.legacy && targetClientId === 'CL-002') {
       row = [
         String(values.upc || itemSku || ''),
         String(values.productDescription || itemTitle || ''),
@@ -1407,7 +1446,7 @@ app.post('/api/inventory/create', async (req, res) => {
         String(values.bundleQty || ''),
         String(values.notes || notes || '')
       ];
-    } else if (targetClientId === 'CL-003') {
+    } else if (profile.legacy && targetClientId === 'CL-003') {
       row = [
         String(values.productName || itemTitle || ''),
         String(values.quantityOrdered ?? qty ?? ''),
@@ -1417,16 +1456,22 @@ app.post('/api/inventory/create', async (req, res) => {
         ...(adminAccess ? [String(values.quantityReceived ?? ''), String(values.quantityShipped ?? '')] : []),
         String(values.notes || notes || '')
       ];
-    } else if (!LEGACY_CLIENT_IDS.includes(targetClientId)) {
+    } else if (!profile.legacy) {
       // Generic clients (created through the admin "Add Client" flow) always use the
       // SKU | Title | ...custom fields... | Qty | Status | Notes column layout.
-      const profile = await getClientProfile(targetClientId);
       const shipmentKeys = findShipmentFieldKeys(profile.fields);
+      const baseQuantity = targetClientId === 'CL-003'
+        ? Number(values.quantityReceived) || 0
+        : targetClientId === 'CL-002'
+          ? Number(values.quantityOrdered ?? qty) || 0
+          : Number(qty) || 0;
       row = [
         itemSku,
         itemTitle || itemSku || 'Untitled',
-        ...profile.fields.map((field) => String(values[field.key] ?? '')),
-        Number(qty) || 0,
+        ...profile.fields.map((field) => String(values[field.key] ?? (
+          ['CL-002', 'CL-003'].includes(targetClientId) && field.key === 'quantityOrdered' ? qty ?? '' : ''
+        ))),
+        baseQuantity,
         shipmentKeys
           ? SHIPMENT_STATUS_TEXT[getShipmentStage(values[shipmentKeys.received], values[shipmentKeys.shipped])]
           : String(status || (Number(qty) <= 5 ? 'Low Stock' : 'In Stock')),
@@ -1522,14 +1567,15 @@ async function getShipmentColumns(clientId, rows) {
     const index = headers.findIndex((name) => name.includes(text));
     return index >= 0 ? index : fallback;
   };
-  if (clientId === 'CL-002') {
+  const profile = await getClientProfile(clientId);
+  if (profile.legacy && clientId === 'CL-002') {
     return { title: find('product description', 1), received: find('quantity received', 3), shipped: find('quantity shipped', 4), status: -1 };
   }
-  if (clientId === 'CL-003') {
+  if (profile.legacy && clientId === 'CL-003') {
     return { title: find('product description/name', 0), received: find('quantity received', 2), shipped: find('quantity shipped', 3), status: -1 };
   }
-  if (LEGACY_CLIENT_IDS.includes(clientId)) return null;
-  const { fields } = await getClientProfile(clientId);
+  if (profile.legacy) return null;
+  const { fields } = profile;
   const keys = findShipmentFieldKeys(fields);
   if (!keys) return null;
   const indexOf = (key) => 2 + fields.findIndex((field) => field.key === key);
@@ -1589,7 +1635,8 @@ async function getItemEditColumns(clientId, rows) {
     const index = headers.findIndex((name) => (typeof test === 'function' ? test(name) : name.includes(test)));
     return index >= 0 ? index : fallback;
   };
-  if (clientId === 'CL-002') {
+  const profile = await getClientProfile(clientId);
+  if (profile.legacy && clientId === 'CL-002') {
     return {
       locate: 'index',
       titleKey: 'productDescription',
@@ -1602,7 +1649,7 @@ async function getItemEditColumns(clientId, rows) {
       }
     };
   }
-  if (clientId === 'CL-003') {
+  if (profile.legacy && clientId === 'CL-003') {
     const exact = (...names) => (name) => names.includes(name);
     return {
       locate: 'index',
@@ -1615,12 +1662,12 @@ async function getItemEditColumns(clientId, rows) {
       }
     };
   }
-  if (clientId === 'CL-001') {
+  if (profile.legacy && clientId === 'CL-001') {
     return { locate: 'sku', titleKey: 'title', numeric: new Set(), columns: { sku: 1, title: 2 } };
   }
-  const { fields } = await getClientProfile(clientId);
+  const { fields } = profile;
   const shipmentKeys = findShipmentFieldKeys(fields);
-  const columns = { sku: 0, title: 1 };
+  const columns = { sku: 0, title: 1, notes: 2 + fields.length + 2 };
   fields.forEach((field, index) => {
     if (shipmentKeys && (field.key === shipmentKeys.received || field.key === shipmentKeys.shipped)) return;
     columns[field.key] = 2 + index;
@@ -1697,6 +1744,7 @@ app.put('/api/inventory/quantity', async (req, res) => {
     if (!clientId || !sku || !Number.isSafeInteger(quantity) || quantity < 0 || (!isStaff && session.clientId !== clientId)) {
       return res.status(400).json({ success: false, error: 'Invalid inventory update.' });
     }
+    const profile = await getClientProfile(clientId);
     if (clientId === 'CL-002') return res.status(400).json({ success: false, error: 'Use the shipment workflow for this client.' });
     if (!isStaff) {
       const denied = await checkQuickEditAccess(req, session, clientId);
@@ -1705,19 +1753,21 @@ app.put('/api/inventory/quantity', async (req, res) => {
 
     const sheet = await findSheetByTitle(clientId);
     if (!sheet) return res.status(404).json({ success: false, error: 'Inventory sheet not found.' });
-    const profile = clientId === 'CL-001' || clientId === 'CL-003' ? null : await getClientProfile(clientId);
-    const skuColumn = clientId === 'CL-001' ? 1 : 0;
-    const quantityColumn = clientId === 'CL-001' ? 3 : clientId === 'CL-003' ? 2 : 2 + profile.fields.length;
-    const statusColumn = clientId === 'CL-003' ? -1 : quantityColumn + 1;
-    const startRow = clientId === 'CL-001' ? 8 : 1;
+    const skuColumn = profile.legacy && clientId === 'CL-001' ? 1 : 0;
+    const receivedIndex = clientId === 'CL-003' ? profile.fields.findIndex((field) => field.key === 'quantityReceived') : -1;
+    const quantityColumn = profile.legacy
+      ? clientId === 'CL-001' ? 3 : clientId === 'CL-003' ? 2 : 2 + profile.fields.length
+      : receivedIndex >= 0 ? 2 + receivedIndex : 2 + profile.fields.length;
+    const statusColumn = profile.legacy && clientId === 'CL-003' ? -1 : profile.legacy ? quantityColumn + 1 : 2 + profile.fields.length + 1;
+    const startRow = profile.legacy && clientId === 'CL-001' ? 8 : 1;
     const endRow = sheet.rowCount;
     const lastColumn = Math.max(skuColumn, quantityColumn, statusColumn) + 1;
-    await withRetry(() => sheet.loadCells(`A1:${String.fromCharCode(64 + lastColumn)}${endRow}`));
+    await withRetry(() => sheet.loadCells(`A1:${columnIndexToLetter(lastColumn)}${endRow}`));
     let rowIndex = -1;
     for (let index = startRow; index < endRow; index += 1) {
       const cellSku = String(sheet.getCell(index, skuColumn).value || '').trim();
       // Items saved without a SKU are listed under their title, so match on the title column instead.
-      const titleMatch = !cellSku && skuColumn === 0 && clientId !== 'CL-003' && String(sheet.getCell(index, 1).value || '').trim() === sku;
+      const titleMatch = !cellSku && skuColumn === 0 && String(sheet.getCell(index, 1).value || '').trim() === sku;
       if (cellSku === sku || titleMatch) {
         rowIndex = index;
         break;
@@ -1821,16 +1871,16 @@ app.post('/api/account/activate', authRateLimit, async (req, res) => {
     if (!codesMatch(activationCode, storedCode)) return invalid();
 
     const recoveryCode = `${generateCode(4)}-${generateCode(4)}`;
+    const clientId = normalizeClientId(user.get('Client_ID')) || 'CL-001';
+    const clientName = String(user.get('Client_Name') || clientId).trim();
+    const role = String(user.get('Role') || (clientId === 'CL-000' ? 'admin' : 'client')).trim().toLowerCase();
+    const notificationToken = signNotificationSession(safeUsername, clientId, role);
     user.set('Password', await hashSecret(safePassword));
     user.set('Activation_Code', '');
     user.set('Recovery_Code_Hash', await hashSecret(recoveryCode));
     await withRetry(() => user.save());
 
-    const clientId = normalizeClientId(user.get('Client_ID')) || 'CL-001';
-    const clientName = String(user.get('Client_Name') || clientId).trim();
-    const role = String(user.get('Role') || (clientId === 'CL-000' ? 'admin' : 'client')).trim().toLowerCase();
-
-    return res.json({ success: true, clientId, clientName, role, recoveryCode });
+    return res.json({ success: true, username: safeUsername, clientId, clientName, role, notificationToken, recoveryCode });
   } catch (error) {
     console.error('Account activation error:', error);
     return res.status(500).json({ success: false, error: 'Unable to activate account.' });
@@ -2176,9 +2226,8 @@ async function migrateClientSettings({ apply = false } = {}) {
     .map((row) => {
       const clientId = normalizeClientId(read(row, 'Client_ID'));
       if (!clientId || clientId === 'CL-000') return null;
-      const fields = LEGACY_CLIENT_IDS.includes(clientId)
-        ? (getClientInventoryFields(clientId).fields || [])
-        : (parseFieldsJson(read(row, 'Fields_JSON')) || []);
+      const fields = parseFieldsJson(read(row, 'Fields_JSON')) ||
+        (LEGACY_CLIENT_IDS.includes(clientId) ? (getClientInventoryFields(clientId).fields || []) : []);
       return {
         row,
         ...planClientSettingsMigration({

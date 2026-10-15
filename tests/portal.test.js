@@ -9,7 +9,90 @@ process.env.GOOGLE_PRIVATE_KEY = 'test-only-not-a-real-key';
 process.env.GOOGLE_SHEET_ID = 'test-sheet';
 
 const { normalizeInventoryRow, getSheetNameForClient, getClientInventoryFields, getVisibleClientFields, getChatDriveFolderForClient, getInventoryFieldSample, getCreateFormTitleConfig, getDashboardColumns, getShipmentStatus } = require('../api/portalLogic.js');
+const { toGenericRows } = require('../api/inventoryLayout.js');
 const { normalizeClientId, summarizeUnreadNotifications, signNotificationSession, readNotificationSession, cachedRead, invalidateReadCache } = require('../api/server.js');
+
+test('legacy inventory conversion preserves shipment values and archives removed field values', () => {
+  const oldFields = [
+    { key: 'quantityOrdered', label: 'Quantity Ordered', type: 'number' },
+    { key: 'quantityReceived', label: 'Quantity Received', type: 'number' },
+    { key: 'quantityShipped', label: 'Quantity Shipped', type: 'number' },
+    { key: 'merchant', label: 'Merchant', type: 'text' },
+    { key: 'expDate', label: 'Exp Date', type: 'text' }
+  ];
+  const rows = [
+    ['UPC', 'Product Description', 'Quantity Ordered', 'Quantity Received', 'Quantity Shipped', 'Exp Date', 'Merchant', 'Notes'],
+    ['00123', 'Copper Marker', 10, 8, 3, '2027-01', 'Shop', 'Handle carefully']
+  ];
+  const converted = toGenericRows({
+    rows,
+    oldFields,
+    newFields: oldFields.filter((field) => field.key !== 'expDate'),
+    titleLabel: 'Product Description',
+    legacyClientId: 'CL-002'
+  });
+
+  assert.deepEqual(converted.headers, [
+    'SKU', 'Product Description', 'Quantity Ordered', 'Quantity Received', 'Quantity Shipped',
+    'Merchant', 'Qty', 'Status', 'Notes', 'Archived: Exp Date'
+  ]);
+  assert.deepEqual(converted.rows, [[
+    '00123', 'Copper Marker', 10, 8, 3, 'Shop', 10, '', 'Handle carefully', '2027-01'
+  ]]);
+});
+
+test('generic inventory layout changes archive removed values and preserve existing archives', () => {
+  const converted = toGenericRows({
+    rows: [
+      ['SKU', 'Product Title', 'Carrier', 'Qty', 'Status', 'Notes', 'Archived: Old Field'],
+      ['A-1', 'Widget', 'UPS', 4, 'In Stock', 'Note', 'original value']
+    ],
+    oldFields: [{ key: 'carrier', label: 'Carrier', type: 'text' }],
+    newFields: [],
+    titleLabel: 'Product Title'
+  });
+
+  assert.deepEqual(converted.headers, ['SKU', 'Product Title', 'Qty', 'Status', 'Notes', 'Archived: Old Field', 'Archived: Carrier']);
+  assert.deepEqual(converted.rows, [['A-1', 'Widget', 4, 'In Stock', 'Note', 'original value', 'UPS']]);
+});
+
+test('CL-001 preamble and CL-003 shipment columns convert to the standard row shape', () => {
+  const cl001 = toGenericRows({
+    rows: [
+      ['Metal Garden Markers inventory'],
+      ['Client ID', 'SKU Code', 'Product Title', 'Qty', 'Status', 'Notes'],
+      ['CL-001', 'MG-1', 'Garden marker', 12, 'In Stock', 'Green'],
+      ['', '', '', '', '', '']
+    ],
+    oldFields: [],
+    newFields: [],
+    legacyClientId: 'CL-001'
+  });
+  assert.deepEqual(cl001.rows, [['MG-1', 'Garden marker', 12, 'In Stock', 'Green']]);
+
+  const oldFields = [
+    { key: 'quantityOrdered', label: 'Quantity Ordered' },
+    { key: 'merchant', label: 'Merchant' },
+    { key: 'carrier', label: 'Carrier' },
+    { key: 'trackingNumber', label: 'Tracking #' },
+    { key: 'quantityReceived', label: 'Quantity Received' },
+    { key: 'quantityShipped', label: 'Quantity Shipped' }
+  ];
+  const cl003 = toGenericRows({
+    rows: [
+      ['Product Description/Name', 'Quantity Ordered', 'Quantity Received', 'Quantity Shipped', 'Merchant', 'Carrier', 'Tracking #', 'Notes'],
+      ['Charizard', 5, 4, 2, 'Store', 'UPS', 'TRACK-1', 'Sleeved']
+    ],
+    oldFields,
+    newFields: oldFields.filter((field) => field.key !== 'carrier'),
+    titleLabel: 'Product Description / Name',
+    legacyClientId: 'CL-003'
+  });
+  assert.deepEqual(cl003.rows, [[
+    'Charizard', 'Charizard', 5, 'Store', 'TRACK-1', 4, 2, 4, '', 'Sleeved', 'UPS'
+  ]]);
+  assert.deepEqual(cl003.headers.slice(-1), ['Archived: Carrier']);
+});
 
 test('server read cache shares in-flight reads, invalidates by prefix, and never caches failures', async () => {
   let calls = 0;
@@ -79,6 +162,12 @@ test('account endpoints use bcrypt, hashed single-use recovery codes, admin-only
     assert.equal((await post('/account/activate', { username: 'MetalGarden', activationCode: 'WRON-GCOD', password: 'NewPass123' })).status, 400);
     const activated = await (await post('/account/activate', { username: 'MetalGarden', activationCode: reset.activationCode.toLowerCase(), password: 'NewPass123' })).json();
     assert.ok(activated.success);
+    assert.equal(activated.username, 'MetalGarden');
+    assert.equal(activated.clientId, 'CL-001');
+    assert.ok(activated.notificationToken);
+    const activatedSession = readNotificationSession({ get: () => `Bearer ${activated.notificationToken}` });
+    assert.equal(activatedSession.username, 'MetalGarden');
+    assert.equal(activatedSession.clientId, 'CL-001');
     assert.match(client.get('Recovery_Code_Hash'), /^\$2[aby]\$/);
     assert.notEqual(client.get('Recovery_Code_Hash'), activated.recoveryCode);
     assert.equal(client.get('Activation_Code'), '');
@@ -727,6 +816,62 @@ test('field toggles, quick-edit PIN protection, and legacy settings edits are en
   ].map(makeRow);
   const added = [];
   const cells = new Map([['1:0', { value: 'SKU-9' }], ['1:4', { value: 1 }], ['1:5', { value: '' }]]);
+  const legacyCl002Rows = [
+    ['UPC', 'Product Description', 'Quantity Ordered', 'Quantity Received', 'Quantity Shipped', 'Exp Date', 'Merchant', 'ASIN #', 'FBM / FBA', 'Transparency Code (Y/N)', 'Bundled? (Y/N)', 'Bundle Quantity', 'Notes'],
+    ['00123', 'Copper Marker', 10, 8, 3, '2027-01', 'Shop', 'ASIN-1', 'FBA', 'Y', 'N', 1, 'Handle carefully']
+  ];
+  const legacyCl003Rows = [
+    ['Product Description/Name', 'Quantity Ordered', 'Quantity Received', 'Quantity Shipped', 'Merchant', 'Carrier', 'Tracking #', 'Notes'],
+    ['Charizard', 5, 4, 2, 'Store', 'UPS', 'TRACK-1', 'Sleeved']
+  ];
+  const cl002Sheet = {
+    title: 'CL-002',
+    sheetId: 2,
+    get rowCount() { return Math.max(legacyCl002Rows.length, 25); },
+    get columnCount() { return 26; },
+    loadCells: async () => {},
+    getCell: (row, column) => ({
+      get value() { return legacyCl002Rows[row]?.[column] ?? ''; },
+      set value(value) {
+        if (!legacyCl002Rows[row]) legacyCl002Rows[row] = [];
+        legacyCl002Rows[row][column] = value;
+      }
+    }),
+    duplicate: async ({ title }) => {
+      const archive = { title, rows: legacyCl002Rows.map((row) => [...row]) };
+      sheets[title] = archive;
+      return archive;
+    },
+    clear: async () => { legacyCl002Rows.splice(1); },
+    setHeaderRow: async (headers) => { legacyCl002Rows[0] = [...headers]; },
+    addRows: async (rows) => { legacyCl002Rows.push(...rows.map((row) => [...row])); },
+    resize: async () => {},
+    saveUpdatedCells: async () => {}
+  };
+  const cl003Sheet = {
+    title: 'CL-003',
+    sheetId: 3,
+    get rowCount() { return Math.max(legacyCl003Rows.length, 25); },
+    get columnCount() { return 26; },
+    loadCells: async () => {},
+    getCell: (row, column) => ({
+      get value() { return legacyCl003Rows[row]?.[column] ?? ''; },
+      set value(value) {
+        if (!legacyCl003Rows[row]) legacyCl003Rows[row] = [];
+        legacyCl003Rows[row][column] = value;
+      }
+    }),
+    duplicate: async ({ title }) => {
+      const archive = { title, rows: legacyCl003Rows.map((row) => [...row]) };
+      sheets[title] = archive;
+      return archive;
+    },
+    clear: async () => { legacyCl003Rows.splice(1); },
+    setHeaderRow: async (headers) => { legacyCl003Rows[0] = [...headers]; },
+    addRows: async (rows) => { legacyCl003Rows.push(...rows.map((row) => [...row])); },
+    resize: async () => {},
+    saveUpdatedCells: async () => {}
+  };
   const sheets = {
     User_Credentials: {
       headerValues: [],
@@ -741,7 +886,9 @@ test('field toggles, quick-edit PIN protection, and legacy settings edits are en
       loadCells: async () => {},
       getCell: (row, col) => cells.get(`${row}:${col}`) || { value: '' },
       saveUpdatedCells: async () => {}
-    }
+    },
+    'CL-002': cl002Sheet,
+    'CL-003': cl003Sheet
   };
   const titleDescriptor = Object.getOwnPropertyDescriptor(GoogleSpreadsheet.prototype, 'sheetsByTitle');
   const indexDescriptor = Object.getOwnPropertyDescriptor(GoogleSpreadsheet.prototype, 'sheetsByIndex');
@@ -796,9 +943,24 @@ test('field toggles, quick-edit PIN protection, and legacy settings edits are en
     assert.equal(cl002.profile.fieldVisibility.bundled.order, false);
     assert.equal(cl002.profile.attributeMap.bundled, null);
     assert.equal(cl002.profile.quickEditMode, 'disabled');
-    assert.equal(credentialRows[0].values.Fields_JSON, undefined);
+    const migratedFields = JSON.parse(credentialRows[0].values.Fields_JSON);
+    assert.deepEqual(migratedFields.map((field) => field.key), ['quantityReceived', 'quantityShipped', 'bundled']);
+    assert.ok(Object.values(sheets).some((sheet) => sheet?.title?.startsWith('CL-002_Original_')));
+    assert.ok(legacyCl002Rows[0].includes('Archived: Exp Date'));
+    assert.equal(legacyCl002Rows[1][legacyCl002Rows[0].indexOf('Archived: Exp Date')], '2027-01');
     assert.ok(!cl002.profile.dashboardColumns.includes('QTY'));
     assert.equal(cl002.profile.dashboardColumns.at(-1), 'STATUS');
+    assert.equal(cl002.profile.legacy, undefined);
+
+    const convertedInventory = await (await call('GET', '/inventory?clientId=CL-002', null, adminToken)).json();
+    assert.equal(convertedInventory[0].title, 'Copper Marker');
+    assert.equal(convertedInventory[0].quantityReceived, '8');
+    const shipmentUpdate = await call('PUT', '/inventory/shipment', {
+      clientId: 'CL-002', itemId: 'CL-002-1', title: 'Copper Marker', received: 9, shipped: 4
+    }, adminToken);
+    assert.equal(shipmentUpdate.status, 200);
+    assert.equal(legacyCl002Rows[1][legacyCl002Rows[0].indexOf('Quantity Received')], 9);
+    assert.equal(legacyCl002Rows[1][legacyCl002Rows[0].indexOf('Quantity Shipped')], 4);
 
     assert.equal((await call('PUT', '/admin/clients/CL-002', { email: 'not-an-email' }, adminToken)).status, 400);
     const withEmail = await (await call('PUT', '/admin/clients/CL-002', { email: 'ecom@example.com' }, adminToken)).json();
@@ -1157,6 +1319,7 @@ test('a saved session survives a page refresh, and expired or rejected sessions 
     setAttribute() {}, removeAttribute() {}, getAttribute: () => null, addEventListener() {},
     querySelector: () => null, querySelectorAll: () => [], focus() {}, replaceChildren() {}, append() {}
   });
+
   const token = (expires) => `${Buffer.from(JSON.stringify({ username: 'EcomElite', clientId: 'CL-002', role: 'client', expires })).toString('base64url')}.sig`;
   const boot = (savedSession, notificationStatus = 200) => {
     const elements = {};
@@ -1210,6 +1373,106 @@ test('a saved session survives a page refresh, and expired or rejected sessions 
   assert.equal(rejected.elements.portalLoginWindow.style.display, 'flex');
   assert.match(rejected.elements.loginErrorMsg.textContent, /session expired/);
   assert.equal(rejected.storage.has('eclPortalSession'), false);
+});
+
+test('theme preference is restored and the mode toggle persists changes', () => {
+  const themeButton = {
+    dataset: { action: 'toggle-theme' },
+    textContent: '',
+    attributes: {},
+    setAttribute(name, value) { this.attributes[name] = value; }
+  };
+  const listeners = [];
+  const preferences = new Map([['eclPortalTheme', 'dark']]);
+  const root = { dataset: { theme: 'light' } };
+  const context = vm.createContext({
+    document: {
+      documentElement: root,
+      getElementById: (id) => id === 'themeToggle' ? themeButton : null,
+      querySelector: () => null,
+      querySelectorAll: () => [],
+      addEventListener: (type, listener) => listeners.push([type, listener])
+    },
+    window: { location: { hostname: 'localhost' }, addEventListener() {} },
+    localStorage: {
+      getItem: (key) => preferences.get(key) || null,
+      setItem: (key, value) => preferences.set(key, value)
+    },
+    setTimeout: () => 0,
+    clearTimeout() {},
+    console
+  });
+
+  vm.runInContext(fs.readFileSync(require.resolve('../frontend/app.js'), 'utf8'), context);
+  assert.equal(root.dataset.theme, 'dark');
+  assert.equal(themeButton.textContent, '☀ Light mode');
+  assert.equal(themeButton.attributes['aria-pressed'], 'true');
+
+  const toggleHandler = listeners.find(([type, listener]) => type === 'click' && String(listener).includes("action === 'toggle-theme'"));
+  assert.ok(toggleHandler, 'the theme control is wired to the delegated click handler');
+  toggleHandler[1]({ target: { closest: () => themeButton } });
+  assert.equal(root.dataset.theme, 'light');
+  assert.equal(preferences.get('eclPortalTheme'), 'light');
+  assert.equal(themeButton.textContent, '☾ Dark mode');
+  assert.equal(themeButton.attributes['aria-pressed'], 'false');
+});
+
+test('newly activated accounts continue into their own client session after saving the recovery code', async () => {
+  const makeElement = () => ({
+    style: {}, dataset: {}, hidden: false, innerHTML: '', textContent: '', value: '',
+    attributes: {}, classList: { add() {}, remove() {}, toggle() {}, contains: () => false },
+    setAttribute(name, value) { this.attributes[name] = value; },
+    removeAttribute() {}, getAttribute: () => null, addEventListener() {},
+    querySelector: () => null, querySelectorAll: () => [], focus() {}, replaceChildren() {}, append() {}
+  });
+  const elements = Object.fromEntries([
+    'portalUser', 'portalPass', 'portalLoginWindow', 'activateAccountWindow', 'recoverAccountWindow',
+    'activateUsername', 'activateCode', 'activatePassword', 'activatePasswordConfirm',
+    'activateErrorMsg', 'activateFormFields', 'activateSuccessPanel', 'activateRecoveryCode', 'activateContinue'
+  ].map((id) => [id, makeElement()]));
+  elements.activateUsername.value = 'CJAClient';
+  elements.activateCode.value = 'SETU-PCOD';
+  elements.activatePassword.value = 'ClientPass123';
+  elements.activatePasswordConfirm.value = 'ClientPass123';
+  const context = vm.createContext({
+    document: {
+      documentElement: { dataset: { theme: 'light' } },
+      hidden: false,
+      getElementById: (id) => elements[id] || null,
+      querySelector: () => null,
+      querySelectorAll: () => [],
+      addEventListener() {}
+    },
+    window: { location: { hostname: 'localhost' }, addEventListener() {} },
+    setTimeout: () => 0,
+    clearTimeout() {},
+    console,
+    fetch: async () => ({
+      ok: true,
+      json: async () => ({
+        success: true,
+        username: 'CJAClient',
+        clientId: 'CL-003',
+        clientName: 'CJA Ventures',
+        role: 'client',
+        notificationToken: 'signed-client-session',
+        recoveryCode: 'SAFE-CODE'
+      })
+    })
+  });
+  vm.runInContext(fs.readFileSync(require.resolve('../frontend/app.js'), 'utf8'), context);
+  let startedSession = null;
+  context.startSession = async (session) => { startedSession = session; };
+
+  await context.submitActivateAccount();
+  assert.equal(elements.activateSuccessPanel.style.display, 'block');
+  assert.equal(elements.activateRecoveryCode.textContent, 'SAFE-CODE');
+  assert.equal(elements.activateContinue.textContent, 'Continue to Your Inventory');
+  await context.finishActivateAccount();
+
+  assert.equal(startedSession.clientId, 'CL-003');
+  assert.equal(startedSession.notificationToken, 'signed-client-session');
+  assert.equal(elements.activateAccountWindow.style.display, 'none');
 });
 
 test('chat messages appear instantly, show failures with retry, and never block the input', async () => {
@@ -1687,6 +1950,9 @@ test('first-time tour launches once for clients, navigates with back/next, and s
   context.__visit = (page) => visited.push(page);
   vm.runInContext('showTourPage = (page) => { if (page) __visit(page); };', context);
   const total = vm.runInContext('ONBOARDING_STEPS.length', context);
+  const themeStep = vm.runInContext("ONBOARDING_STEPS.find((step) => step.target === '#themeToggle')", context);
+  assert.equal(themeStep.title, 'Choose light or dark mode');
+  assert.match(themeStep.body, /remembered the next time you visit/);
 
   vm.runInContext('state.auth = true; state.isAdmin = true;', context);
   assert.equal(vm.runInContext('maybeStartOnboarding()', context), false, 'admins are not auto-toured');
@@ -1704,6 +1970,10 @@ test('first-time tour launches once for clients, navigates with back/next, and s
   assert.equal(elements.tourBack.hidden, false);
   assert.equal(elements.tourSpotlight.hidden, false);
   assert.equal(elements.tourSpotlight.style.top, '194px');
+  vm.runInContext(`moveOnboardingTour(${vm.runInContext("ONBOARDING_STEPS.findIndex((step) => step.target === '#themeToggle') - 1", context)})`, context);
+  assert.equal(elements.tourTitle.textContent, 'Choose light or dark mode');
+  assert.match(elements.tourBody.textContent, /remembered the next time you visit/);
+  vm.runInContext('moveOnboardingTour(-1)', context);
   vm.runInContext('moveOnboardingTour(-1); moveOnboardingTour(-1);', context);
   assert.equal(elements.tourStep.textContent, `Step 1 of ${total}`, 'back stops at the first step');
 

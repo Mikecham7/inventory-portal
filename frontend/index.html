@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html>
+<html data-theme="light">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
@@ -9,7 +9,7 @@
     <link rel="icon" type="image/png" sizes="192x192" href="icons/icon-192.png?v=1" />
     <link rel="apple-touch-icon" sizes="180x180" href="icons/icon-180.png?v=1" />
     <meta name="theme-color" content="#0D1B2A" />
-    <link rel="stylesheet" href="styles.css?v=20261015f" />
+    <link rel="stylesheet" href="styles.css?v=20261015l" />
   </head>
   <body>
     <div class="portal-login-overlay" id="portalLoginWindow">
@@ -40,13 +40,13 @@
       <div class="portal-login-box">
         <img src="https://static.wixstatic.com/media/32ab39_dfd6e4b0422f4d30ac72594477453225~mv2.png" alt="ECL Logo" />
         <h2>CREATE YOUR ACCOUNT</h2>
-        <p>Enter the username and activation code you were given.</p>
+        <p>Enter the exact username and one-time account setup code from ECL, then choose your password.</p>
         <div class="login-error" id="activateErrorMsg"></div>
         <div id="activateFormFields">
           <div class="portal-login-form">
             <label>Username</label>
             <input type="text" id="activateUsername" placeholder="Your username..." autocomplete="username" />
-            <label>Activation Code</label>
+            <label>Account Setup Code</label>
             <input type="text" id="activateCode" placeholder="XXXX-XXXX" autocomplete="off" />
             <label>New Password</label>
             <div class="password-field">
@@ -66,7 +66,7 @@
             <p><strong>Save this recovery code somewhere safe.</strong> You'll need it if you ever forget your password — it won't be shown again.</p>
             <div class="recovery-code-value" id="activateRecoveryCode"></div>
           </div>
-          <button class="portal-login-btn" onclick="finishActivateAccount()">Continue to Sign In</button>
+          <button class="portal-login-btn" id="activateContinue" onclick="finishActivateAccount()">Continue to Your Inventory</button>
         </div>
         <div class="portal-auth-links">
           <a href="#" onclick="showAuthScreen('login'); return false;">Back to Sign In</a>
@@ -122,6 +122,7 @@
           </div>
         </div>
         <div class="header-right">
+          <button class="theme-toggle" id="themeToggle" type="button" data-action="toggle-theme" aria-label="Switch to dark mode" aria-pressed="false" title="Switch to dark mode">☾ Dark mode</button>
           <div class="notification-anchor" id="notificationAnchor" style="display:none;">
             <button class="notification-button" id="notificationButton" type="button" aria-label="Notifications" aria-expanded="false" aria-controls="notificationPanel" title="Notifications" onclick="toggleNotifications()">🔔<span class="notification-badge" id="notificationBadge" style="display:none;">0</span></button>
             <div class="notification-panel" id="notificationPanel" style="display:none;" role="region" aria-label="Unread notifications">
@@ -541,7 +542,7 @@
       <details class="update-card section-panel" open>
         <summary><span>Edit an existing client<small>Update account settings and inventory configuration</small></span></summary>
         <div class="section-body">
-        <p style="color:#666;font-size:12px;margin-bottom:12px;">Change settings or add/rename/remove fields any time — the sheet columns update to match.</p>
+        <p style="color:#666;font-size:12px;margin-bottom:12px;">Change settings or add/rename/remove fields any time. Removed field values are retained in archived columns.</p>
         <div id="editClientMsg" role="status" style="display:none;margin-bottom:12px;padding:8px 10px;border-radius:8px;font-size:12px;font-weight:700;"></div>
 
         <label class="ac-label" for="ecClientSelect">Select Client</label>
@@ -550,7 +551,7 @@
         </select>
 
         <div id="editClientForm" style="display:none;">
-          <div id="ecLegacyNote" class="ac-note" style="display:none;">This is a built-in client. Its sheet columns and layout stay as they are; you can change the email, field visibility, Quick Edit, filter mapping, and overstock level.</div>
+          <div id="ecLegacyNote" class="ac-note" style="display:none;">Saving this built-in client's settings will standardize its inventory tab. The original tab will be duplicated as a backup, and existing inventory and shipment data will be carried over.</div>
           <div style="margin-bottom:10px;">
             <label class="ac-label" for="ecEmail">Email</label>
             <input type="email" id="ecEmail" class="ac-input" maxlength="254" placeholder="client@email.com" autocomplete="off" />
@@ -648,15 +649,15 @@
       </details>
 
       <details class="update-card section-panel">
-        <summary><span>Reset client access<small>Issue a one-time password reset code</small></span></summary>
+        <summary><span>Reset client access<small>Issue a one-time account setup code</small></span></summary>
         <div class="section-body">
-        <p style="color:#666;font-size:12px;margin-bottom:12px;">Passwords and recovery codes are stored hashed and can't be read from the sheet. Resetting invalidates the old password and recovery code and gives you a one-time reset code to send with the exact username; the client then chooses a new password using "Forgot Password?". "Create Account" also accepts this code.</p>
+        <p style="color:#666;font-size:12px;margin-bottom:12px;">Issue a one-time setup code for a client who is creating their account or needs new access. This immediately invalidates their current password and recovery code. Send the code with their exact username; they choose <strong>Create Account</strong>, set a password, save their new recovery code, and continue directly to their inventory.</p>
         <div id="resetPasswordMsg" role="status" style="display:none;margin-bottom:12px;padding:8px 10px;border-radius:8px;font-size:12px;font-weight:700;"></div>
         <label class="ac-label" for="rpClientSelect">Client</label>
         <select id="rpClientSelect" style="width:100%;padding:10px 12px;border:1px solid #dfe7f1;border-radius:8px;margin-bottom:12px;">
           <option value="">— Choose a client —</option>
         </select>
-        <button type="button" class="btn-set" onclick="resetClientPasswordPrompt()">Reset Password</button>
+        <button type="button" class="btn-set" onclick="resetClientPasswordPrompt()">Issue Setup Code</button>
         </div>
       </details>
     </div>
@@ -701,6 +702,12 @@
               <p>Type a SKU or product name in the dashboard search box — results update as you type. Select <strong>Filters</strong> to narrow the list by status, such as low stock or partially shipped.</p>
             </div>
           </details>
+          <details class="faq-item" data-keywords="dark light mode theme appearance brightness display">
+            <summary>How do I switch between dark mode and light mode?</summary>
+            <div class="faq-answer">
+              <p>Select the <strong>Dark mode</strong> or <strong>Light mode</strong> button in the top-right of the portal header. The portal updates right away and remembers your choice in this browser for your next visit.</p>
+            </div>
+          </details>
           <details class="faq-item" data-keywords="status badge meaning low stock out of stock not received partially fully shipped">
             <summary>What do the status labels mean?</summary>
             <div class="faq-answer">
@@ -711,6 +718,12 @@
             <summary>Where can I see a history of changes?</summary>
             <div class="faq-answer">
               <p>Open the <strong>Activity</strong> tab. Each row shows the timestamp, action, user, and details, with the most recent first. Use the filter box to search any column; the list refreshes automatically while it's open.</p>
+            </div>
+          </details>
+          <details class="faq-item" data-keywords="create account first time setup activation code invitation existing client new password">
+            <summary>How do I create my portal account?</summary>
+            <div class="faq-answer">
+              <p>Use the exact username and one-time account setup code provided by ECL. Select <strong>Create Account</strong> on the sign-in screen, choose a password, and save the recovery code shown. Select <strong>Continue to Your Inventory</strong> to open your inventory.</p>
             </div>
           </details>
           <details class="faq-item" data-keywords="password reset forgot change recovery code sign in login">
@@ -785,6 +798,6 @@
     <div class="footer">Electric City Logistics LLC &nbsp;|&nbsp; eclsupport@electriccitylogistics.com &nbsp;|&nbsp; (406)-948-2719</div>
     <div class="toast" id="toast"></div>
 
-    <script src="app.js?v=20261015f"></script>
+    <script src="app.js?v=20261015l"></script>
   </body>
 </html>

@@ -65,6 +65,10 @@ button { cursor: pointer; }
 .logout-btn { background: #dc3545; color: white; border: none; padding: 5px 8px; font-size: 10px; font-weight: bold; border-radius: 4px; cursor: pointer; white-space: nowrap; }
 .logout-btn:active { background: #bd2130; }
 @media (min-width: 480px) { .logout-btn { font-size: 11px; padding: 5px 10px; } }
+.theme-toggle { padding: 5px 8px; border: 1px solid #7a96ae; border-radius: 4px; background: transparent; color: white; font-size: 10px; font-weight: 700; white-space: nowrap; }
+.theme-toggle:hover { background: rgba(255,255,255,.12); }
+.theme-toggle:focus-visible { outline: 2px solid var(--yellow); outline-offset: 2px; }
+@media (min-width: 480px) { .theme-toggle { font-size: 11px; padding: 6px 10px; } }
 
 .notification-anchor { position: relative; }
 .notification-button { width: 32px; height: 32px; position: relative; background: transparent; border: 1px solid #7a96ae; border-radius: 4px; color: white; font-size: 16px; }
@@ -388,7 +392,7 @@ label { display: block; font-size: 11px; font-weight: bold; color: var(--mid); m
 .portal-login-box h2 { color: var(--navy); font-size: 18px; margin-bottom: 4px; }
 .portal-login-box p { color: #666; font-size: 12px; margin-bottom: 18px; }
 .portal-login-form { text-align: left; margin-bottom: 14px; }
-.portal-login-form input { width: 100%; padding: 10px 12px; font-size: 14px; border: 1.5px solid var(--border); border-radius: 6px; margin-bottom: 10px; color: var(--navy); outline: none; }
+.portal-login-form input { width: 100%; padding: 10px 12px; font-size: 14px; border: 1.5px solid var(--border); border-radius: 6px; margin-bottom: 10px; background: white; color: var(--navy); color-scheme: light; outline: none; }
 .portal-login-form input:focus { border-color: var(--mid); }
 .password-field { position: relative; }
 .password-field input { padding-right: 44px; }
@@ -813,6 +817,8 @@ html, body { background: var(--canvas); }
 
 /* Faded diagonal ECL logo watermark behind the sign-in, activation, and reset screens. */
 .portal-login-overlay {
+  color-scheme: light;
+  --border: #D0D4DA;
   background: radial-gradient(ellipse at center, #16314d 0%, #0a1520 70%);
   isolation: isolate;
   overflow-y: auto;
@@ -832,6 +838,11 @@ html, body { background: var(--canvas); }
 .portal-login-overlay .portal-login-box { position: relative; margin: auto; }
 @media (max-width: 599px) { .portal-login-overlay::before { background-size: 80px auto; } }
 @media (prefers-reduced-transparency: reduce) { .portal-login-overlay::before { display: none; } }
+html[data-theme="dark"] .portal-login-overlay {
+  color-scheme: light;
+  --border: #D0D4DA;
+  background: radial-gradient(ellipse at center, #16314d 0%, #0a1520 70%);
+}
 /* Help & FAQ */
 .help-heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
 .help-tour-btn {
@@ -912,3 +923,172 @@ body.tour-open { overflow-x: hidden; }
 @media (prefers-reduced-motion: reduce) {
   .tour-spotlight, .tour-progress span, .faq-item > summary::after { transition: none; }
 }
+
+html[data-theme="dark"] {
+  color-scheme: dark;
+  --canvas: #111a24;
+  --surface-border: #46576a;
+  --surface-border-strong: #62758a;
+  --surface-head: #253444;
+  --surface-shadow: 0 1px 3px rgba(0,0,0,.3), 0 8px 20px rgba(0,0,0,.22);
+  --gray: #202d3b;
+  --light: #2a3c4f;
+  --border: #46576a;
+  --green-bg: #193a2b; --green-fg: #a3dfb4;
+  --yellow-bg: #423819; --yellow-fg: #f0d477;
+  --red-bg: #45262b; --red-fg: #f0a4ab;
+  --gray-bg: #303b47; --gray-fg: #d0d7df;
+  --blue-bg: #1f3852; --blue-fg: #acd1f4;
+  --new-bg: #193a2b; --new-fg: #a3dfb4;
+  --text: #e6edf5;
+  --muted-text: #b0bfd0;
+  --surface: #1b2734;
+  background: var(--canvas);
+}
+
+html[data-theme="dark"] body { background: var(--canvas); color: var(--text); }
+html[data-theme="dark"] .tabs,
+html[data-theme="dark"] .summary-card:not(.warn):not(.danger),
+html[data-theme="dark"] .data-card,
+html[data-theme="dark"] .table-wrap,
+html[data-theme="dark"] .update-card,
+html[data-theme="dark"] .section-panel,
+html[data-theme="dark"] .section-body .section-panel > summary,
+html[data-theme="dark"] .notification-panel,
+html[data-theme="dark"] .search-results,
+html[data-theme="dark"] .ac-input,
+html[data-theme="dark"] .filter-bar input,
+html[data-theme="dark"] .filter-btn,
+html[data-theme="dark"] .filter-toggle,
+html[data-theme="dark"] .filter-panel,
+html[data-theme="dark"] .filter-option,
+html[data-theme="dark"] .filter-option::before,
+html[data-theme="dark"] .filter-clear,
+html[data-theme="dark"] .billing-total:not(.primary),
+html[data-theme="dark"] .billing-invoice,
+html[data-theme="dark"] .billing-day,
+html[data-theme="dark"] .billing-day-head,
+html[data-theme="dark"] .chat-container,
+html[data-theme="dark"] .identity-bar,
+html[data-theme="dark"] .messages-box,
+html[data-theme="dark"] .msg-wrap.them .msg-bubble,
+html[data-theme="dark"] .input-area,
+html[data-theme="dark"] .activity-table tbody tr:nth-child(odd),
+html[data-theme="dark"] .section-body .section-panel,
+html[data-theme="dark"] .faq-item,
+html[data-theme="dark"] .tour-card,
+html[data-theme="dark"] .tour-btn:not(.tour-next) {
+  background-color: var(--surface);
+}
+
+html[data-theme="dark"] .tabs { border-bottom-color: var(--surface-border); }
+html[data-theme="dark"] .tab:not(.active) { color: var(--muted-text); }
+html[data-theme="dark"] .tab:not(.active):hover,
+html[data-theme="dark"] .section-panel > summary:hover,
+html[data-theme="dark"] .section-body .section-panel > summary,
+html[data-theme="dark"] .faq-item > summary:hover { background: var(--surface-head); }
+html[data-theme="dark"] .section-panel,
+html[data-theme="dark"] .section-panel > summary,
+html[data-theme="dark"] .billing-invoice,
+html[data-theme="dark"] .billing-day,
+html[data-theme="dark"] .faq-item { border-color: var(--surface-border); }
+html[data-theme="dark"] .page-heading h2,
+html[data-theme="dark"] .summary-card .num,
+html[data-theme="dark"] .data-card-title,
+html[data-theme="dark"] .data-card-grid .dcg-val,
+html[data-theme="dark"] .sku-cell,
+html[data-theme="dark"] .title-cell,
+html[data-theme="dark"] .qty-cell,
+html[data-theme="dark"] td,
+html[data-theme="dark"] .billing-total strong,
+html[data-theme="dark"] .billing-lines td,
+html[data-theme="dark"] .billing-entry,
+html[data-theme="dark"] .billing-invoice-head,
+html[data-theme="dark"] .billing-subhead,
+html[data-theme="dark"] .section-panel > summary,
+html[data-theme="dark"] .section-panel > summary small,
+html[data-theme="dark"] .filter-option,
+html[data-theme="dark"] .filter-panel-head,
+html[data-theme="dark"] .filter-clear,
+html[data-theme="dark"] .faq-item > summary,
+html[data-theme="dark"] .faq-answer,
+html[data-theme="dark"] .tour-card,
+html[data-theme="dark"] .tour-title,
+html[data-theme="dark"] .tour-body,
+html[data-theme="dark"] .tour-btn:not(.tour-next) {
+  color: var(--text);
+}
+
+html[data-theme="dark"] .content p,
+html[data-theme="dark"] .content label,
+html[data-theme="dark"] .content small,
+html[data-theme="dark"] .content .data-card-sub,
+html[data-theme="dark"] .content .data-card-grid .dcg-lbl,
+html[data-theme="dark"] .content .page-heading p,
+html[data-theme="dark"] .content .ac-label,
+html[data-theme="dark"] .content .ac-check,
+html[data-theme="dark"] .content .qty-display .ql,
+html[data-theme="dark"] .content .billing-total span,
+html[data-theme="dark"] .content .billing-detail,
+html[data-theme="dark"] .content .billing-updated,
+html[data-theme="dark"] .content .billing-hint,
+html[data-theme="dark"] .content .billing-progress-label,
+html[data-theme="dark"] .content .billing-line-rate,
+html[data-theme="dark"] .content .billing-line-desc,
+html[data-theme="dark"] .content .billing-entry-desc,
+html[data-theme="dark"] .content .billing-entry-meta,
+html[data-theme="dark"] .content .rc-service-head,
+html[data-theme="dark"] .content .faq-count,
+html[data-theme="dark"] .content .faq-empty,
+html[data-theme="dark"] .content .tour-step,
+html[data-theme="dark"] .content .tour-skip {
+  color: var(--muted-text);
+}
+
+html[data-theme="dark"] .content input:not([type="checkbox"]):not([type="radio"]),
+html[data-theme="dark"] .content select,
+html[data-theme="dark"] .content textarea {
+  background-color: #141f2b;
+  color: var(--text);
+  border-color: var(--surface-border-strong);
+}
+html[data-theme="dark"] .content input::placeholder,
+html[data-theme="dark"] .content textarea::placeholder { color: #9aabbd; }
+html[data-theme="dark"] .content .billing-total,
+html[data-theme="dark"] .content .billing-day-head { color: var(--text); }
+html[data-theme="dark"] .content .billing-entry.editing { background: #352f1d; }
+html[data-theme="dark"] .content .billing-progress { background: var(--surface-head); }
+html[data-theme="dark"] .content .table-wrap td,
+html[data-theme="dark"] .content .activity-table td,
+html[data-theme="dark"] .content .billing-lines td,
+html[data-theme="dark"] .content .billing-entry,
+html[data-theme="dark"] .content .identity-bar,
+html[data-theme="dark"] .content .input-area {
+  border-color: var(--surface-border);
+}
+html[data-theme="dark"] .admin-switcher { background: var(--surface); }
+html[data-theme="dark"] .admin-switcher label { color: var(--muted-text); }
+html[data-theme="dark"] .admin-switcher-btn:not(.active) {
+  background: var(--surface-head);
+  color: var(--text);
+  border-color: var(--surface-border-strong);
+}
+html[data-theme="dark"] .content .selected-banner,
+html[data-theme="dark"] .content .qty-display,
+html[data-theme="dark"] .content .identity-bar,
+html[data-theme="dark"] .content .billing-total,
+html[data-theme="dark"] .content .billing-day-head,
+html[data-theme="dark"] .content .section-panel > summary {
+  background-color: var(--surface-head);
+}
+html[data-theme="dark"] .content .billing-total.primary { background: var(--navy); }
+html[data-theme="dark"] .content .billing-total.primary span { color: var(--yellow); }
+html[data-theme="dark"] .content .billing-total.primary strong { color: white; }
+html[data-theme="dark"] .content .welcome-banner.is-personalized h2 { color: white; }
+html[data-theme="dark"] .content .welcome-banner.is-personalized #welcomeSubtitle { color: #c7d5e4; }
+html[data-theme="dark"] .content .faq-item > summary { background: var(--surface-head); }
+html[data-theme="dark"] .content .ac-note { background: #1e3550; color: #c5ddf5; border-color: #395979; }
+html[data-theme="dark"] .faq-item > summary::after { border-color: var(--muted-text); }
+html[data-theme="dark"] .faq-answer a { color: #8fc5ff; }
+html[data-theme="dark"] .tour-card .tour-step { color: var(--yellow-fg); }
+html[data-theme="dark"] .tour-card .tour-skip { color: var(--muted-text); }

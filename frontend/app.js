@@ -1122,6 +1122,8 @@ function showAuthError(elementId, message) {
   el.style.display = 'block';
 }
 
+let pendingActivatedSession = null;
+
 async function submitActivateAccount() {
   const username = String(document.getElementById('activateUsername')?.value || '').trim();
   const activationCode = String(document.getElementById('activateCode')?.value || '').trim();
@@ -1152,16 +1154,21 @@ async function submitActivateAccount() {
       throw new Error(result.error || 'Unable to create account.');
     }
 
+    pendingActivatedSession = result.notificationToken ? result : null;
     document.getElementById('activateFormFields').style.display = 'none';
     document.getElementById('activateSuccessPanel').style.display = 'block';
     document.getElementById('activateRecoveryCode').textContent = result.recoveryCode;
+    const continueButton = document.getElementById('activateContinue');
+    if (continueButton) continueButton.textContent = pendingActivatedSession ? 'Continue to Your Inventory' : 'Continue to Sign In';
     if (portalUser) portalUser.value = username;
   } catch (error) {
     showAuthError('activateErrorMsg', error.message || 'Unable to create account.');
   }
 }
 
-function finishActivateAccount() {
+async function finishActivateAccount() {
+  const activatedSession = pendingActivatedSession;
+  pendingActivatedSession = null;
   document.getElementById('activateFormFields').style.display = 'block';
   document.getElementById('activateSuccessPanel').style.display = 'none';
   ['activateUsername', 'activateCode', 'activatePassword', 'activatePasswordConfirm'].forEach((id) => {
@@ -1169,6 +1176,14 @@ function finishActivateAccount() {
     if (el) el.value = '';
   });
   showAuthScreen('login');
+  if (!activatedSession) return;
+  try {
+    await startSession(activatedSession);
+  } catch (error) {
+    console.error('Could not open inventory after account activation:', error);
+    executePortalLogout('Your account is ready. Please sign in with your new password.');
+    if (portalUser) portalUser.value = activatedSession.username || '';
+  }
 }
 
 let recoverySubmitting = false;
@@ -1421,8 +1436,8 @@ function renderDriveFolderLink() {
 
 function syncAddTabVisibility() {
   const clientId = state.activeClientId || state.session?.clientId || 'CL-001';
-  const config = getClientInventoryFields(clientId);
-  const shouldShow = Boolean(config && !config.readOnly && !config.requirePin);
+  const profile = state.clientProfile && state.clientProfile.clientId === clientId ? state.clientProfile : null;
+  const shouldShow = Boolean(profile && profile.enableAddItem && !profile.readOnly);
   ['tabOrder'].forEach((id) => {
     const tab = document.getElementById(id);
     if (tab) tab.style.display = shouldShow ? 'block' : 'none';
@@ -1445,7 +1460,10 @@ function getFormFields(clientId, kind) {
 
 function syncCreateFormLayout() {
   const clientId = state.activeClientId || state.session?.clientId || 'CL-001';
-  const titleConfig = getCreateFormTitleConfig(clientId);
+  const profile = state.clientProfile && state.clientProfile.clientId === clientId ? state.clientProfile : null;
+  const titleConfig = profile && !profile.legacy
+    ? { ...getCreateFormTitleConfig(clientId), ...profile.titleField, visible: true }
+    : getCreateFormTitleConfig(clientId);
   const isCardClient = clientId === 'CL-003';
 
   Object.values(ITEM_FORMS).forEach(({ prefix }) => {
@@ -1512,7 +1530,8 @@ function renderFieldInputs(fields, idPrefix) {
 
 function renderProductForm() {
   const clientId = state.activeClientId || state.session?.clientId || 'CL-001';
-  const config = getClientInventoryFields(clientId);
+  const profile = state.clientProfile && state.clientProfile.clientId === clientId ? state.clientProfile : null;
+  const config = profile || getClientInventoryFields(clientId);
 
   syncAddTabVisibility();
   syncCreateFormLayout();
@@ -1971,6 +1990,12 @@ const ONBOARDING_STEPS = [
   },
   {
     page: 'page-dashboard',
+    target: '#themeToggle',
+    title: 'Choose light or dark mode',
+    body: 'Select this button to switch between light mode and dark mode. Your choice is saved in this browser and will be remembered the next time you visit.'
+  },
+  {
+    page: 'page-dashboard',
     target: '#page-dashboard .table-shell',
     title: 'Your inventory at a glance',
     body: 'Every item and its status lives here. Search by SKU or product name, or use Filters to narrow the list.'
@@ -2173,8 +2198,8 @@ function closeOnboardingTour({ markSeen = true, restorePage = true } = {}) {
   tourState.frame = 0;
   tourState.observer?.disconnect();
   tourState.observer = null;
-  window.removeEventListener('resize', scheduleTourPosition);
-  window.removeEventListener('scroll', scheduleTourPosition);
+  window.removeEventListener?.('resize', scheduleTourPosition);
+  window.removeEventListener?.('scroll', scheduleTourPosition);
   const overlay = document.getElementById('tourOverlay');
   if (overlay) overlay.hidden = true;
   document.body?.classList.remove('tour-open');
@@ -2485,6 +2510,15 @@ function getEditableItemFields(clientId) {
   const fields = (profile ? profile.fields : CLIENT_INVENTORY_FIELDS[safeClientId]?.fields) || [];
   const shipment = getShipmentFieldKeys(safeClientId);
   const custom = fields.filter((field) => !shipment || (field.key !== shipment.received && field.key !== shipment.shipped));
+  if ((safeClientId === 'CL-002' || safeClientId === 'CL-003') && profile && !profile.legacy) {
+    const base = safeClientId === 'CL-002'
+      ? [
+        { key: 'sku', label: 'UPC', type: 'text' },
+        { key: 'title', label: profile.titleField?.label || 'Product Description', type: 'text' }
+      ]
+      : [{ key: 'title', label: profile.titleField?.label || 'Product Description / Name', type: 'text' }];
+    return [...base, ...custom, { key: 'notes', label: 'Notes', type: 'textarea' }];
+  }
   if (safeClientId === 'CL-002' || safeClientId === 'CL-003') return custom;
   const base = [
     { key: 'sku', label: 'SKU (optional)', type: 'text' },
@@ -2757,6 +2791,7 @@ document.addEventListener('click', (event) => {
     clearFilters();
   }
 
+  if (action === 'toggle-theme') toggleTheme();
   if (action === 'toggle-filter-panel') {
     setFilterPanelOpen(document.getElementById('filterPanel')?.hidden !== false);
   }
@@ -3020,8 +3055,8 @@ async function loadClientForEdit(clientId) {
 
   if (form) form.style.display = 'block';
   const isLegacy = Boolean(profile.legacy);
-  state.editClientLegacy = isLegacy;
-  [['ecGenericSettings', !isLegacy], ['ecAddFieldBtn', !isLegacy], ['ecDeleteBtn', !isLegacy], ['ecLegacyNote', isLegacy]].forEach(([id, show]) => {
+  state.editClientLegacy = false;
+  [['ecGenericSettings', true], ['ecAddFieldBtn', true], ['ecDeleteBtn', !isLegacy], ['ecLegacyNote', isLegacy]].forEach(([id, show]) => {
     const el = document.getElementById(id);
     if (el) el.style.display = show ? '' : 'none';
   });
@@ -3062,11 +3097,14 @@ async function loadClientForEdit(clientId) {
   });
 
   const visibility = profile.fieldVisibility || {};
-  state.editClientFields = (profile.fields || []).map((field) => ({
+  const legacyCoreKeys = new Set(['upc', 'productDescription', 'productName', 'notes']);
+  const fixedShipmentKeys = new Set(['quantityReceived', 'quantityShipped']);
+  state.editClientFields = (profile.fields || []).filter((field) => !isLegacy || !legacyCoreKeys.has(field.key)).map((field) => ({
     key: field.key,
     label: field.label,
     type: field.type,
     options: (field.options || []).join(', '),
+    fixed: fixedShipmentKeys.has(field.key) && ['CL-002', 'CL-003'].includes(state.editClientId),
     showInInventory: visibility[field.key]?.inventory !== false,
     showInOrder: visibility[field.key]?.order !== false
   }));
@@ -3111,7 +3149,7 @@ function renderEditClientFieldRows() {
   }
 
   const handlers = { update: 'updateEditClientFieldRow', remove: 'removeEditClientFieldRow', render: 'renderEditClientFieldRows' };
-  host.innerHTML = state.editClientFields.map((field, index) => fieldRowHtml(field, index, handlers, state.editClientLegacy)).join('');
+  host.innerHTML = state.editClientFields.map((field, index) => fieldRowHtml(field, index, handlers, field.fixed)).join('');
 }
 
 function showEditClientMessage(text, type) {
@@ -3234,7 +3272,7 @@ async function resetClientPasswordPrompt() {
     showResetPasswordMessage('Choose a client first.', 'error');
     return;
   }
-  if (!window.confirm(`Reset the password for ${clientId}? Their current password and recovery code stop working immediately.`)) return;
+  if (!window.confirm(`Issue an account setup code for ${clientId}? Their current password and recovery code stop working immediately.`)) return;
 
   try {
     const response = await fetch(`${ADMIN_CLIENTS_URL}/${encodeURIComponent(clientId)}/reset-password`, {
@@ -3245,7 +3283,7 @@ async function resetClientPasswordPrompt() {
     if (!response.ok || !result.success) {
       throw new Error(result.error || 'Unable to reset password.');
     }
-    showResetPasswordMessage(`Password reset for ${result.username}. Send them this one-time reset code: ${result.activationCode}. They'll use "Forgot Password?" on the sign-in screen with this exact username to choose a new password. "Create Account" also accepts this code.`, 'success');
+    showResetPasswordMessage(`Setup code for ${result.username}: ${result.activationCode}. Send this one-time code with the exact username. They should choose "Create Account" to set their password and then continue to their inventory.`, 'success');
   } catch (error) {
     showResetPasswordMessage(error.message || 'Unable to reset password.', 'error');
   }
@@ -3729,6 +3767,7 @@ async function syncBillingTab() {
 }
 
 function initializeApp() {
+  initializeTheme();
   const typingIndicator = document.getElementById('typingIndicator');
   if (typingIndicator) {
     typingIndicator.style.display = 'none';
@@ -3746,6 +3785,47 @@ function initializeApp() {
     restoreSavedSession().finally(() => {
       if (!state.auth && portalLoginWindow) portalLoginWindow.style.display = 'flex';
     });
+  }
+}
+
+const THEME_PREFERENCE_KEY = 'eclPortalTheme';
+
+function applyTheme(theme) {
+  const isDark = theme === 'dark';
+  const root = document.documentElement;
+  if (!root) return;
+  root.dataset.theme = isDark ? 'dark' : 'light';
+  const toggle = document.getElementById('themeToggle');
+  if (!toggle) return;
+  const nextTheme = isDark ? 'light' : 'dark';
+  toggle.textContent = isDark ? '☀ Light mode' : '☾ Dark mode';
+  toggle.setAttribute('aria-label', `Switch to ${nextTheme} mode`);
+  toggle.setAttribute('title', `Switch to ${nextTheme} mode`);
+  toggle.setAttribute('aria-pressed', String(isDark));
+}
+
+function initializeTheme() {
+  let theme = 'light';
+  if (typeof localStorage !== 'undefined') {
+    try {
+      const savedTheme = localStorage.getItem(THEME_PREFERENCE_KEY);
+      if (savedTheme === 'dark' || savedTheme === 'light') theme = savedTheme;
+    } catch (error) {
+      console.error('Unable to load theme preference:', error);
+      showToast('Your theme preference could not be loaded.', 'error');
+    }
+  }
+  applyTheme(theme);
+}
+
+function toggleTheme() {
+  const theme = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
+  applyTheme(theme);
+  try {
+    localStorage.setItem(THEME_PREFERENCE_KEY, theme);
+  } catch (error) {
+    console.error('Unable to save theme preference:', error);
+    showToast('Theme changed, but your choice could not be saved.', 'error');
   }
 }
 
