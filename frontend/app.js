@@ -16,10 +16,14 @@ const CLIENTS_URL = `${API_BASE}/api/clients`;
 const CHAT_URL = `${API_BASE}/api/chat`;
 
 const CREATE_ITEM_URL = `${API_BASE}/api/inventory/create`;
+const CATALOG_SYNC_URL = `${API_BASE}/api/catalog/sync`;
+const STORE_CONNECTION_URL = `${API_BASE}/api/store-connection`;
 
 const CLIENT_PROFILE_URL = `${API_BASE}/api/client-profile`;
 
 const ADMIN_CLIENTS_URL = `${API_BASE}/api/admin/clients`;
+const ADMIN_STAFF_URL = `${API_BASE}/api/admin/staff`;
+const ADMIN_LOGINS_URL = `${API_BASE}/api/admin/logins`;
 
 const ACTIVATE_ACCOUNT_URL = `${API_BASE}/api/account/activate`;
 
@@ -28,6 +32,8 @@ const RECOVER_ACCOUNT_URL = `${API_BASE}/api/account/recover`;
 const NOTIFICATIONS_URL = `${API_BASE}/api/notifications`;
 
 const ACTIVITY_URL = `${API_BASE}/api/activity`;
+const TRACKING_URL = `${API_BASE}/api/tracking`;
+const INBOUND_URL = `${API_BASE}/api/inbound-shipments`;
 
 const UPDATE_QUANTITY_URL = `${API_BASE}/api/inventory/quantity`;
 const QUICK_EDIT_UNLOCK_URL = `${API_BASE}/api/quick-edit/unlock`;
@@ -42,7 +48,6 @@ const CLIENT_INVENTORY_FIELDS = {
   'CL-001': { label: 'Metal Garden Markers', readOnly: true, requirePin: true, fields: [] },
   'CL-002': { label: 'Ecom Elite 2.0', readOnly: false, requirePin: false, fields: [
     { key: 'upc', label: 'UPC', type: 'text' },
-    { key: 'productDescription', label: 'Product Description', type: 'textarea' },
     { key: 'quantityOrdered', label: 'Quantity Ordered', type: 'number' },
     { key: 'quantityReceived', label: 'Quantity Received', type: 'number', adminOnly: true },
     { key: 'quantityShipped', label: 'Quantity Shipped', type: 'number', adminOnly: true },
@@ -221,6 +226,7 @@ function normalizeInventoryItem(item, fallbackClientId = '') {
 const state = {
   items: [],
   filters: { stock: [], stage: [], attr: [] },
+  inventoryView: 'active',
   quickEditUnlock: null,
   billing: null,
   pendingMessages: [],
@@ -242,6 +248,7 @@ const state = {
   editClientId: '',
   editClientFields: [],
   activity: { clientId: null, entries: null, loading: false, error: '' },
+  tracking: { clientId: null, items: null, query: '', updatedAt: '', loading: false, error: '' },
   notifications: { chat: 0, inventory: 0, total: 0, items: [] }
 };
 
@@ -249,6 +256,7 @@ let chatRequestId = 0;
 let inventoryRequestId = 0;
 let notificationRequestId = 0;
 let activityRequestId = 0;
+let trackingRequestId = 0;
 let chatSignature = null;
 let inventorySignature = null;
 let syncGeneration = 0;
@@ -274,9 +282,9 @@ function cacheClientView(clientId, values) {
   if (!clientId) return;
   clientViewCache.set(clientId, { ...(clientViewCache.get(clientId) || {}), ...values });
 }
-const syncTimers = { chat: null, inventory: null, notifications: null, billing: null, activity: null };
-const syncFailures = { chat: 0, inventory: 0, notifications: 0, billing: 0, activity: 0 };
-const syncIntervals = { chat: 12000, inventory: 30000, notifications: 60000, billing: 30000, activity: 30000 };
+const syncTimers = { chat: null, inventory: null, notifications: null, billing: null, activity: null, tracking: null };
+const syncFailures = { chat: 0, inventory: 0, notifications: 0, billing: 0, activity: 0, tracking: 0 };
+const syncIntervals = { chat: 12000, inventory: 30000, notifications: 60000, billing: 30000, activity: 30000, tracking: 30000 };
 // Every open tab shares the same Google Sheets read allowance, so idle tabs stop polling until used again.
 const IDLE_PAUSE_MS = 5 * 60 * 1000;
 let lastInteractionAt = Date.now();
@@ -317,6 +325,7 @@ function scheduleBackgroundSync(kind, delay, generation = syncGeneration) {
     if (kind === 'chat' && !document.getElementById('page-chat')?.classList.contains('active')) return;
     if (kind === 'billing' && !isPageActive('page-billing')) return;
     if (kind === 'activity' && !isPageActive('page-logs')) return;
+    if (kind === 'tracking' && !isPageActive('page-tracking')) return;
 
     const clientId = state.activeClientId;
     let status = 0;
@@ -325,7 +334,8 @@ function scheduleBackgroundSync(kind, delay, generation = syncGeneration) {
       status = kind === 'chat' ? await loadChatMessages(clientId)
         : kind === 'billing' ? await loadBillingSummary(clientId)
           : kind === 'activity' ? await loadActivity(clientId)
-            : kind === 'inventory' ? await fetchInventory(clientId) : await fetchNotifications(clientId);
+            : kind === 'tracking' ? await loadTracking(clientId)
+              : kind === 'inventory' ? await fetchInventory(clientId) : await fetchNotifications(clientId);
     } catch (error) {
       console.error(`Background ${kind} refresh failed:`, error);
     }
@@ -356,9 +366,11 @@ function startBackgroundSync(immediate = false) {
   if (isPageActive('page-logs')) {
     scheduleBackgroundSync('activity', immediate ? 0 : syncIntervals.activity);
   }
+  if (isPageActive('page-tracking')) scheduleBackgroundSync('tracking', 0);
 }
 
 document.addEventListener('visibilitychange', () => {
+  if (document.hidden) stopBarcodeCamera();
   if (document.hidden) stopBackgroundSync();
   else {
     lastInteractionAt = Date.now();
@@ -517,6 +529,14 @@ function showToast(text, variant = 'success') {
 }
 
 function setPage(pageId) {
+  if (state.auth && !canOpenPortalPage(pageId)) {
+    showToast('Your role does not have access to this section.', 'error');
+    return;
+  }
+  if (pageId !== 'page-dashboard') closePackagingDialog();
+  if (!['page-dashboard', 'page-tracking'].includes(pageId)) closeInboundDialog();
+  if (pageId !== 'page-update') stopBarcodeCamera();
+  if (pageId !== 'page-store-settings') resetStoreConnection();
   const typingIndicator = document.getElementById('typingIndicator');
   if (typingIndicator) {
     typingIndicator.style.display = 'none';
@@ -543,7 +563,9 @@ function setPage(pageId) {
     'page-chat': 4,
     'page-billing': 5,
     'page-clients': 6,
-    'page-help': 7
+    'page-tracking': 7,
+    'page-store-settings': 8,
+    'page-help': 9
   };
 
   const tabIndex = tabMap[pageId];
@@ -552,6 +574,20 @@ function setPage(pageId) {
     tabs[tabIndex].setAttribute('aria-current', 'page');
   }
   if (state.auth && !document.hidden) {
+    if (pageId === 'page-store-settings') {
+      updateStoreSettingsAccess();
+      renderBrandingForms();
+      renderPackagingInstructions();
+      if (canManageStoreConnection()) loadStoreConnection();
+    }
+    if (['page-dashboard', 'page-tracking'].includes(pageId)) loadInboundShipments();
+    if (pageId === 'page-tracking') {
+      renderTracking();
+      scheduleBackgroundSync('tracking', 0);
+    } else {
+      clearTimeout(syncTimers.tracking);
+      syncTimers.tracking = null;
+    }
     if (pageId === 'page-logs') {
       renderLogs();
       scheduleBackgroundSync('activity', 0);
@@ -582,10 +618,24 @@ function showPage(pageName, markChatRead = true) {
     chat: 'page-chat',
     billing: 'page-billing',
     clients: 'page-clients',
-    help: 'page-help'
+    help: 'page-help',
+    tracking: 'page-tracking',
+    'store-settings': 'page-store-settings'
   };
 
   const targetPage = routeMap[pageName] || pageName;
+  if (state.auth && !canOpenPortalPage(targetPage)) {
+    showToast('Your role does not have access to this section.', 'error');
+    return;
+  }
+  if (targetPage === 'page-store-settings' && !canManageBranding()) {
+    showToast('Only the account owner or an administrator can manage store settings.', 'error');
+    return;
+  }
+  if (targetPage === 'page-clients' && !canConfigureStaff()) {
+    showToast('Administrator access is required for account setup.', 'error');
+    return;
+  }
   if (targetPage && document.getElementById(targetPage)) {
     setPage(targetPage);
   }
@@ -603,6 +653,8 @@ function showPage(pageName, markChatRead = true) {
   if (targetPage === 'page-clients') {
     renderClientFieldRows();
     populateEditClientSelect();
+    loadStaffAccounts();
+    loadLoginHistory();
   }
 }
 
@@ -610,6 +662,7 @@ function showPage(pageName, markChatRead = true) {
 function getShipmentFieldKeys(clientId) {
   const safeClientId = String(clientId || '').trim().toUpperCase();
   const profile = state.clientProfile && state.clientProfile.clientId === safeClientId ? state.clientProfile : null;
+  if (profile?.inventoryMode === 'inventory') return null;
   const fields = (profile ? profile.fields : CLIENT_INVENTORY_FIELDS[safeClientId]?.fields) || [];
   const find = (pattern) => fields.find((field) => pattern.test(`${field.key} ${field.label}`))?.key || null;
   const received = find(/received/i);
@@ -631,9 +684,37 @@ function getShippingStatus(item = {}) {
   return keys ? getShipmentStage(item[keys.received], item[keys.shipped]) : null;
 }
 
-function getItemStatus(item) {
+const FULFILLMENT_STATUSES = {
+  transit: 'In Transit to Warehouse', arrived: 'Arrived / Check-In',
+  verified: 'Received & Verified', prep: 'In Prep', dispatched: 'Shipped out'
+};
+
+function isFulfillmentClient(clientId = state.activeClientId) {
+  const profile = state.clientProfile;
+  return profile?.clientId === clientId && profile.inventoryMode
+    ? profile.inventoryMode === 'custom'
+    : ['CL-002', 'CL-003'].includes(clientId);
+}
+
+function getFulfillmentStatus(item) {
+  const saved = String(item.status || '').trim();
   const shipping = getShippingStatus(item);
-  if (shipping) return shipping;
+  if (shipping === 'fully' || /^(shipped|fully shipped|delivered|shipped out)$/i.test(saved)) return 'dispatched';
+  if (/^arrived at warehouse$/i.test(saved)) return 'arrived';
+  const match = Object.keys(FULFILLMENT_STATUSES).find((key) => FULFILLMENT_STATUSES[key] === saved);
+  if (match) return match;
+  return ['not', 'partial'].includes(shipping) ? 'arrived' : 'transit';
+}
+
+function getItemStatus(item) {
+  if (isFulfillmentClient(item.clientId || state.activeClientId)) return getFulfillmentStatus(item);
+  const shipping = getShippingStatus(item);
+  if (shipping && state.clientProfile?.inventoryMode !== 'inventory') return shipping;
+
+  const savedStatus = String(item.status || '').trim().toLowerCase();
+  if (savedStatus === 'in stock') return 'in';
+  if (savedStatus === 'low stock') return 'low';
+  if (savedStatus === 'out of stock') return 'out';
 
   const qty = Number(item.qty ?? item.quantity ?? 0);
   if (!Number.isFinite(qty) || qty <= 0) return 'out';
@@ -642,6 +723,7 @@ function getItemStatus(item) {
 }
 
 function getStatusText(status) {
+  if (FULFILLMENT_STATUSES[status]) return FULFILLMENT_STATUSES[status];
   if (status === 'fully') return 'Fully Shipped';
   if (status === 'partial') return 'Partially Shipped';
   if (status === 'not') return 'Not Shipped';
@@ -652,6 +734,10 @@ function getStatusText(status) {
 }
 
 function getStatusBadgeClass(status) {
+  if (status === 'dispatched') return 'badge-fully';
+  if (['verified', 'prep'].includes(status)) return 'badge-partial';
+  if (status === 'arrived') return 'badge-not';
+  if (status === 'transit') return 'badge-awaiting';
   if (status === 'fully') return 'badge-fully';
   if (status === 'partial') return 'badge-partial';
   if (status === 'not') return 'badge-not';
@@ -671,7 +757,12 @@ async function fetchClientProfile(clientId = state.activeClientId || state.sessi
     const profile = await response.json();
     cacheClientView(clientId, { profile });
     // A slow profile for a previously selected client must not relabel the current table.
-    if (state.activeClientId === clientId) state.clientProfile = profile;
+    if (state.activeClientId === clientId) {
+      state.clientProfile = profile;
+      renderClientBranding();
+      renderBrandingForms();
+      renderPackagingInstructions();
+    }
     return profile;
   } catch (error) {
     return null;
@@ -680,7 +771,7 @@ async function fetchClientProfile(clientId = state.activeClientId || state.sessi
 
 function getFilterConfig(clientId = state.activeClientId || state.session?.clientId || 'CL-001') {
   const safeClientId = String(clientId || '').trim().toUpperCase();
-  const shippingClient = Boolean(getShipmentFieldKeys(safeClientId));
+  const shippingClient = isFulfillmentClient(safeClientId) || Boolean(getShipmentFieldKeys(safeClientId));
   if (shippingClient) {
     return {
       mode: 'shipping',
@@ -712,6 +803,11 @@ const FILTER_GROUPS = [
 const AGED_ORDER_MS = 48 * 60 * 60 * 1000;
 const DEAD_STOCK_MS = 90 * 24 * 60 * 60 * 1000;
 
+function getFilterGroups() {
+  return FILTER_GROUPS.map((group) => group.key === 'stage' && isFulfillmentClient()
+    ? { ...group, options: Object.entries(FULFILLMENT_STATUSES) } : group);
+}
+
 function emptyFilters() {
   return { stock: [], stage: [], attr: [] };
 }
@@ -737,6 +833,7 @@ function getStockLevel(item, profile = state.clientProfile) {
 
 // Returns null when a row carries no shipping information at all (plain stock items).
 function getFulfillmentStage(item) {
+  if (isFulfillmentClient(item.clientId || state.activeClientId)) return getFulfillmentStatus(item);
   const text = `${item.status || ''} ${item.notes || ''} ${item.fulfillment || ''}`.toLowerCase();
   if (/exception|delivery issue|lost|damaged|returned to sender/.test(text)) return 'exception';
   if (/ready for label/.test(text)) return 'label';
@@ -756,7 +853,7 @@ function getItemAttributes(item, profile = state.clientProfile, now = Date.now()
   if (map.fragile && isYes(item[map.fragile])) attributes.add('fragile');
   if (map.oversized && isYes(item[map.oversized])) attributes.add('oversized');
   const addedAt = Date.parse(item.addedAt || '');
-  if (Number.isFinite(addedAt) && now - addedAt > AGED_ORDER_MS && getFulfillmentStage(item) !== 'fully') attributes.add('aged');
+  if (Number.isFinite(addedAt) && now - addedAt > AGED_ORDER_MS && !['fully', 'dispatched'].includes(getFulfillmentStage(item))) attributes.add('aged');
   const lastActivityAt = Date.parse(item.lastActivityAt || '');
   if (Number.isFinite(lastActivityAt) && now - lastActivityAt > DEAD_STOCK_MS && toNumber(item.qty ?? item.quantity) > 0) attributes.add('dead');
   return attributes;
@@ -773,14 +870,14 @@ function updateInventoryMarkup(element, markup) {
 
 function renderFilterControls(resultCount = getFilteredItems().length) {
   const filters = state.filters || emptyFilters();
-  const selected = FILTER_GROUPS.flatMap((group) => group.options
+  const selected = getFilterGroups().flatMap((group) => group.options
     .filter(([key]) => filters[group.key].includes(key))
     .map(([key, label]) => ({ group: group.key, key, label })));
 
   const host = document.getElementById('filterGroups');
   if (host) {
     const focused = document.activeElement?.dataset?.key ? `${document.activeElement.dataset.group}:${document.activeElement.dataset.key}` : '';
-    const changed = updateInventoryMarkup(host, FILTER_GROUPS.map((group) => `
+    const changed = updateInventoryMarkup(host, getFilterGroups().map((group) => `
       <div class="filter-section" role="group" aria-label="${group.label}">
         <div class="filter-section-title">${group.label}</div>
         <div class="filter-options">
@@ -826,7 +923,7 @@ function setFilterPanelOpen(open) {
 }
 
 function toggleFilter(groupKey, optionKey) {
-  const group = FILTER_GROUPS.find((entry) => entry.key === groupKey);
+  const group = getFilterGroups().find((entry) => entry.key === groupKey);
   if (!group || !group.options.some(([key]) => key === optionKey)) return;
   const selected = state.filters[groupKey];
   state.filters[groupKey] = selected.includes(optionKey) ? selected.filter((key) => key !== optionKey) : [...selected, optionKey];
@@ -849,7 +946,8 @@ function updateSummary() {
   const outEl = document.getElementById('s-out');
   const counts = { fully: 0, partial: 0, not: 0, low: 0, out: 0 };
   for (const item of state.items) {
-    const status = getItemStatus(item);
+    const itemStatus = getItemStatus(item);
+    const status = isFulfillmentClient(clientId) ? (itemStatus === 'dispatched' ? 'fully' : getShippingStatus(item) || 'not') : itemStatus;
     if (Object.hasOwn(counts, status)) counts[status] += 1;
   }
 
@@ -884,6 +982,35 @@ function updateSummary() {
   }
 }
 
+function shippedViewEnabled() {
+  return state.clientProfile?.clientId === state.activeClientId
+    && ![false, 'false', 0, '0'].includes(state.clientProfile.enableShippedTab);
+}
+
+function isShippedItem(item) {
+  if (isFulfillmentClient(item.clientId || state.activeClientId)) return getFulfillmentStatus(item) === 'dispatched';
+  if (/^(shipped|fully shipped|delivered)$/i.test(String(item.status || '').trim())) return true;
+  const stage = getShippingStatus(item);
+  return stage === 'fully';
+}
+
+function syncInventoryViews() {
+  const enabled = shippedViewEnabled();
+  if (!enabled) state.inventoryView = 'active';
+  const host = document.getElementById('inventoryViews');
+  if (!host) return;
+  host.hidden = !enabled;
+  host.querySelectorAll('[data-view]').forEach((button) => {
+    button.setAttribute('aria-pressed', String(button.dataset.view === state.inventoryView));
+  });
+}
+
+function selectInventoryView(view) {
+  if (!shippedViewEnabled() || !['active', 'shipped'].includes(view)) return;
+  state.inventoryView = view;
+  renderTable();
+}
+
 function getFilteredItems() {
   const query = (state.query || '').trim().toLowerCase();
   const filters = state.filters || emptyFilters();
@@ -891,6 +1018,7 @@ function getFilteredItems() {
 
   // OR within a group, AND across groups; an empty group doesn't filter.
   return state.items.filter((item) => {
+    if (shippedViewEnabled() && isShippedItem(item) !== (state.inventoryView === 'shipped')) return false;
     if (query && !`${item.sku || ''} ${item.title || ''} ${item.category || ''} ${item.location || ''}`.toLowerCase().includes(query)) return false;
     if (filters.stock.length && !filters.stock.includes(getStockLevel(item))) return false;
     if (filters.stage.length && !filters.stage.includes(getFulfillmentStage(item))) return false;
@@ -957,6 +1085,8 @@ function scrollInventoryTable(direction) {
 }
 
 function renderTable() {
+  syncInventoryViews();
+  syncBarcodeCheckIn();
   const items = getFilteredItems();
   renderFilterControls(items.length);
   if (isPageActive('page-logs')) renderLogs();
@@ -964,11 +1094,13 @@ function renderTable() {
 
   syncDashboardColumns();
   const profile = state.clientProfile;
-  const fields = (profile && profile.fields) || [];
+  const clientId = profile?.clientId || state.activeClientId || state.session?.clientId;
+  const fields = ((profile && profile.fields) || [])
+    .filter((field) => clientId !== 'CL-002' || field.key !== 'productDescription');
   const dashboardFieldKeys = (profile && profile.dashboardFieldKeys) || fields.map((field) => field.key);
   const showQty = !(profile && profile.hideQtyColumn);
   const showEdit = !(profile && (profile.readOnly || profile.hideQuickEdit));
-  const columnCount = (profile && profile.dashboardColumns && profile.dashboardColumns.length) || (2 + fields.length);
+  const columnCount = 2 + dashboardFieldKeys.length + Number(showQty) + Number(showEdit);
   const metaFields = dashboardFieldKeys.length ? [] : fields.slice(0, 2);
 
   if (!items.length) {
@@ -983,7 +1115,7 @@ function renderTable() {
     // Clients whose custom fields aren't broken out into their own dashboard columns
     // (e.g. CL-003's tracking/carrier) still get a quick summary under the title.
     const metaText = metaFields.length
-      ? `<div style="font-size:10px;color:#64748b;margin-top:4px;">${metaFields.map((field) => `${field.label}: ${item[field.key] || '—'}`).join(' • ')}</div>`
+      ? `<div class="inventory-meta">${metaFields.map((field) => `${field.label}: ${item[field.key] || '—'}`).join(' • ')}</div>`
       : '';
 
     const fieldCells = dashboardFieldKeys.map((key) => `<td>${item[key] ?? '—'}</td>`).join('');
@@ -998,7 +1130,7 @@ function renderTable() {
     ` : '';
 
     return `
-      <tr>
+      <tr data-item-id="${escapeHtml(item.id)}" tabindex="0" aria-label="${escapeHtml(item.title || 'Inventory item')} - double-click or press Enter to view details">
         <td class="title-cell">${item.title || '—'}${metaText}</td>
         ${fieldCells}
         ${qtyCell}
@@ -1036,7 +1168,7 @@ function renderChatMessages() {
     return;
   }
 
-  const isCurrentUserStaff = Boolean(state.session && (String(state.session.role || '').toLowerCase() === 'admin' || String(state.session.clientId || '').toUpperCase() === 'CL-000'));
+  const isCurrentUserStaff = hasWarehouseAccess();
 
   msgBox.innerHTML = messages.map((message) => {
     const messageIsStaff = message.isStaff === true;
@@ -1275,11 +1407,17 @@ async function fetchInventory(clientId = state.activeClientId || state.session?.
 
   try {
     const response = await fetch(inventoryUrl, {
-      headers: { Accept: 'application/json' },
+      headers: adminHeaders({ Accept: 'application/json' }),
       signal: viewSignal()
     });
 
-    if (!response.ok) return response.status;
+    if (!response.ok) {
+      if (requestId === inventoryRequestId && state.auth && state.session === session && state.activeClientId === targetClientId) {
+        if (response.status === 401) handleExpiredSession();
+        else showToast('Unable to load inventory. Please refresh and try again.', 'error');
+      }
+      return response.status;
+    }
 
     const result = await response.json();
     if (Array.isArray(result)) {
@@ -1377,6 +1515,124 @@ function renderClientHeader() {
   }
 
   renderWelcomeBanner(clientLabel || clientId || 'Client');
+  renderClientBranding();
+  renderBrandingForms();
+}
+
+function canManageBranding() {
+  return state.auth && state.activeClientId && state.activeClientId !== 'CL-000'
+    && (hasWarehouseAccess() || (state.session?.role === 'client' && state.session.clientId === state.activeClientId));
+}
+
+function brandTextColor(hex) {
+  const values = hex.slice(1).match(/../g).map(value => {
+    const channel = parseInt(value, 16) / 255;
+    return channel <= .04045 ? channel / 12.92 : ((channel + .055) / 1.055) ** 2.4;
+  });
+  const luminance = values.reduce((sum, value, index) => sum + value * [.2126, .7152, .0722][index], 0);
+  return luminance > .179 ? '#000000' : '#FFFFFF';
+}
+
+function renderClientBranding() {
+  const root = document.documentElement;
+  if (!root?.style) return;
+  const profile = state.auth && state.clientProfile?.clientId === state.activeClientId ? state.clientProfile : null;
+  const color = /^#[a-f0-9]{6}$/i.test(profile?.accentColor || '') ? profile.accentColor : '';
+  if (color) {
+    root.style.setProperty('--client-accent', color);
+    root.style.setProperty('--client-accent-text', brandTextColor(color));
+  } else {
+    root.style.removeProperty('--client-accent');
+    root.style.removeProperty('--client-accent-text');
+  }
+  const logo = document.querySelector('.header-logo');
+  if (!logo) return;
+  if (!logo.dataset.defaultSrc) {
+    logo.dataset.defaultSrc = logo.getAttribute('src');
+    logo.dataset.defaultAlt = logo.alt;
+  }
+  const source = /^https?:\/\//i.test(profile?.logoUrl || '') ? profile.logoUrl : logo.dataset.defaultSrc;
+  if (logo.getAttribute('src') !== source) {
+    logo.onerror = source === logo.dataset.defaultSrc ? null : () => {
+      logo.onerror = null;
+      logo.src = logo.dataset.defaultSrc;
+      logo.alt = logo.dataset.defaultAlt;
+      showToast('Client logo could not load. Check its public image URL in branding settings.', 'error');
+    };
+    logo.src = source;
+  }
+  logo.alt = source === logo.dataset.defaultSrc ? logo.dataset.defaultAlt : `${profile.clientName || state.activeClientId} logo`;
+}
+
+function renderBrandingForms() {
+  const current = canManageBranding() && state.clientProfile?.clientId === state.activeClientId;
+  for (const prefix of ['settings']) {
+    const panel = document.getElementById(`${prefix}Branding`);
+    const host = document.getElementById(`${prefix}BrandingForm`);
+    if (!panel || !host) continue;
+    panel.hidden = !current;
+    if (!current) { host.innerHTML = ''; delete host.dataset.signature; continue; }
+    const profile = state.clientProfile;
+    const signature = JSON.stringify([state.activeClientId, profile.websiteUrl, profile.logoUrl, profile.accentColor]);
+    if (host.dataset.signature === signature) continue;
+    host.dataset.signature = signature;
+    host.innerHTML = `<form data-branding-form data-client-id="${escapeHtml(state.activeClientId)}">
+      <label class="ac-label" for="${prefix}WebsiteUrl">Client Website URL</label>
+      <input class="ac-input" id="${prefix}WebsiteUrl" name="websiteUrl" type="text" maxlength="2000" placeholder="https://your-company.com" value="${escapeHtml(profile.websiteUrl || '')}" />
+      <button type="button" class="btn-set" data-fetch-branding>Fetch website branding</button>
+      <p class="integration-description">Optional public website lookup, no API connection needed. Review the suggested logo and CSS/theme color, or enter your own. Save to apply branding.</p>
+      <label class="ac-label" for="${prefix}LogoUrl">Logo image URL (manual override)</label>
+      <input class="ac-input" id="${prefix}LogoUrl" name="logoUrl" type="url" maxlength="2000" placeholder="https://your-company.com/logo.png" value="${escapeHtml(profile.logoUrl || '')}" />
+      <label class="ac-label" for="${prefix}AccentColor">Accent hex color (manual override)</label>
+      <input class="ac-input" id="${prefix}AccentColor" name="accentColor" type="text" maxlength="7" pattern="#([a-fA-F0-9]{3}|[a-fA-F0-9]{6})" placeholder="#2463EB" value="${escapeHtml(profile.accentColor || '')}" />
+      <p class="integration-description">Blank logo/color restores ECL defaults. Manual values are preserved when a website has no matching metadata.</p>
+      <p class="branding-status" role="status" aria-live="polite"></p>
+      <button type="submit" class="btn-set">Save branding</button>
+    </form>`;
+    const form = host.querySelector('form');
+    form?.addEventListener('submit', event => { event.preventDefault(); submitBranding(form, false); });
+    form?.querySelector('[data-fetch-branding]')?.addEventListener('click', () => submitBranding(form, true));
+  }
+}
+
+async function submitBranding(form, fetchWebsite) {
+  if (!canManageBranding() || form.dataset.busy === 'true' || form.dataset.clientId !== state.activeClientId) return;
+  const clientId = state.activeClientId;
+  const session = state.session;
+  const status = form.querySelector('.branding-status');
+  const input = name => form.elements.namedItem(name);
+  const body = { clientId, websiteUrl: input('websiteUrl').value.trim(), logoUrl: input('logoUrl').value.trim(), accentColor: input('accentColor').value.trim() };
+  form.dataset.busy = 'true';
+  form.querySelectorAll('button, input').forEach(element => { element.disabled = true; });
+  status.textContent = fetchWebsite ? 'Fetching public website branding...' : 'Saving branding...';
+  try {
+    const response = await fetch(`${API_BASE}/api/branding${fetchWebsite ? '/fetch' : ''}`, {
+      method: fetchWebsite ? 'POST' : 'PUT', headers: adminHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify(body), signal: viewSignal()
+    });
+    const result = await response.json();
+    if (session !== state.session || clientId !== state.activeClientId || !form.isConnected) return;
+    if (!response.ok || !result.success || result.clientId !== clientId) throw new Error(result.error || 'Branding was not confirmed. Please retry.');
+    if (fetchWebsite) {
+      if (result.branding.logoUrl) input('logoUrl').value = result.branding.logoUrl;
+      if (result.branding.accentColor) input('accentColor').value = result.branding.accentColor;
+      status.textContent = [...result.branding.warnings, 'Review or edit the fields, then Save branding to apply.'].join(' ');
+    } else {
+      Object.assign(state.clientProfile, result.branding, { accentColor: result.branding.accentColor || '#F5C518' });
+      cacheClientView(clientId, { profile: state.clientProfile });
+      status.textContent = 'Client branding saved.';
+      renderClientBranding();
+      renderBrandingForms();
+      showToast('Client branding saved.', 'success');
+    }
+  } catch (error) {
+    if (session === state.session && clientId === state.activeClientId && form.isConnected && error.name !== 'AbortError') {
+      status.textContent = error.message || 'Unable to update branding. Manual entry remains available.';
+    }
+  } finally {
+    form.dataset.busy = 'false';
+    form.querySelectorAll('button, input').forEach(element => { element.disabled = false; });
+  }
 }
 
 function getTimeOfDayGreeting(date = new Date()) {
@@ -1406,7 +1662,9 @@ function renderWelcomeBanner(clientLabel) {
     || String(state.activeClientId || '').toUpperCase() === String(state.session.clientId || '').toUpperCase();
   banner.classList.add('is-personalized');
   set('welcomeGreeting', getTimeOfDayGreeting(now));
-  set('welcomeTitle', state.isAdmin ? 'Welcome back, Admin' : `Welcome back, ${clientLabel}`);
+  set('welcomeTitle', state.isAdmin
+    ? state.session.role === 'staff' ? 'Welcome back, Team' : 'Welcome back, Admin'
+    : `Welcome back, ${clientLabel}`);
   set('welcomeSubtitle', state.isAdmin && !viewingOwnAccount
     ? `You're viewing ${clientLabel}'s inventory, fulfillment progress, and quick actions.`
     : "Here's your inventory overview — stock levels, fulfillment progress, and quick actions in one place.");
@@ -1436,26 +1694,191 @@ function renderDriveFolderLink() {
 
 function syncAddTabVisibility() {
   const clientId = state.activeClientId || state.session?.clientId || 'CL-001';
-  const profile = state.clientProfile && state.clientProfile.clientId === clientId ? state.clientProfile : null;
-  const shouldShow = Boolean(profile && profile.enableAddItem && !profile.readOnly);
+  const shouldShow = canAddInventoryItems(clientId);
   ['tabOrder'].forEach((id) => {
     const tab = document.getElementById(id);
     if (tab) tab.style.display = shouldShow ? 'block' : 'none';
   });
 }
 
+function canAddInventoryItems(clientId = state.activeClientId) {
+  if (!state.auth || !clientId || clientId === 'CL-000') return false;
+  if (hasWarehouseAccess()) return true;
+  const profile = state.clientProfile;
+  return state.session?.clientId === clientId && profile?.clientId === clientId
+    && Boolean(profile.enableAddItem) && !profile.readOnly;
+}
+
 const ITEM_FORMS = {
   inventory: { prefix: 'newProduct', fieldPrefix: 'customField_', fieldsHost: 'customProductFields', submit: 'createProductSubmit', notice: 'createProductReadOnlyNotice' }
 };
+const CATALOG_FIELDS = [
+  { key: 'imageUrl', label: 'Product Image URL', type: 'text', aliases: ['imageurl', 'image url', 'product image url', 'image thumbnail', 'image'] },
+  { key: 'bundled', label: 'Is Bundled', type: 'select', options: ['', 'Y', 'N'], aliases: ['bundled', 'is bundled', 'isbundled', 'bundled? (y/n)'] },
+  { key: 'bundleQty', label: 'Bundle Quantity', type: 'number', aliases: ['bundleqty', 'bundlequantity', 'bundle quantity'] },
+  { key: 'prepInstructions', label: 'Special Prep Instructions', type: 'textarea', aliases: ['prepinstructions', 'special prep instructions'] }
+];
+
+function catalogFieldMatches(catalog, field) {
+  return (catalog.key === 'bundled' && field.key === state.clientProfile?.attributeMap?.bundled)
+    || catalog.aliases.includes(field.key.toLowerCase()) || catalog.aliases.includes(field.label.toLowerCase());
+}
+
+function withCatalogFields(fields, configured = fields) {
+  const prep = CATALOG_FIELDS.find((field) => field.key === 'prepInstructions');
+  return [...fields.map((field) => catalogFieldMatches(prep, field) ? { ...field, type: 'textarea' } : field),
+    ...CATALOG_FIELDS.filter((catalog) => !configured.some((field) => catalogFieldMatches(catalog, field)))];
+}
+
+let catalogSyncController = null;
+let catalogProducts = [];
+let catalogSyncGeneration = 0;
+
+function catalogMessage(message, error = false) {
+  const host = document.getElementById('catalogSyncMessage');
+  if (!host) return;
+  host.textContent = message;
+  host.classList.toggle('is-error', error);
+}
+
+function resetCatalogSync(clearDraft = false) {
+  catalogSyncGeneration += 1;
+  catalogSyncController?.abort();
+  catalogSyncController = null;
+  catalogProducts = [];
+  for (const id of ['catalogSourceUrl', 'catalogProductSelect']) {
+    const input = document.getElementById(id);
+    if (input) input.value = '';
+  }
+  const picker = document.getElementById('catalogProductPicker');
+  if (picker) picker.hidden = true;
+  const panel = document.getElementById('catalogSyncPanel');
+  if (panel) panel.open = false;
+  const replace = document.getElementById('catalogReplaceExisting');
+  if (replace) replace.checked = false;
+  const preview = document.getElementById('catalogImagePreview');
+  if (preview) { preview.hidden = true; preview.removeAttribute('src'); }
+  const message = document.getElementById('catalogImageMessage');
+  if (message) message.textContent = '';
+  if (clearDraft) {
+    ['newProductSku', 'newProductTitle', 'newProductQty'].forEach((id) => {
+      const input = document.getElementById(id);
+      if (input) input.value = id === 'newProductQty' ? '0' : '';
+    });
+  }
+  const button = document.getElementById('catalogSyncSubmit');
+  if (button) button.disabled = !canAddInventoryItems();
+  catalogMessage('');
+}
+
+function catalogInput(key) {
+  const catalog = CATALOG_FIELDS.find((entry) => entry.key === key);
+  const field = getFormFields(state.activeClientId, 'inventory').find((entry) =>
+    catalogFieldMatches(catalog, entry));
+  return field ? document.getElementById(`customField_${field.key}`) : null;
+}
+
+function previewCatalogImage() {
+  const preview = document.getElementById('catalogImagePreview');
+  if (!preview) return;
+  const value = catalogInput('imageUrl')?.value.trim() || '';
+  const message = document.getElementById('catalogImageMessage');
+  preview.hidden = true;
+  preview.removeAttribute('src');
+  if (message) message.textContent = '';
+  if (!value) return;
+  let url;
+  try { url = new URL(value); } catch {
+    if (message) message.textContent = 'Enter a complete HTTP or HTTPS image URL.';
+    return;
+  }
+  if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) {
+    if (message) message.textContent = 'Image preview requires an HTTP or HTTPS URL without credentials.';
+    return;
+  }
+  preview.src = url.href;
+  preview.hidden = false;
+}
+
+async function syncCatalog(event) {
+  event.preventDefault();
+  if (!canAddInventoryItems() || catalogSyncController) return;
+  const session = state.session;
+  const clientId = state.activeClientId;
+  const generation = ++catalogSyncGeneration;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 20000);
+  catalogSyncController = controller;
+  const button = document.getElementById('catalogSyncSubmit');
+  button.disabled = true;
+  document.getElementById('catalogProductPicker').hidden = true;
+  catalogProducts = [];
+  catalogMessage('Fetching public product details. Manual entry remains available.');
+  try {
+    const response = await fetch(CATALOG_SYNC_URL, {
+      method: 'POST', headers: adminHeaders({ 'Content-Type': 'application/json' }), signal: controller.signal,
+      body: JSON.stringify({ clientId, url: document.getElementById('catalogSourceUrl').value.trim() })
+    });
+    const result = await response.json();
+    if (generation !== catalogSyncGeneration || session !== state.session || clientId !== state.activeClientId) return;
+    if (!response.ok || !result.success || !Array.isArray(result.products) || !result.products.length) throw new Error(result.error || 'No public product details were found.');
+    catalogProducts = result.products;
+    const select = document.getElementById('catalogProductSelect');
+    select.innerHTML = catalogProducts.map((product, index) => `<option value="${index}">${escapeHtml(product.title)}${product.sku ? ` (${escapeHtml(product.sku)})` : ''}</option>`).join('');
+    select.value = '0';
+    document.getElementById('catalogProductPicker').hidden = false;
+    catalogMessage(`${catalogProducts.length} product${catalogProducts.length === 1 ? '' : 's'} found. Select a product to prefill; all fields remain editable.`);
+  } catch (error) {
+    if (generation === catalogSyncGeneration) catalogMessage(`${error.name === 'AbortError' ? 'Website import timed out.' : error.message} Enter or edit the fields below manually.`, true);
+  } finally {
+    clearTimeout(timeout);
+    if (catalogSyncController === controller) {
+      catalogSyncController = null;
+      button.disabled = !canAddInventoryItems();
+    }
+  }
+}
+
+function applyCatalogProduct() {
+  const product = catalogProducts[Number(document.getElementById('catalogProductSelect').value)];
+  if (!product || !canAddInventoryItems()) return;
+  const replace = document.getElementById('catalogReplaceExisting').checked;
+  let skipped = 0;
+  const fill = (input, value) => {
+    if (!input || input.disabled || input.readOnly || !value) return;
+    if (input.value.trim() && !replace) { skipped += 1; return; }
+    if (input.tagName === 'SELECT' && ![...input.options].some((option) => option.value === value)) {
+      const option = document.createElement('option');
+      option.value = value;
+      option.textContent = value;
+      input.appendChild(option);
+    }
+    input.value = value;
+    input.dataset.userTyped = 'true';
+  };
+  const title = document.getElementById('newProductTitle');
+  const productName = document.getElementById('customField_productName');
+  if (productName) fill(productName, product.title);
+  if (title && document.getElementById('newProductTitleWrap')?.style.display !== 'none') fill(title, product.title);
+  fill(document.getElementById('newProductSku'), product.sku);
+  const upcField = document.getElementById('customField_upc');
+  if (/^\d{8,14}$/.test(product.sku || '')) fill(upcField, product.sku);
+  fill(catalogInput('imageUrl'), product.imageUrl);
+  fill(catalogInput('bundled'), product.bundled);
+  fill(catalogInput('bundleQty'), product.bundleQty);
+  previewCatalogImage();
+  catalogMessage(`Product details prefilled. Review and edit before saving.${skipped ? ' Existing entries were kept; enable Replace existing details to overwrite them.' : ''}`);
+}
 
 // Custom fields for one form, minus any the admin switched off and, for clients, the staff-only received/shipped counts.
 function getFormFields(clientId, kind) {
   const profile = state.clientProfile && state.clientProfile.clientId === clientId ? state.clientProfile : null;
   const visibility = (profile && profile.fieldVisibility) || {};
   const shipment = state.isAdmin ? null : getShipmentFieldKeys(clientId);
-  return getVisibleClientFields(clientId, state.isAdmin)
+  return withCatalogFields(getVisibleClientFields(clientId, state.isAdmin)
+    .filter((field) => clientId !== 'CL-002' || field.key !== 'productDescription')
     .filter((field) => !visibility[field.key] || visibility[field.key][kind] !== false)
-    .filter((field) => !shipment || (field.key !== shipment.received && field.key !== shipment.shipped));
+    .filter((field) => !shipment || (field.key !== shipment.received && field.key !== shipment.shipped)), getVisibleClientFields(clientId, state.isAdmin));
 }
 
 function syncCreateFormLayout() {
@@ -1489,8 +1912,6 @@ function escapeHtml(value) {
 }
 
 function renderFieldInputs(fields, idPrefix) {
-  const labelStyle = 'display:block;font-size:11px;font-weight:700;color:#475569;margin-bottom:6px;';
-  const commonStyle = 'width:100%;padding:10px 12px;border:1px solid #dfe7f1;border-radius:8px;';
   return fields.map((field) => {
     const fieldId = escapeHtml(`${idPrefix}${field.key}`);
     const label = escapeHtml(field.label);
@@ -1504,36 +1925,42 @@ function renderFieldInputs(fields, idPrefix) {
       }).join('');
       return `
         <div>
-          <label style="${labelStyle}">${label}</label>
-          <select id="${fieldId}" style="${commonStyle}" data-placeholder="${samplePlaceholder}" ${isReadOnlyField ? 'disabled' : ''}>${options}</select>
+          <label class="ac-label" for="${fieldId}">${label}</label>
+          <select id="${fieldId}" class="ac-input" data-placeholder="${samplePlaceholder}" ${isReadOnlyField ? 'disabled' : ''}>${options}</select>
         </div>
       `;
     }
 
     if (field.type === 'textarea') {
       return `
-        <div style="grid-column:1 / -1;">
-          <label style="${labelStyle}">${label}</label>
-          <textarea id="${fieldId}" placeholder="${samplePlaceholder}" style="${commonStyle};min-height:84px;resize:vertical;" ${isReadOnlyField ? 'readonly' : ''}></textarea>
+        <div class="item-field-wide">
+          <label class="ac-label" for="${fieldId}">${label}</label>
+          <textarea id="${fieldId}" class="ac-input" placeholder="${samplePlaceholder}" ${isReadOnlyField ? 'readonly' : ''}></textarea>
         </div>
       `;
     }
 
     return `
       <div>
-        <label style="${labelStyle}">${label}</label>
-        <input type="${field.type === 'number' ? 'number' : 'text'}" id="${fieldId}" placeholder="${samplePlaceholder}" style="${commonStyle}" ${isReadOnlyField ? 'readonly' : ''} />
+        <label class="ac-label" for="${fieldId}">${label}</label>
+        <input type="${field.type === 'number' ? 'number' : 'text'}" id="${fieldId}" class="ac-input" placeholder="${samplePlaceholder}" ${isReadOnlyField ? 'readonly' : ''} />
       </div>
     `;
   }).join('');
 }
 
 function renderProductForm() {
+  renderPackagingInstructions();
   const clientId = state.activeClientId || state.session?.clientId || 'CL-001';
   const profile = state.clientProfile && state.clientProfile.clientId === clientId ? state.clientProfile : null;
-  const config = profile || getClientInventoryFields(clientId);
+  const syncButton = document.getElementById('catalogSyncSubmit');
+  const canAdd = canAddInventoryItems(clientId);
+  if (syncButton) syncButton.disabled = !canAdd;
 
   syncAddTabVisibility();
+  renderInboundShipments();
+  if (inboundAvailable() && inboundState.clientId !== clientId
+    && (isPageActive('page-dashboard') || isPageActive('page-tracking'))) loadInboundShipments();
   syncCreateFormLayout();
 
   const skuSample = getInventoryFieldSample(state.items, 'sku');
@@ -1546,21 +1973,24 @@ function renderProductForm() {
     if (titleInput && !titleInput.dataset.userTyped) titleInput.placeholder = titleSample ? `e.g. ${titleSample}` : 'Copper Marker';
 
     const host = document.getElementById(form.fieldsHost);
-    if (host) host.innerHTML = renderFieldInputs(getFormFields(clientId, kind), form.fieldPrefix);
+    const fields = getFormFields(clientId, kind);
+    if (host) {
+      host.innerHTML = renderFieldInputs(fields, form.fieldPrefix);
+      host.hidden = !fields.length;
+    }
 
     const notice = document.getElementById(form.notice);
     if (notice) {
-      notice.style.display = config.readOnly ? 'block' : 'none';
-      notice.textContent = config.readOnly
+      notice.style.display = !canAdd ? 'block' : 'none';
+      notice.textContent = !canAdd
         ? 'This client is in view-only mode. Inventory is locked and cannot be added to directly.'
         : '';
     }
 
     const submitBtn = document.getElementById(form.submit);
     if (submitBtn) {
-      submitBtn.disabled = Boolean(config.readOnly);
-      submitBtn.textContent = config.readOnly ? 'Locked' : 'Add';
-      submitBtn.style.opacity = config.readOnly ? '0.6' : '1';
+      submitBtn.disabled = !canAdd;
+      submitBtn.textContent = !canAdd ? 'Inventory locked' : 'Add to inventory';
     }
   });
 }
@@ -1568,7 +1998,18 @@ function renderProductForm() {
 function switchClientView(clientId) {
   const nextClientId = String(clientId || '').trim().toUpperCase();
   if (!nextClientId) return Promise.resolve();
+  if (!state.auth || (!hasWarehouseAccess() && nextClientId !== state.session?.clientId)) {
+    showToast('You can only view your own client account.', 'error');
+    return Promise.resolve();
+  }
 
+  closeOnboardingTour({ markSeen: false, restorePage: false });
+  closePackagingDialog();
+  resetInboundShipments();
+  closeInventoryItemDialog(true);
+  resetStoreConnection();
+  resetCatalogSync(true);
+  resetBarcodeCheckIn();
   stopBackgroundSync();
   resetViewRequests();
   notificationRequestId += 1;
@@ -1578,8 +2019,12 @@ function switchClientView(clientId) {
 
   const cached = clientViewCache.get(nextClientId) || {};
   state.activeClientId = nextClientId;
+  updateStoreSettingsAccess();
+  if (isPageActive('page-store-settings')) loadStoreConnection();
+  resetTracking();
   state.activity = { clientId: null, entries: null, loading: false, error: '' };
   state.filters = emptyFilters();
+  state.inventoryView = 'active';
   state.quickEditUnlock = null;
   state.billing = null;
   state.billingEditId = null;
@@ -1677,7 +2122,7 @@ async function executePortalAuth() {
 }
 
 const SAVED_SESSION_KEY = 'eclPortalSession';
-const RESTORABLE_PAGES = ['page-dashboard', 'page-logs', 'page-chat', 'page-billing', 'page-clients', 'page-help'];
+const RESTORABLE_PAGES = ['page-dashboard', 'page-logs', 'page-chat', 'page-billing', 'page-clients', 'page-help', 'page-tracking', 'page-store-settings'];
 
 function readTokenExpiry(token) {
   try {
@@ -1724,9 +2169,15 @@ function handleExpiredSession() {
 }
 
 async function startSession(result, saved = null) {
+  if (!String(result.clientId || '').trim() || !['admin', 'staff', 'client'].includes(result.role)
+    || (result.role === 'client' && result.clientId === 'CL-000')) {
+    executePortalLogout('Your account role is invalid. Contact an administrator.');
+    return;
+  }
   state.session = result;
   state.auth = true;
-  state.isAdmin = String(result.role || '').toLowerCase() === 'admin' || String(result.clientId || '').toUpperCase() === 'CL-000';
+  // Existing warehouse controls share this flag; master settings always use canConfigureStaff().
+  state.isAdmin = hasWarehouseAccess();
   state.activeClientId = String(result.clientId || '').trim().toUpperCase() || 'CL-001';
   state.roster = [];
   state.pinUnlocked = false;
@@ -1739,7 +2190,12 @@ async function startSession(result, saved = null) {
   setPage('page-dashboard');
 
   const tabClients = document.getElementById('tabClients');
-  if (tabClients) tabClients.style.display = state.isAdmin ? 'block' : 'none';
+  if (tabClients) tabClients.style.display = canConfigureStaff() ? 'block' : 'none';
+  updateStoreSettingsAccess();
+  const staffSection = document.getElementById('staffAccountsSection');
+  if (staffSection) staffSection.hidden = !canConfigureStaff();
+  const loginHistorySection = document.getElementById('loginHistorySection');
+  if (loginHistorySection) loginHistorySection.hidden = !canConfigureStaff();
 
   if (state.isAdmin) {
     const roster = await fetchClientRoster();
@@ -1763,13 +2219,15 @@ async function startSession(result, saved = null) {
   renderDriveFolderLink();
   renderProductForm();
   renderTable();
+  updateStoreSettingsAccess();
   startBackgroundSync();
   await syncBillingTab();
 
   const page = saved?.page;
   const billingTab = document.getElementById('tabBilling');
   const allowed = RESTORABLE_PAGES.includes(page)
-    && (page !== 'page-clients' || state.isAdmin)
+    && (page !== 'page-clients' || canConfigureStaff())
+    && (page !== 'page-store-settings' || canManageBranding())
     && (page !== 'page-billing' || billingTab?.style.display !== 'none');
   if (allowed && page !== 'page-dashboard') showPage(page.replace('page-', ''));
   saveSession();
@@ -1787,6 +2245,14 @@ async function restoreSavedSession() {
 }
 
 function executePortalLogout(message = '') {
+  closePackagingDialog();
+  resetInboundShipments();
+  resetStoreConnection();
+  resetCatalogSync(true);
+  clearStaffAccounts();
+  clearLoginHistory();
+  closeInventoryItemDialog(true);
+  resetBarcodeCheckIn();
   clearSavedSession();
   closeOnboardingTour({ markSeen: false, restorePage: false });
   stopBackgroundSync();
@@ -1805,12 +2271,16 @@ function executePortalLogout(message = '') {
   state.isAdmin = false;
   state.roster = [];
   state.activeClientId = null;
+  renderClientBranding();
+  renderBrandingForms();
+  resetTracking();
   state.activity = { clientId: null, entries: null, loading: false, error: '' };
   renderLogs();
   state.selectedItemId = null;
   state.pinUnlocked = false;
   state.quickEditUnlock = null;
   state.filters = emptyFilters();
+  state.inventoryView = 'active';
   state.pendingMessages = [];
   state.billing = null;
   state.billingEditId = null;
@@ -1941,7 +2411,7 @@ function requestUpdatePage() {
   const clientId = state.activeClientId || state.session?.clientId || 'CL-001';
   const config = getClientInventoryFields(clientId);
 
-  if (!config.readOnly && !config.requirePin) {
+  if (hasWarehouseAccess() || (!config.readOnly && !config.requirePin)) {
     setPage('page-update');
     return;
   }
@@ -1957,7 +2427,7 @@ function requestUpdatePage() {
 function goToAddOrder() {
   const clientId = state.activeClientId || state.session?.clientId || 'CL-001';
   const config = getClientInventoryFields(clientId);
-  if ((!config.readOnly && !config.requirePin) || state.pinUnlocked) {
+  if (hasWarehouseAccess() || (!config.readOnly && !config.requirePin) || state.pinUnlocked) {
     setPage('page-order');
     return;
   }
@@ -1980,19 +2450,19 @@ const ONBOARDING_KEY = 'has_seen_onboarding';
 const ONBOARDING_STEPS = [
   {
     title: 'Welcome to your ECL portal',
-    body: 'This quick tour shows where everything is and takes under a minute. You can skip it now and replay it any time from the Help tab.'
+    body: 'Get started with inventory views, receiving, tracking, and optional product imports. The tour adapts to your account access. Skip now or replay it any time from Help, the last tab on the right.'
   },
   {
     page: 'page-help',
     target: '#faqSearch',
     title: 'Find answers in Help',
-    body: 'Search the Help tab for answers about your account, inventory, shipment updates, and light or dark mode.'
+    body: 'Search Help for inventory instructions, scanner and tracking guidance, or the Shopify and WooCommerce integration guide. Settings includes packaging notes, appearance and optional store configuration. API integration is still in development and may not work correctly; automatic order sync is not enabled.'
   },
   {
     page: 'page-dashboard',
     target: '#mainTabs',
     title: 'Move between sections',
-    body: 'Use these tabs to switch between your inventory, updates, activity history, chat with the ECL team, and help.'
+    body: 'Use the tabs for Dashboard, Updates, Add item when available, Activity, Chat, ECL Tracking, and optional Settings. Help stays at the far right. Some sections depend on your account permissions.'
   },
   {
     page: 'page-dashboard',
@@ -2004,7 +2474,48 @@ const ONBOARDING_STEPS = [
     page: 'page-dashboard',
     target: '#page-dashboard .table-shell',
     title: 'Your inventory at a glance',
-    body: 'Every item and its status lives here. Search by SKU or product name, or use Filters to narrow the list.'
+    body: 'Search by SKU or product name and use Filters to narrow the list. Double-click an item to open its details; editable fields depend on your permissions. Stock accounts show stock levels, while fulfillment accounts show warehouse and prep stages.'
+  },
+  {
+    page: 'page-dashboard',
+    target: '#inboundDashboard',
+    available: inboundAvailable,
+    title: 'Tell ECL about incoming restocks',
+    body: 'Select Notify Restock / Add Inbound Shipment to enter a carrier, tracking number, expected delivery date and SKU quantities. Your inbound boxes appear here and in ECL Tracking. Staff scan tracking numbers to record arrival; notices and scans never change stock quantities.'
+  },
+  {
+    page: 'page-dashboard',
+    target: '#inventoryViews [data-view="shipped"]',
+    available: shippedViewEnabled,
+    title: 'Switch between active and shipped items',
+    body: 'Use Active / Non-Shipped and Shipped Items to switch inventory views. The shipped view separates completed shipments from active work without changing your records. This selector appears only when enabled for your account.'
+  },
+  {
+    page: 'page-update',
+    target: '.barcode-checkin',
+    available: () => barcodeCheckInAllowed() && tourCanOpenItemForms(),
+    title: 'Check in a matching item',
+    body: 'A unique active match records Arrived / Check-In and a timestamp, with visual confirmation and no quantity changes. Multiple matches require you to select the item. An unmatched barcode opens Add item with the scanned value prefilled; review it before saving. This tour never starts the camera or submits a scan.'
+  },
+  {
+    page: 'page-tracking',
+    target: '#trackingSearchForm',
+    title: 'Follow shipments in ECL Tracking',
+    body: 'Search incoming or outgoing shipments by tracking number, SKU or item name. ECL-branded progress follows sheet updates from In Transit through warehouse arrival, prep and shipping, including scan timestamps. Carrier badges link to UPS, FedEx or USPS details in a new tab; this is not a live carrier-event feed.'
+  },
+  {
+    page: 'page-dashboard',
+    target: '#tabOrder',
+    available: tourCanAddItems,
+    title: 'Add products your way',
+    body: 'Choose Add item for manual entry or Sync from Website URL. You can enter product details, quantities, image URLs and bundle information yourself. A store API connection is never required; PIN-protected accounts may need to unlock this page first.'
+  },
+  {
+    page: 'page-order',
+    target: '#catalogSyncPanel',
+    available: () => tourCanAddItems() && tourCanOpenItemForms(),
+    title: 'Import details, then review',
+    body: 'Expand Sync from Website URL and fetch a public product page or supported feed. Select one product and apply its details, review or edit the fields, then save. Existing manual entries are kept unless you choose to replace them. If a site cannot be read, continue manually without API keys.'
   },
   {
     page: 'page-logs',
@@ -2022,10 +2533,20 @@ const ONBOARDING_STEPS = [
     page: 'page-dashboard',
     target: '#tabHelp',
     title: 'Help is always here',
-    body: 'Find answers to common questions in Help, and replay this tour whenever you like.'
+    body: 'Help is the last navigation tab. Search for step-by-step guides, including optional Shopify/WooCommerce API keys and webhook preparation. API integration in Settings is still in development and may not work correctly. Manual entry and public URL imports remain supported. Replay this tour here whenever you like.'
   }
 ];
-const tourState = { active: false, index: 0, returnPage: 'page-dashboard', lastFocus: null, frame: 0, observer: null };
+const tourState = { active: false, index: 0, steps: [], returnPage: 'page-dashboard', lastFocus: null, frame: 0, observer: null };
+
+function tourCanAddItems() {
+  const profile = state.clientProfile;
+  return profile?.clientId === state.activeClientId && Boolean(profile.enableAddItem) && !profile.readOnly;
+}
+
+function tourCanOpenItemForms() {
+  const config = getClientInventoryFields(state.activeClientId);
+  return (!config.readOnly && !config.requirePin) || state.pinUnlocked;
+}
 
 // When storage is blocked, treat the tour as seen so it doesn't reappear on every sign-in.
 function hasSeenOnboarding() {
@@ -2056,6 +2577,7 @@ function startOnboardingTour(options = {}) {
   const currentPage = document.querySelector('.page.active')?.id || 'page-dashboard';
   tourState.active = true;
   tourState.index = 0;
+  tourState.steps = ONBOARDING_STEPS.filter((step) => !step.available || step.available());
   tourState.returnPage = options.returnPage || currentPage;
   tourState.lastFocus = document.activeElement;
   overlay.hidden = false;
@@ -2073,9 +2595,9 @@ function showTourPage(pageId) {
 }
 
 function renderOnboardingStep() {
-  const step = ONBOARDING_STEPS[tourState.index];
+  const step = tourState.steps[tourState.index];
   if (!tourState.active || !step) return;
-  const total = ONBOARDING_STEPS.length;
+  const total = tourState.steps.length;
   const isFirst = tourState.index === 0;
   const isLast = tourState.index === total - 1;
   const set = (id, text) => {
@@ -2087,7 +2609,7 @@ function renderOnboardingStep() {
   set('tourBody', step.body);
   const progress = document.getElementById('tourProgress');
   if (progress) {
-    progress.innerHTML = ONBOARDING_STEPS.map((_, i) => `<span class="${i === tourState.index ? 'is-active' : i < tourState.index ? 'is-done' : ''}"></span>`).join('');
+    progress.innerHTML = tourState.steps.map((_, i) => `<span class="${i === tourState.index ? 'is-active' : i < tourState.index ? 'is-done' : ''}"></span>`).join('');
   }
   const back = document.getElementById('tourBack');
   const next = document.getElementById('tourNext');
@@ -2143,7 +2665,7 @@ function positionOnboardingTour() {
   const spotlight = document.getElementById('tourSpotlight');
   const card = document.getElementById('tourCard');
   if (!tourState.active || !overlay || !spotlight || !card) return;
-  const target = getTourTarget(ONBOARDING_STEPS[tourState.index]);
+  const target = getTourTarget(tourState.steps[tourState.index]);
   card.style.top = '';
   card.style.left = '';
   if (!target) {
@@ -2183,7 +2705,7 @@ function positionOnboardingTour() {
 function moveOnboardingTour(delta) {
   if (!tourState.active) return;
   const nextIndex = tourState.index + delta;
-  if (nextIndex < 0 || nextIndex >= ONBOARDING_STEPS.length) return;
+  if (nextIndex < 0 || nextIndex >= tourState.steps.length) return;
   tourState.index = nextIndex;
   renderOnboardingStep();
 }
@@ -2274,6 +2796,599 @@ document.addEventListener('toggle', (event) => {
 }, true);
 
 filterFaq();
+
+let storeConnectionRequestId = 0;
+let storeConnectionBusy = false;
+let storeConnectionLoaded = false;
+let storeConnection = null;
+
+function canManageStoreConnection() {
+  return state.auth && state.activeClientId !== 'CL-000'
+    && (state.session?.role === 'admin' || (state.session?.role === 'client' && state.session?.clientId === state.activeClientId));
+}
+
+function hasWarehouseAccess() {
+  return state.auth && ['admin', 'staff'].includes(state.session?.role);
+}
+
+function canOpenPortalPage(pageId) {
+  if (pageId === 'page-clients') return canConfigureStaff();
+  if (pageId === 'page-store-settings') return canManageBranding();
+  if (pageId === 'page-billing') return state.session?.role === 'admin'
+    || (state.session?.role === 'client' && document.getElementById('tabBilling')?.style.display !== 'none');
+  return hasWarehouseAccess() || state.activeClientId === state.session?.clientId;
+}
+
+function updateStoreSettingsAccess() {
+  const tab = document.getElementById('tabStoreSettings');
+  if (tab) tab.style.display = canManageBranding() ? '' : 'none';
+  document.querySelectorAll('[data-owner-settings]').forEach(section => {
+    section.hidden = !canManageStoreConnection();
+  });
+}
+
+function storeConnectionMessage(message, error = false) {
+  const host = document.getElementById('storeConnectionStatus');
+  if (host) {
+    host.textContent = message;
+    host.classList.toggle('is-error', error);
+  }
+}
+
+function clearStoreSecrets() {
+  ['storeAccessToken', 'storeConsumerKey', 'storeConsumerSecret', 'storeApiToken', 'storeConnectionDetails'].forEach((id) => {
+    const input = document.getElementById(id);
+    if (input) input.value = '';
+  });
+}
+
+function resetStoreConnection() {
+  storeConnectionRequestId += 1;
+  storeConnectionBusy = false;
+  storeConnectionLoaded = false;
+  storeConnection = null;
+  clearStoreSecrets();
+  const form = document.getElementById('storeConnectionForm');
+  if (form) form.reset();
+  const fields = document.getElementById('storeConnectionFields');
+  if (fields) fields.disabled = true;
+  const status = document.getElementById('storeCredentialStatus');
+  if (status) status.textContent = '';
+  storeConnectionMessage('');
+}
+
+function syncStorePlatform() {
+  const platform = document.getElementById('storePlatform');
+  if (!platform) return;
+  const shopify = platform.value === 'shopify';
+  const woo = platform.value === 'woocommerce';
+  const generic = !shopify && !woo;
+  document.getElementById('shopifyCredentialFields').hidden = !shopify;
+  document.getElementById('wooCredentialFields').hidden = !woo;
+  document.getElementById('genericCredentialFields').hidden = !generic;
+  document.getElementById('storeDomain').placeholder = shopify ? 'your-store.myshopify.com' : 'https://your-store.com';
+  document.getElementById('storeAccessToken').disabled = !storeConnection?.storageReady || !shopify;
+  ['storeConsumerKey', 'storeConsumerSecret'].forEach((id) => {
+    document.getElementById(id).disabled = !storeConnection?.storageReady || !woo;
+  });
+  ['storeApiToken', 'storeConnectionDetails'].forEach((id) => {
+    document.getElementById(id).disabled = !storeConnection?.storageReady || !generic;
+  });
+}
+
+function renderStoreConnection() {
+  const fields = document.getElementById('storeConnectionFields');
+  if (!fields) return;
+  fields.disabled = !storeConnectionLoaded || storeConnectionBusy;
+  document.getElementById('storeConnectionReload').disabled = storeConnectionBusy;
+  if (!storeConnection) return;
+  document.getElementById('storeStorageWarning').hidden = storeConnection.storageReady;
+  document.getElementById('storeCredentialStatus').textContent = storeConnection.hasCredentials
+    ? 'Encrypted credentials saved. Their validity has not been tested. Automatic sync is not enabled.'
+    : 'No credentials saved. You can save the store address alone, or leave this connection unconfigured.';
+  syncStorePlatform();
+}
+
+async function loadStoreConnection() {
+  if (!canManageStoreConnection()) {
+    resetStoreConnection();
+    storeConnectionMessage('Only the account owner or an administrator can manage store settings.', true);
+    return;
+  }
+  const clientId = state.activeClientId;
+  const session = state.session;
+  const requestId = ++storeConnectionRequestId;
+  storeConnectionBusy = true;
+  storeConnectionLoaded = false;
+  clearStoreSecrets();
+  renderStoreConnection();
+  storeConnectionMessage('Loading optional store settings...');
+  try {
+    const response = await fetch(`${STORE_CONNECTION_URL}?clientId=${encodeURIComponent(clientId)}`, {
+      headers: adminHeaders({ Accept: 'application/json' }), signal: viewSignal()
+    });
+    const result = await response.json();
+    if (requestId !== storeConnectionRequestId || session !== state.session || clientId !== state.activeClientId || !state.auth) return;
+    if (!response.ok || !result.success || result.clientId !== clientId) throw new Error(result.error || 'Unable to load store settings.');
+    storeConnection = result.connection;
+    storeConnectionLoaded = true;
+    document.getElementById('storePlatform').value = storeConnection.platform;
+    document.getElementById('storeDomain').value = storeConnection.domain;
+    document.getElementById('storeRemoveCredentials').checked = false;
+    storeConnectionMessage('Configuration only. Manual inventory and URL product imports remain available without a connection.');
+  } catch (error) {
+    if (requestId === storeConnectionRequestId && error.name !== 'AbortError') {
+      storeConnectionMessage(error.message || 'Unable to load settings. Use Reload settings to retry.', true);
+    }
+  } finally {
+    if (requestId === storeConnectionRequestId) {
+      storeConnectionBusy = false;
+      renderStoreConnection();
+    }
+  }
+}
+
+async function saveStoreConnection(event, disconnect = false) {
+  event?.preventDefault();
+  if (!canManageStoreConnection() || !storeConnectionLoaded || storeConnectionBusy) return;
+  const clientId = state.activeClientId;
+  const session = state.session;
+  const requestId = ++storeConnectionRequestId;
+  const body = disconnect ? { clientId, disconnect: true } : {
+    clientId,
+    platform: document.getElementById('storePlatform').value,
+    domain: document.getElementById('storeDomain').value.trim(),
+    removeCredentials: document.getElementById('storeRemoveCredentials').checked
+  };
+  if (!disconnect && storeConnection?.storageReady && !body.removeCredentials) {
+    if (body.platform === 'shopify') body.accessToken = document.getElementById('storeAccessToken').value.trim();
+    else if (body.platform === 'woocommerce') {
+      body.consumerKey = document.getElementById('storeConsumerKey').value.trim();
+      body.consumerSecret = document.getElementById('storeConsumerSecret').value.trim();
+    } else {
+      body.accessToken = document.getElementById('storeApiToken').value.trim();
+      body.connectionDetails = document.getElementById('storeConnectionDetails').value.trim();
+    }
+  }
+  storeConnectionBusy = true;
+  renderStoreConnection();
+  storeConnectionMessage(disconnect ? 'Removing saved configuration...' : 'Saving optional configuration...');
+  try {
+    const response = await fetch(STORE_CONNECTION_URL, {
+      method: 'PUT', headers: adminHeaders({ 'Content-Type': 'application/json' }), body: JSON.stringify(body), signal: viewSignal()
+    });
+    const result = await response.json();
+    if (requestId !== storeConnectionRequestId || session !== state.session || clientId !== state.activeClientId || !state.auth) return;
+    if (!response.ok || !result.success || result.clientId !== clientId) throw new Error(result.error || 'Store settings were not confirmed. Please retry.');
+    storeConnection = result.connection;
+    document.getElementById('storeDomain').value = storeConnection.domain;
+    document.getElementById('storePlatform').value = storeConnection.platform;
+    document.getElementById('storeRemoveCredentials').checked = false;
+    storeConnectionMessage(disconnect
+      ? 'Saved configuration removed. Revoke tokens and remove webhooks separately in your store.'
+      : 'Configuration saved, not connected or verified. Automatic order sync is not enabled.');
+  } catch (error) {
+    if (requestId === storeConnectionRequestId && error.name !== 'AbortError') storeConnectionMessage(error.message || 'Unable to save settings. Please retry.', true);
+  } finally {
+    // Secrets never survive an attempt in the UI, including a failed save.
+    if (requestId === storeConnectionRequestId) {
+      clearStoreSecrets();
+      storeConnectionBusy = false;
+      renderStoreConnection();
+    }
+  }
+}
+
+function openIntegrationGuide() {
+  showPage('help');
+  const search = document.getElementById('faqSearch');
+  if (search) { search.value = ''; filterFaq(); }
+  const guide = document.getElementById('integrationGuide');
+  if (guide) {
+    guide.open = true;
+    guide.scrollIntoView({ block: 'start', behavior: 'smooth' });
+  }
+}
+
+let inboundRequest = 0;
+let inboundDraftId = null;
+let inboundLineId = 0;
+let inboundState = { clientId: null, shipments: null, loading: false, busy: false, error: '', message: '' };
+
+function inboundAvailable() {
+  return state.auth && state.clientProfile?.clientId === state.activeClientId
+    && state.clientProfile.inventoryMode === 'inventory';
+}
+
+function closeInboundDialog() {
+  document.getElementById('inboundDialog')?.close?.();
+  inboundDraftId = null;
+}
+
+function resetInboundShipments() {
+  inboundRequest += 1;
+  closeInboundDialog();
+  inboundState = { clientId: null, shipments: null, loading: false, busy: false, error: '', message: '' };
+  document.getElementById('inboundForm')?.reset?.();
+  renderInboundShipments();
+}
+
+function renderInboundShipments() {
+  const visible = inboundAvailable();
+  const current = inboundState.clientId === state.activeClientId;
+  const shipments = current ? inboundState.shipments : null;
+  const busy = current && inboundState.busy;
+  ['inboundDashboard', 'inboundTracking'].forEach((id) => {
+    const host = document.getElementById(id);
+    if (!host) return;
+    host.hidden = !visible;
+    if (!visible) { host.innerHTML = ''; return; }
+    const markup = `<div class="inbound-heading"><h3>Inbound restock shipments</h3><div class="inbound-actions">
+      <button type="button" class="btn-set" data-inbound-action="add"${busy ? ' disabled' : ''}>Notify Restock / Add Inbound Shipment</button>
+      <button type="button" class="filter-clear" data-inbound-action="refresh"${busy || (current && inboundState.loading) ? ' disabled' : ''}>Refresh inbound</button></div></div>
+      <p class="inbound-hint">Expected boxes and SKU contents for ${escapeHtml(state.activeClientId)}. Arrival records do not change stock quantities.</p>
+      ${packagingBanner(null)}
+      ${state.isAdmin ? `<form class="inbound-scan"><label>Dock scan: tracking number<input name="code" aria-label="Inbound tracking barcode" maxlength="200" autocomplete="off" required${busy ? ' disabled' : ''} placeholder="Scan with USB scanner, then press Enter" /></label><button type="submit" class="btn-set"${busy ? ' disabled' : ''}>Record arrival</button></form>` : ''}
+      <p class="inbound-error" role="alert">${current ? escapeHtml(inboundState.error) : ''}</p>
+      <p class="inbound-hint" role="status">${current ? escapeHtml(inboundState.message || (inboundState.loading ? 'Loading inbound shipments...' : '')) : ''}</p>
+      <div class="inbound-list">${!shipments ? '<p class="inbound-hint">Load inbound shipments with Refresh inbound.</p>' : !shipments.length
+        ? '<p class="inbound-hint">No inbound shipments logged yet.</p>'
+        : shipments.map((shipment) => `<article class="inbound-card">
+          <div class="inbound-heading"><strong>${escapeHtml(shipment.carrier)}</strong><span>${escapeHtml(shipment.status)}</span></div>
+          <div class="tracking-number-row">${trackingCarrierMarkup(shipment.trackingNumber)}</div>
+          <p>Expected delivery: ${escapeHtml(shipment.expectedDeliveryDate)}</p>
+          <ul>${shipment.contents.map((line) => `<li>${escapeHtml(line.sku)} &mdash; ${escapeHtml(String(line.quantity))} expected</li>`).join('')}</ul>
+          ${shipment.contents.map((line) => state.items.find((item) => String(item.sku || '').trim().toUpperCase() === line.sku.toUpperCase()))
+            .filter(Boolean).map((item) => packagingBanner(item, false)).join('')}
+          <p class="inbound-hint">Notified ${escapeHtml(formatActivityTimestamp(shipment.createdAt))} by ${escapeHtml(shipment.createdBy)}</p>
+          ${shipment.arrivedAt ? `<p>Arrived ${escapeHtml(formatActivityTimestamp(shipment.arrivedAt))} &middot; ${escapeHtml(shipment.arrivedBy)}</p>` : state.isAdmin
+            ? `<button type="button" class="filter-clear" data-inbound-action="arrive" data-shipment-id="${escapeHtml(shipment.id)}"${busy ? ' disabled' : ''}>Record arrival for this shipment</button>` : ''}
+        </article>`).join('')}</div>`;
+    if (host.innerHTML !== markup) host.innerHTML = markup;
+  });
+}
+
+async function loadInboundShipments() {
+  if (!inboundAvailable() || inboundState.busy || inboundState.loading) return;
+  const clientId = state.activeClientId;
+  const session = state.session;
+  const request = ++inboundRequest;
+  if (inboundState.clientId !== clientId) inboundState = { clientId, shipments: null, loading: false, busy: false, error: '', message: '' };
+  inboundState.loading = true;
+  inboundState.error = '';
+  renderInboundShipments();
+  try {
+    const response = await fetch(`${INBOUND_URL}?clientId=${encodeURIComponent(clientId)}`, { headers: adminHeaders(), signal: viewSignal() });
+    const result = await response.json();
+    if (request !== inboundRequest || session !== state.session || clientId !== state.activeClientId || !state.auth) return;
+    if (!response.ok || !result.success || result.clientId !== clientId || !Array.isArray(result.shipments)) throw new Error(result.error || 'Unable to load inbound shipments.');
+    inboundState.shipments = result.shipments;
+  } catch (error) {
+    if (request === inboundRequest && error.name !== 'AbortError') inboundState.error = error.message || 'Unable to load inbound shipments. Please retry.';
+  } finally {
+    if (request === inboundRequest) { inboundState.loading = false; renderInboundShipments(); }
+  }
+}
+
+function addInboundLine() {
+  const host = document.getElementById('inboundContents');
+  if (!host || host.children.length >= 50) return;
+  const id = ++inboundLineId;
+  host.insertAdjacentHTML('beforeend', `<div class="inbound-line">
+    <label for="inboundSku${id}">SKU<input id="inboundSku${id}" data-inbound-sku list="inboundSkuOptions" maxlength="100" required /></label>
+    <label for="inboundQty${id}">Expected quantity<input id="inboundQty${id}" data-inbound-quantity type="number" min="1" max="1000000" step="1" required /></label>
+    <button type="button" class="filter-clear" data-inbound-remove aria-label="Remove contents line">Remove</button></div>`);
+  document.getElementById('inboundAddLine').disabled = host.children.length >= 50;
+}
+
+function openInboundDialog() {
+  if (!inboundAvailable() || inboundState.busy) return;
+  const dialog = document.getElementById('inboundDialog');
+  if (!dialog) return;
+  if (typeof globalThis.crypto?.randomUUID !== 'function') {
+    showToast('A secure browser context is required. Open this portal over HTTPS or localhost.', 'error');
+    return;
+  }
+  inboundDraftId = crypto.randomUUID();
+  document.getElementById('inboundForm').reset();
+  document.getElementById('inboundFields').disabled = false;
+  document.getElementById('inboundSave').disabled = false;
+  document.getElementById('inboundError').textContent = '';
+  document.getElementById('inboundContents').innerHTML = '';
+  document.getElementById('inboundSkuOptions').innerHTML = state.items.filter((item) => item.sku)
+    .map((item) => `<option value="${escapeHtml(item.sku)}">${escapeHtml(item.title)}</option>`).join('');
+  addInboundLine();
+  dialog.showModal();
+  document.getElementById('inboundCarrier').focus();
+}
+
+async function submitInboundShipment(event) {
+  event.preventDefault();
+  if (!inboundAvailable() || inboundState.busy || !inboundDraftId) return;
+  const contents = [...document.querySelectorAll('#inboundContents .inbound-line')].map((line) => ({
+    sku: line.querySelector('[data-inbound-sku]').value.trim(), quantity: Number(line.querySelector('[data-inbound-quantity]').value)
+  }));
+  if (!contents.length) { document.getElementById('inboundError').textContent = 'Add at least one SKU line.'; return; }
+  await mutateInboundShipment('', {
+    shipmentId: inboundDraftId, carrier: document.getElementById('inboundCarrier').value,
+    trackingNumber: document.getElementById('inboundTrackingNumber').value.trim(),
+    expectedDeliveryDate: document.getElementById('inboundExpectedDate').value, contents
+  });
+}
+
+async function checkInInboundShipment(code, shipmentId) {
+  if (!inboundAvailable() || !state.isAdmin || inboundState.busy) return;
+  await mutateInboundShipment('/check-in', { code, ...(shipmentId ? { shipmentId } : {}) });
+}
+
+async function mutateInboundShipment(path, body) {
+  const clientId = state.activeClientId;
+  const session = state.session;
+  const request = ++inboundRequest;
+  inboundState.clientId = clientId;
+  inboundState.loading = false;
+  inboundState.busy = true;
+  inboundState.error = '';
+  inboundState.message = '';
+  if (!path) {
+    document.getElementById('inboundFields').disabled = true;
+    document.getElementById('inboundSave').disabled = true;
+    document.getElementById('inboundError').textContent = '';
+  }
+  renderInboundShipments();
+  try {
+    const response = await fetch(`${INBOUND_URL}${path}`, {
+      method: 'POST', headers: adminHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ clientId, ...body }), signal: viewSignal()
+    });
+    const result = await response.json();
+    if (request !== inboundRequest || session !== state.session || clientId !== state.activeClientId || !state.auth) return;
+    if (!response.ok || !result.success || result.clientId !== clientId || !result.shipment) throw new Error(result.error || 'Shipment changes were not confirmed. Refresh before retrying.');
+    if (inboundState.shipments) {
+      inboundState.shipments = [result.shipment, ...inboundState.shipments.filter((entry) => entry.id !== result.shipment.id)];
+    }
+    inboundState.message = path ? `${result.alreadyCheckedIn ? 'Already arrived' : 'Arrival recorded'}: ${result.shipment.trackingNumber}. Stock quantities unchanged.` : 'Warehouse notified. Stock quantities unchanged.';
+    if (!path) closeInboundDialog();
+  } catch (error) {
+    if (request === inboundRequest && error.name !== 'AbortError') {
+      inboundState.error = error.message || 'Shipment changes were not confirmed. Refresh before retrying.';
+      if (!path) document.getElementById('inboundError').textContent = inboundState.error;
+    }
+  } finally {
+    if (request === inboundRequest) {
+      inboundState.busy = false;
+      if (!path) {
+        document.getElementById('inboundFields').disabled = false;
+        document.getElementById('inboundSave').disabled = false;
+      }
+      renderInboundShipments();
+      if (!inboundState.shipments && !inboundState.error) loadInboundShipments();
+    }
+  }
+}
+
+let packagingEditor = null;
+let packagingRequest = 0;
+
+function currentPackagingNotes() {
+  return state.clientProfile?.clientId === state.activeClientId ? state.clientProfile.packagingNotes || '' : '';
+}
+
+function packagingBanner(item, includeGlobal = true) {
+  const global = includeGlobal ? currentPackagingNotes() : '';
+  const special = item?.prepInstructions || '';
+  return `${global ? `<aside class="prep-banner"><h3>Client SOP / Packaging Notes</h3><p>${escapeHtml(global)}</p></aside>` : ''}
+    ${special ? `<aside class="prep-banner"><h3>Special Prep Instructions${item?.sku ? `: ${escapeHtml(item.sku)}` : ''}</h3><p>${escapeHtml(special)}</p></aside>` : ''}`;
+}
+
+function renderPackagingInstructions() {
+  const profile = state.clientProfile;
+  const current = state.auth && profile?.clientId === state.activeClientId && state.activeClientId !== 'CL-000';
+  for (const id of ['packagingProfile', 'settingsPackagingProfile']) {
+    const host = document.getElementById(id);
+    if (!host) continue;
+    const settings = id === 'settingsPackagingProfile';
+    const visible = current && (settings ? canManageStoreConnection() : Boolean(currentPackagingNotes()));
+    host.hidden = !visible;
+    host.innerHTML = visible ? `<h3>Standard Operating Procedure / Packaging Notes</h3>
+      ${packagingBanner(null) || '<p class="inbound-hint">No client-wide packaging notes saved.</p>'}
+      ${settings && canManageStoreConnection() ? '<button type="button" class="filter-clear" data-edit-packaging>Edit client packaging notes</button>' : ''}` : '';
+  }
+  const selected = state.items.find((item) => String(item.id) === String(state.selectedItemId));
+  const modal = inventoryItemEditor?.clientId === state.activeClientId ? inventoryItemEditor.item : null;
+  for (const [id, item, includeGlobal] of [
+    ['warehousePackagingBanner', null, true], ['selectedPackagingBanner', selected, false],
+    ['itemPackagingBanner', modal, true]
+  ]) {
+    const banner = document.getElementById(id);
+    if (banner) banner.innerHTML = current ? packagingBanner(item, includeGlobal) : '';
+  }
+}
+
+function closePackagingDialog() {
+  packagingRequest += 1;
+  packagingEditor = null;
+  document.getElementById('packagingDialog')?.close?.();
+  document.getElementById('packagingForm')?.reset?.();
+}
+
+function openPackagingDialog() {
+  if (!canManageStoreConnection()) return;
+  packagingEditor = { clientId: state.activeClientId, previousNotes: currentPackagingNotes(), busy: false };
+  document.getElementById('packagingNotesInput').value = packagingEditor.previousNotes;
+  document.getElementById('packagingNotesInput').disabled = false;
+  document.getElementById('packagingSave').disabled = false;
+  document.getElementById('packagingError').textContent = '';
+  document.getElementById('packagingDialog').showModal();
+  document.getElementById('packagingNotesInput').focus();
+}
+
+async function savePackagingNotes(event) {
+  event.preventDefault();
+  const editor = packagingEditor;
+  if (!editor || editor.busy || !canManageStoreConnection() || editor.clientId !== state.activeClientId) return;
+  const session = state.session;
+  const request = ++packagingRequest;
+  editor.busy = true;
+  document.getElementById('packagingNotesInput').disabled = true;
+  document.getElementById('packagingSave').disabled = true;
+  document.getElementById('packagingError').textContent = '';
+  try {
+    const response = await fetch(`${API_BASE}/api/packaging-notes`, {
+      method: 'PUT', headers: adminHeaders({ 'Content-Type': 'application/json' }), signal: viewSignal(),
+      body: JSON.stringify({ clientId: editor.clientId, previousNotes: editor.previousNotes, packagingNotes: document.getElementById('packagingNotesInput').value })
+    });
+    const result = await response.json();
+    if (request !== packagingRequest || session !== state.session || editor.clientId !== state.activeClientId || !state.auth) return;
+    if (!response.ok || !result.success || result.clientId !== editor.clientId) throw new Error(result.error || 'Packaging notes were not confirmed. Please refresh.');
+    state.clientProfile.packagingNotes = result.packagingNotes;
+    cacheClientView(editor.clientId, { profile: state.clientProfile });
+    closePackagingDialog();
+    renderPackagingInstructions();
+    renderInboundShipments();
+    renderTracking();
+    showToast('Packaging notes saved.');
+  } catch (error) {
+    if (request === packagingRequest && error.name !== 'AbortError') document.getElementById('packagingError').textContent = error.message || 'Unable to save packaging notes.';
+  } finally {
+    if (request === packagingRequest) {
+      editor.busy = false;
+      document.getElementById('packagingNotesInput').disabled = false;
+      document.getElementById('packagingSave').disabled = false;
+    }
+  }
+}
+
+function normalizeTrackingNumber(value) {
+  return String(value || '').trim().toUpperCase().replace(/[\s-]+/g, '');
+}
+
+function detectTrackingCarrier(value) {
+  const number = normalizeTrackingNumber(value);
+  if (/^1Z[A-Z0-9]+$/.test(number)) {
+    return { name: 'UPS', key: 'ups', number, url: `https://www.ups.com/track?loc=en_US&tracknum=${encodeURIComponent(number)}` };
+  }
+  // USPS overlaps FedEx's 20-digit format, so its prefixes take precedence.
+  if (/^(?=\d{20,22}$)(?:9|82)\d+$/.test(number)) {
+    return { name: 'USPS', key: 'usps', number, url: `https://tools.usps.com/go/TrackConfirmAction?tLabels=${encodeURIComponent(number)}` };
+  }
+  if (/^(?:\d{12}|\d{15}|\d{20})$/.test(number)) {
+    return { name: 'FedEx', key: 'fedex', number, url: `https://www.fedex.com/fedextrack/?trknbr=${encodeURIComponent(number)}` };
+  }
+  return null;
+}
+
+function trackingCarrierMarkup(value) {
+  const carrier = detectTrackingCarrier(value);
+  return `<span class="tracking-number">${escapeHtml(value)}</span>${carrier
+    ? `<span class="carrier-badge carrier-${carrier.key}">${carrier.name}</span><a class="tracking-carrier-link" href="${escapeHtml(carrier.url)}" target="_blank" rel="noopener noreferrer">View ${carrier.name} details <span class="sr-only">(opens in a new tab)</span></a>`
+    : '<span class="carrier-badge">Carrier unknown</span>'}`;
+}
+
+function resetTracking() {
+  trackingRequestId += 1;
+  state.tracking = { clientId: null, items: null, query: '', updatedAt: '', loading: false, error: '' };
+  const input = document.getElementById('trackingSearchInput');
+  if (input) input.value = '';
+  renderTracking();
+}
+
+async function loadTracking(clientId = state.activeClientId) {
+  if (!state.auth || !state.session?.notificationToken) return 401;
+  loadInboundShipments();
+  const requestId = ++trackingRequestId;
+  const session = state.session;
+  if (state.tracking.clientId !== clientId) {
+    state.tracking = { clientId, items: null, query: '', updatedAt: '', loading: false, error: '' };
+  }
+  state.tracking.loading = true;
+  state.tracking.error = '';
+  renderTracking();
+  const isCurrent = () => requestId === trackingRequestId && state.auth && state.session === session && state.activeClientId === clientId;
+  let status = 0;
+  try {
+    const response = await fetch(`${TRACKING_URL}?clientId=${encodeURIComponent(clientId)}`, {
+      headers: adminHeaders({ Accept: 'application/json' }), signal: viewSignal()
+    });
+    status = response.status;
+    if (!response.ok) throw new Error(`Tracking request failed (${status})`);
+    const result = await response.json();
+    if (result.clientId !== clientId || !Array.isArray(result.items)) throw new Error('Invalid tracking response');
+    if (isCurrent()) {
+      state.tracking.items = result.items;
+      state.tracking.updatedAt = result.updatedAt;
+    }
+    return 200;
+  } catch (error) {
+    if (error.name === 'AbortError' || !isCurrent()) return 0;
+    console.error('Tracking fetch failed:', error);
+    state.tracking.error = status === 401 ? 'Sign in again to view tracking.'
+      : 'Unable to refresh ECL tracking. Use Refresh status to retry. Previously loaded progress may be out of date.';
+    return status === 200 ? 0 : status;
+  } finally {
+    if (isCurrent()) {
+      state.tracking.loading = false;
+      renderTracking();
+    }
+  }
+}
+
+function renderTracking() {
+  const host = document.getElementById('trackingResults');
+  if (!host) return;
+  const tracking = state.tracking;
+  const current = state.auth && tracking.clientId === state.activeClientId;
+  const items = current ? tracking.items : null;
+  const query = current ? tracking.query.trim() : '';
+  const normalized = normalizeTrackingNumber(query);
+  const matches = (items || []).filter((item) => !query
+    || item.trackingNumbers.some((entry) => normalizeTrackingNumber(entry.number) === normalized)
+    || normalizeTrackingNumber(item.sku) === normalized
+    || String(item.title || '').toLowerCase().includes(query.toLowerCase()));
+  const errorHost = document.getElementById('trackingError');
+  if (errorHost) {
+    errorHost.hidden = !current || !tracking.error;
+    errorHost.textContent = current ? tracking.error : '';
+  }
+  const refresh = document.getElementById('trackingRefresh');
+  if (refresh) refresh.disabled = !state.auth || (current && tracking.loading);
+  const summary = document.getElementById('trackingSummary');
+  if (summary) summary.textContent = current && tracking.loading ? 'Refreshing ECL progress...'
+    : items ? `${matches.length} item${matches.length === 1 ? '' : 's'} in ${state.activeClientId}. Last refreshed ${formatActivityTimestamp(tracking.updatedAt)}.`
+      : 'Select an account to view its ECL shipment progress.';
+  const preview = document.getElementById('trackingCarrierPreview');
+  if (preview) preview.innerHTML = detectTrackingCarrier(query)
+    ? `<p>Detected carrier (format only)</p><div class="tracking-number-row">${trackingCarrierMarkup(query)}</div>` : '';
+  host.setAttribute('aria-busy', String(Boolean(current && tracking.loading)));
+  const labels = ['In Transit', 'Arrived at Warehouse', 'In Prep', 'Shipped'];
+  const markup = (current ? packagingBanner(null) : '') + (!items
+    ? '<p class="tracking-empty">Tracking records will appear here after loading.</p>'
+    : !matches.length
+      ? `<p class="tracking-empty">${query ? 'No matching records in this account. A detected carrier link does not confirm an ECL shipment or its status.' : 'No inventory records in this account yet.'}</p>`
+      : matches.map((item) => {
+        const stage = Number.isInteger(item.stage) && item.stage >= 0 && item.stage < labels.length ? item.stage : null;
+        const progression = stage === null
+          ? '<p class="tracking-stock-note">Stock-managed item. Warehouse fulfillment progression is not available.</p>'
+          : `<ol class="tracking-progress" aria-label="ECL warehouse progress">${labels.map((label, index) =>
+            `<li class="${index < stage ? 'is-complete' : index === stage ? 'is-current' : ''}"${index === stage ? ' aria-current="step"' : ''}><span class="tracking-step-dot" aria-hidden="true">${index + 1}</span><span>${label}</span>${index === stage ? '<span class="sr-only"> (current stage)</span>' : ''}</li>`
+          ).join('')}</ol>`;
+        return `<article class="tracking-card"><div class="tracking-card-heading"><div><h3>${escapeHtml(item.title)}</h3><p>SKU: ${escapeHtml(item.sku || 'Not set')}</p></div><span class="tracking-sheet-status">${escapeHtml(item.status)}</span></div>
+          ${packagingBanner(item, false)}
+          ${progression}
+          ${item.checkInTimestamp ? `<p class="tracking-checkin">Warehouse check-in: ${escapeHtml(formatActivityTimestamp(item.checkInTimestamp))}</p>` : ''}
+          <div class="tracking-numbers">${item.trackingNumbers.length ? item.trackingNumbers.map((entry) =>
+            `<div><p class="tracking-number-label">${escapeHtml(entry.label)}</p><div class="tracking-number-row">${trackingCarrierMarkup(entry.number)}</div></div>`
+          ).join('') : '<p>No tracking number saved on this inventory record.</p>'}</div></article>`;
+      }).join(''));
+  if (host.innerHTML !== markup) host.innerHTML = markup;
+}
+
+function searchTracking(event) {
+  event.preventDefault();
+  if (!state.auth) return;
+  state.tracking.query = document.getElementById('trackingSearchInput').value;
+  renderTracking();
+}
 
 async function loadActivity(clientId = state.activeClientId) {
   if (!state.auth || !state.session?.notificationToken) return 401;
@@ -2374,7 +3489,7 @@ async function submitMessage() {
   }
   const fileName = fileUrl ? (fileUrl.split('/').pop() || 'Shared file') : '';
 
-  const isStaff = Boolean(state.session && (String(state.session.role || '').toLowerCase() === 'admin' || String(state.session.clientId || '').toUpperCase() === 'CL-000'));
+  const isStaff = hasWarehouseAccess();
   const entry = {
     localId: `local-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     status: 'sending',
@@ -2463,11 +3578,267 @@ function filterSearch() {
   searchResults.style.display = 'block';
 }
 
+let barcodeCheckIn = null;
+let barcodeScanBusy = false;
+let barcodeCamera = null;
+let barcodeCameraStarting = false;
+let barcodeCameraGeneration = 0;
+let barcodeDecodeBusy = false;
+
+async function stopBarcodeCamera() {
+  barcodeCameraGeneration += 1;
+  const camera = barcodeCamera;
+  if (!camera || barcodeCameraStarting) return;
+  barcodeCamera = null;
+  try {
+    if (camera.isScanning) await camera.stop();
+    camera.clear();
+    const panel = document.getElementById('barcodeCameraPanel');
+    if (panel) panel.hidden = true;
+  } catch (error) {
+    setBarcodeScanMessage(`Unable to stop camera: ${error.message || error}. Close this page to release the camera.`, true);
+  }
+}
+
+async function startBarcodeCamera() {
+  if (!barcodeCheckInAllowed() || barcodeCamera || barcodeCameraStarting) return;
+  resetBarcodeCheckIn();
+  if (!window.isSecureContext || !navigator.mediaDevices?.getUserMedia) {
+    setBarcodeScanMessage('Camera scanning requires HTTPS (or localhost) and camera permission. You can still use the USB scan field.', true);
+    return;
+  }
+  if (typeof Html5Qrcode !== 'function') {
+    setBarcodeScanMessage('Camera scanner could not load. Refresh the page or use the USB scan field.', true);
+    return;
+  }
+  const generation = ++barcodeCameraGeneration;
+  const session = state.session;
+  const clientId = state.activeClientId;
+  const panel = document.getElementById('barcodeCameraPanel');
+  panel.hidden = false;
+  barcodeCameraStarting = true;
+  const camera = new Html5Qrcode('barcodeCameraReader');
+  barcodeCamera = camera;
+  try {
+    await camera.start({ facingMode: 'environment' }, { fps: 10 }, async (code) => {
+      if (barcodeDecodeBusy || barcodeScanBusy || barcodeCheckIn || barcodeCameraGeneration !== generation
+        || state.session !== session || state.activeClientId !== clientId || !barcodeCheckInAllowed()) return;
+      barcodeDecodeBusy = true;
+      await stopBarcodeCamera();
+      document.getElementById('barcodeScanInput').value = code;
+      try {
+        await scanBarcode({ preventDefault() {} });
+      } finally {
+        barcodeDecodeBusy = false;
+      }
+    }, () => {});
+    setBarcodeScanMessage('Camera ready. Hold one barcode in view.');
+  } catch (error) {
+    setBarcodeScanMessage(`Camera unavailable: ${error.message || error}. Allow camera access or use the USB scan field.`, true);
+  } finally {
+    barcodeCameraStarting = false;
+    if (generation !== barcodeCameraGeneration || !camera.isScanning) await stopBarcodeCamera();
+  }
+}
+
+function barcodeScanFeedback() {
+  const host = document.getElementById('barcodeScanMessage');
+  if (host) {
+    host.classList.add('scan-success');
+    setTimeout(() => host.classList.remove('scan-success'), 1500);
+  }
+}
+
+function barcodeCheckInAllowed() {
+  return state.auth && state.isAdmin && isFulfillmentClient();
+}
+
+function setBarcodeScanMessage(message, isError = false) {
+  const host = document.getElementById('barcodeScanMessage');
+  if (!host) return;
+  host.textContent = message;
+  host.classList.toggle('is-error', isError);
+}
+
+function syncBarcodeCheckIn() {
+  const allowed = barcodeCheckInAllowed();
+  ['barcodeScanInput', 'barcodeScanSubmit', 'barcodeConfirmSubmit', 'barcodeScanMatch', 'barcodeCameraStart'].forEach((id) => {
+    const input = document.getElementById(id);
+    if (input) input.disabled = !allowed || barcodeScanBusy;
+  });
+  if (!allowed) {
+    const form = document.getElementById('barcodeConfirmForm');
+    if (form) form.hidden = true;
+    setBarcodeScanMessage(state.isAdmin
+      ? 'Select an order-fulfillment account to check in items.'
+      : 'Only ECL staff can record warehouse arrivals.');
+  }
+}
+
+function resetBarcodeCheckIn() {
+  stopBarcodeCamera();
+  barcodeCheckIn = null;
+  const form = document.getElementById('barcodeConfirmForm');
+  if (form) form.hidden = true;
+  const input = document.getElementById('barcodeScanInput');
+  if (input) input.value = '';
+  setBarcodeScanMessage('');
+  const instructions = document.getElementById('scanPackagingBanner');
+  if (instructions) instructions.innerHTML = '';
+}
+
+function normalizeBarcode(value) {
+  return String(value ?? '').trim().toUpperCase();
+}
+
+function findBarcodeMatches(items, code, clientId, fields = []) {
+  const normalized = normalizeBarcode(code);
+  if (!normalized) return [];
+  const customKeys = fields.filter((field) => /sku|upc|tracking/i.test(`${field.key} ${field.label}`)).map((field) => field.key);
+  const keys = [...new Set(['sku', 'upc', 'trackingNumber', 'tracking', ...customKeys])];
+  return items.filter((item) => (!item.clientId || item.clientId === clientId) && !isShippedItem(item)
+    && keys.some((key) => normalizeBarcode(item[key]) === normalized));
+}
+
+function previewBarcodeCheckIn() {
+  const editor = barcodeCheckIn;
+  if (!editor) return;
+  const id = document.getElementById('barcodeScanMatch').value;
+  const item = editor.items.find((entry) => String(entry.id) === id);
+  const instructions = document.getElementById('scanPackagingBanner');
+  if (instructions) instructions.innerHTML = packagingBanner(item);
+  const host = document.getElementById('barcodeScanPreview');
+  if (!item) {
+    host.textContent = 'More than one item matches. Choose the item being received.';
+    return;
+  }
+  host.textContent = `${item.title || item.sku}: record Arrived / Check-In and a timestamp. Quantities remain unchanged.`;
+}
+
+async function scanBarcode(event) {
+  event.preventDefault();
+  if (barcodeScanBusy) return;
+  if (!barcodeCheckInAllowed()) {
+    syncBarcodeCheckIn();
+    return;
+  }
+  const input = document.getElementById('barcodeScanInput');
+  const code = normalizeBarcode(input.value);
+  resetBarcodeCheckIn();
+  if (!code) {
+    setBarcodeScanMessage('Scan or enter a UPC, SKU or tracking number first.', true);
+    input.focus();
+    return;
+  }
+  const clientId = state.activeClientId;
+  const session = state.session;
+  barcodeScanBusy = true;
+  syncBarcodeCheckIn();
+  setBarcodeScanMessage('Looking up barcode...');
+  try {
+    const status = await fetchInventory(clientId);
+    if (session !== state.session || clientId !== state.activeClientId) return;
+    if (status !== 200) throw new Error('Unable to refresh inventory. Try scanning again.');
+    const matches = findBarcodeMatches(state.items, code, clientId, state.clientProfile?.fields);
+    if (!matches.length) {
+      renderProductForm();
+      const fields = getFormFields(clientId, 'inventory');
+      const field = fields.find((entry) => /upc/i.test(`${entry.key} ${entry.label}`)) || fields.find((entry) => /tracking/i.test(`${entry.key} ${entry.label}`));
+      const target = document.getElementById(field ? `customField_${field.key}` : 'newProductSku');
+      if (!target || document.getElementById('createProductSubmit')?.disabled) throw new Error('No matching active record. This account cannot add inventory.');
+      target.value = code;
+      target.dataset.userTyped = 'true';
+      showPage('order');
+      target.focus();
+      showToast('No active match. Barcode filled in Add Item; review the other fields before saving.', 'success');
+      return;
+    }
+    barcodeCheckIn = { clientId, session, code, items: matches.map((item) => ({ ...item })) };
+    if (matches.length === 1) {
+      await recordBarcodeArrival(barcodeCheckIn, matches[0]);
+      return;
+    }
+    const select = document.getElementById('barcodeScanMatch');
+    select.innerHTML = (matches.length > 1 ? '<option value="">Choose an item to check in</option>' : '') + matches.map((item) =>
+      `<option value="${escapeHtml(item.id)}">${escapeHtml(item.title || 'Inventory item')} — ${escapeHtml(item.upc || item.sku || item.id)} (${escapeHtml(item.id)})</option>`
+    ).join('');
+    document.getElementById('barcodeConfirmForm').hidden = false;
+    setBarcodeScanMessage(`${matches.length} items matched. Choose the item before checking in.`);
+    previewBarcodeCheckIn();
+  } catch (error) {
+    if (session === state.session && clientId === state.activeClientId) setBarcodeScanMessage(error.message || 'Unable to look up barcode.', true);
+  } finally {
+    barcodeScanBusy = false;
+    syncBarcodeCheckIn();
+  }
+}
+
+async function confirmBarcodeCheckIn(event) {
+  event.preventDefault();
+  const editor = barcodeCheckIn;
+  if (barcodeScanBusy || !editor) return;
+  if (!barcodeCheckInAllowed() || editor.session !== state.session || editor.clientId !== state.activeClientId) {
+    resetBarcodeCheckIn();
+    syncBarcodeCheckIn();
+    return;
+  }
+  const item = editor.items.find((entry) => String(entry.id) === document.getElementById('barcodeScanMatch').value);
+  if (!item) {
+    setBarcodeScanMessage('Choose which matching item to check in.', true);
+    return;
+  }
+  barcodeScanBusy = true;
+  syncBarcodeCheckIn();
+  try {
+    await recordBarcodeArrival(editor, item);
+  } finally {
+    barcodeScanBusy = false;
+    syncBarcodeCheckIn();
+  }
+}
+
+async function recordBarcodeArrival(editor, item) {
+  const instructions = document.getElementById('scanPackagingBanner');
+  if (instructions) instructions.innerHTML = packagingBanner(item);
+  setBarcodeScanMessage('Recording arrival...');
+  try {
+    const response = await fetch(`${API_BASE}/api/inventory/check-in`, {
+      method: 'POST', headers: adminHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({
+        clientId: editor.clientId, itemId: item.id, title: item.title,
+        code: editor.code
+      })
+    });
+    const result = await response.json();
+    if (barcodeCheckIn !== editor) return;
+    if (!response.ok || !result.success) throw new Error(result.error || 'Unable to record check-in.');
+    resetBarcodeCheckIn();
+    inventorySignature = null;
+    const status = await fetchInventory(editor.clientId);
+    if (editor.session !== state.session || editor.clientId !== state.activeClientId) return;
+    if (instructions) instructions.innerHTML = packagingBanner(state.items.find((entry) => entry.id === item.id) || item);
+    setBarcodeScanMessage(status === 200
+      ? `${result.alreadyCheckedIn ? 'Already checked in' : 'Arrival recorded'}: ${item.title}. Quantities unchanged. Ready for the next scan.`
+      : 'Check-in saved, but inventory could not refresh. Refresh before scanning again.', status !== 200);
+    if (status === 200) barcodeScanFeedback();
+  } catch (error) {
+    if (barcodeCheckIn === editor) {
+      resetBarcodeCheckIn();
+      setBarcodeScanMessage(`${error.message || 'Unable to record check-in.'} Refresh and verify arrival before scanning again.`, true);
+    }
+  } finally {
+    if (!barcodeCheckIn && editor.session === state.session && editor.clientId === state.activeClientId) {
+      document.getElementById('barcodeScanInput').focus();
+    }
+  }
+}
+
 function selectItem(id) {
   const item = state.items.find((entry) => String(entry.id) === String(id));
   if (!item) return;
 
   state.selectedItemId = String(id);
+  renderPackagingInstructions();
   const status = getItemStatus(item);
   const statusText = getStatusText(status);
   if (selectedItem) selectedItem.style.display = 'block';
@@ -2519,26 +3890,29 @@ function getEditableItemFields(clientId) {
   const profile = state.clientProfile && state.clientProfile.clientId === safeClientId ? state.clientProfile : null;
   const fields = (profile ? profile.fields : CLIENT_INVENTORY_FIELDS[safeClientId]?.fields) || [];
   const shipment = getShipmentFieldKeys(safeClientId);
-  const custom = fields.filter((field) => !shipment || (field.key !== shipment.received && field.key !== shipment.shipped));
+  const custom = fields
+    .filter((field) => safeClientId !== 'CL-002' || field.key !== 'productDescription')
+    .filter((field) => !shipment || (field.key !== shipment.received && field.key !== shipment.shipped));
   if ((safeClientId === 'CL-002' || safeClientId === 'CL-003') && profile && !profile.legacy) {
     const base = safeClientId === 'CL-002'
       ? [
         { key: 'sku', label: 'UPC', type: 'text' },
-        { key: 'title', label: profile.titleField?.label || 'Product Description', type: 'text' }
+        { key: 'title', label: profile.titleField?.label || 'Product Title', type: 'text' }
       ]
       : [{ key: 'title', label: profile.titleField?.label || 'Product Description / Name', type: 'text' }];
-    return [...base, ...custom, { key: 'notes', label: 'Notes', type: 'textarea' }];
+    return withCatalogFields([...base, ...custom, { key: 'notes', label: 'Notes', type: 'textarea' }]);
   }
-  if (safeClientId === 'CL-002' || safeClientId === 'CL-003') return custom;
+  if (safeClientId === 'CL-002' || safeClientId === 'CL-003') return withCatalogFields(custom);
   const base = [
     { key: 'sku', label: 'SKU (optional)', type: 'text' },
     { key: 'title', label: profile?.titleField?.label || 'Product Title', type: 'text' }
   ];
-  return safeClientId === 'CL-001' ? base : [...base, ...custom];
+  return withCatalogFields(safeClientId === 'CL-001' ? base : [...base, ...custom]);
 }
 
 function itemFieldValue(item, key) {
   if (key === 'sku') return item.rawSku ?? item.sku ?? '';
+  if (key === 'status' && isFulfillmentClient(item.clientId || state.activeClientId)) return getStatusText(getItemStatus(item));
   return item[key] ?? '';
 }
 
@@ -2549,13 +3923,21 @@ function renderItemDetails(item) {
   const clientId = item.clientId || state.activeClientId;
   const viewOnly = !state.isAdmin && Boolean(state.clientProfile?.readOnly);
   const fields = getEditableItemFields(clientId);
+  if (isFulfillmentClient(clientId)) {
+    fields.push({ key: 'status', label: 'Fulfillment stage', type: 'select', options: Object.values(FULFILLMENT_STATUSES), readOnly: !state.isAdmin });
+  }
   section.hidden = viewOnly || !fields.length;
   if (section.hidden) return;
-  host.innerHTML = fields.map((field) => {
-    const id = escapeHtml(`detail_${field.key}`);
+  host.innerHTML = renderItemDetailFields(item, fields, 'detail_');
+}
+
+function renderItemDetailFields(item, fields, prefix, viewOnly = false) {
+  return fields.map((field) => {
+    const id = escapeHtml(`${prefix}${field.key}`);
     const value = escapeHtml(itemFieldValue(item, field.key));
     const label = `<label class="ac-label" for="${id}">${escapeHtml(field.label)}</label>`;
-    const common = `id="${id}" class="ac-input detail-input" data-key="${escapeHtml(field.key)}"`;
+    const prep = CATALOG_FIELDS.find((entry) => entry.key === 'prepInstructions');
+    const common = `id="${id}" class="ac-input detail-input" data-key="${escapeHtml(field.key)}"${catalogFieldMatches(prep, field) ? ' maxlength="5000"' : ''}${viewOnly || field.readOnly ? ' disabled' : ''}`;
     if (field.type === 'select') {
       const current = String(itemFieldValue(item, field.key));
       // Keep a sheet value that isn't one of the listed options, so saving other fields doesn't overwrite it.
@@ -2571,8 +3953,126 @@ function renderItemDetails(item) {
     // A number box can't hold sheet text like "10 units"; it would show blank and saving would erase it.
     const raw = String(itemFieldValue(item, field.key)).trim();
     const numeric = field.type === 'number' && (raw === '' || Number.isFinite(Number(raw)));
-    return `<div>${label}<input type="${numeric ? 'number' : 'text'}" ${common} value="${value}" /></div>`;
+    return `<div>${label}<input type="${numeric ? 'number' : 'text'}" ${common}${field.key === 'qty' ? ' min="0" step="1"' : ''} value="${value}" /></div>`;
   }).join('');
+}
+
+let inventoryItemEditor = null;
+
+function openInventoryItemDialog(itemId) {
+  const dialog = document.getElementById('inventoryItemDialog');
+  const item = state.items.find((entry) => String(entry.id) === String(itemId));
+  if (!dialog || !item) {
+    showToast('This item is no longer available. Refresh inventory and try again.', 'error');
+    return;
+  }
+  if (dialog.open) return;
+  const clientId = item.clientId || state.activeClientId;
+  const profile = state.clientProfile;
+  const viewOnly = !state.isAdmin && Boolean(profile?.readOnly);
+  const shipment = isFulfillmentClient(clientId) && (Boolean(getShipmentFieldKeys(clientId)) || ['CL-002', 'CL-003'].includes(clientId));
+  const stockLocked = shipment || (!state.isAdmin && profile?.quickEditMode === 'disabled');
+  const fulfillment = isFulfillmentClient(clientId);
+  const fields = getEditableItemFields(clientId).map((field) => ({ ...field }));
+  if (clientId === 'CL-002' && profile?.legacy) fields.unshift({ key: 'title', label: 'Product Title', type: 'text' });
+  if (!fields.some((field) => ['sku', 'upc'].includes(field.key))) {
+    fields.unshift({ key: 'sku', label: 'SKU', type: 'text', readOnly: true });
+  }
+  fields.push(
+    { key: 'qty', label: shipment ? 'Quantity (shipment-managed)' : 'Quantity', type: 'number', readOnly: stockLocked },
+    { key: 'status', label: fulfillment ? 'Fulfillment stage' : 'Status', type: 'select', options: fulfillment ? Object.values(FULFILLMENT_STATUSES) : ['In Stock', 'Low Stock', 'Out of Stock'], readOnly: fulfillment ? !state.isAdmin : stockLocked }
+  );
+  if (!fields.some((field) => field.key === 'notes')) fields.push({ key: 'notes', label: 'Notes / Comments', type: 'textarea' });
+  const uniqueFields = fields.filter((field, index) => fields.findIndex((other) => other.key === field.key) === index);
+  const snapshot = { ...item, status: getStatusText(getItemStatus(item)) };
+  inventoryItemEditor = { item: snapshot, clientId, viewOnly, busy: false };
+  renderPackagingInstructions();
+  document.getElementById('inventoryItemTitle').textContent = item.title || 'Item details';
+  document.getElementById('inventoryItemHint').textContent = viewOnly
+    ? 'This account is view-only. Contact your ECL team to request changes.'
+    : shipment
+      ? 'Edit product details here. Received and shipped quantities are managed in Updates.'
+      : 'Update product details, stock levels, and notes for this item.';
+  document.getElementById('inventoryItemFields').innerHTML = renderItemDetailFields(snapshot, uniqueFields, 'modalItem_', viewOnly);
+  document.getElementById('inventoryItemFields').inert = false;
+  document.getElementById('inventoryItemError').textContent = '';
+  document.getElementById('inventoryItemPinWrap').hidden = true;
+  document.getElementById('inventoryItemPin').value = '';
+  document.getElementById('inventoryItemSave').hidden = viewOnly;
+  document.getElementById('inventoryItemSave').disabled = false;
+  document.getElementById('inventoryItemSave').textContent = 'Save changes';
+  dialog.showModal();
+}
+
+function closeInventoryItemDialog(force = false) {
+  if (inventoryItemEditor?.busy && !force) return;
+  document.getElementById('inventoryItemDialog')?.close?.();
+  inventoryItemEditor = null;
+}
+
+async function saveInventoryItemDialog(event) {
+  event.preventDefault();
+  const editor = inventoryItemEditor;
+  if (!editor || editor.busy || editor.viewOnly) return;
+  const errorHost = document.getElementById('inventoryItemError');
+  const submit = document.getElementById('inventoryItemSave');
+  errorHost.textContent = '';
+  const values = {};
+  document.querySelectorAll('#inventoryItemFields .detail-input').forEach((input) => {
+    if (!input.disabled && String(input.value).trim() !== String(itemFieldValue(editor.item, input.dataset.key)).trim()) {
+      values[input.dataset.key] = input.value;
+    }
+  });
+  if (!Object.keys(values).length) {
+    errorHost.textContent = 'No changes to save.';
+    return;
+  }
+  const pinWrap = document.getElementById('inventoryItemPinWrap');
+  const headers = adminHeaders({ 'Content-Type': 'application/json' });
+  editor.busy = true;
+  submit.disabled = true;
+  submit.textContent = 'Saving...';
+  document.getElementById('inventoryItemFields').inert = true;
+  try {
+    if (!pinWrap.hidden) {
+      const pin = document.getElementById('inventoryItemPin').value.trim();
+      if (!pin) throw new Error('Enter your Quick Edit PIN to save stock changes.');
+      const unlockResponse = await fetch(QUICK_EDIT_UNLOCK_URL, {
+        method: 'POST', headers, body: JSON.stringify({ clientId: editor.clientId, pin })
+      });
+      const unlock = await unlockResponse.json();
+      if (!unlockResponse.ok || !unlock.success) throw new Error(unlock.error || 'Unable to unlock stock changes.');
+      if (inventoryItemEditor !== editor) return;
+      state.quickEditUnlock = { clientId: editor.clientId, token: unlock.token, expiresAt: unlock.expiresAt };
+      document.getElementById('inventoryItemPin').value = '';
+    }
+    const response = await fetch(UPDATE_ITEM_URL, {
+      method: 'PUT',
+      headers: { ...headers, ...quickEditHeaders(editor.clientId) },
+      body: JSON.stringify({ clientId: editor.clientId, itemId: editor.item.id, sku: editor.item.sku, title: editor.item.title, values })
+    });
+    const result = await response.json();
+    if (inventoryItemEditor !== editor) return;
+    if (result.code === 'QUICK_EDIT_PIN_REQUIRED') {
+      state.quickEditUnlock = null;
+      pinWrap.hidden = false;
+      document.getElementById('inventoryItemPin').focus();
+    }
+    if (!response.ok || !result.success) throw new Error(result.error || 'Unable to save item changes.');
+    closeInventoryItemDialog(true);
+    showToast('Item updated successfully', 'success');
+    inventorySignature = null;
+    if (editor.clientId === state.activeClientId) await fetchInventory(editor.clientId);
+  } catch (error) {
+    if (inventoryItemEditor === editor) errorHost.textContent = error.message || 'Unable to save item changes.';
+  } finally {
+    editor.busy = false;
+    if (inventoryItemEditor === editor) {
+      submit.disabled = false;
+      submit.textContent = 'Save changes';
+      document.getElementById('inventoryItemFields').inert = false;
+    }
+  }
 }
 
 async function saveItemDetails() {
@@ -2614,7 +4114,18 @@ function previewShipment() {
   if (!preview) return;
   const received = toNumber(document.getElementById('shipReceived')?.value);
   const shipped = toNumber(document.getElementById('shipShipped')?.value);
-  const stage = getShipmentStage(received, shipped);
+  const item = state.items.find((entry) => String(entry.id) === String(state.selectedItemId));
+  const keys = getShipmentFieldKeys();
+  const nextStatus = item && keys
+    ? (shipped > 0 && shipped >= received ? 'Shipped out'
+      : toNumber(item[keys.received]) === 0 && received > 0 ? 'Arrived / Check-In'
+        : getStatusText(getFulfillmentStatus({ ...item,
+          status: /^(shipped|fully shipped|delivered|shipped out)$/i.test(String(item.status || '').trim()) ? '' : item.status,
+          [keys.received]: received, [keys.shipped]: shipped })))
+    : '';
+  const stage = isFulfillmentClient() && nextStatus
+    ? Object.keys(FULFILLMENT_STATUSES).find((key) => FULFILLMENT_STATUSES[key] === nextStatus)
+    : getShipmentStage(received, shipped);
   preview.className = `badge ${getStatusBadgeClass(stage)}`;
   preview.textContent = shipped > received ? 'Shipped is more than received' : getStatusText(stage);
 }
@@ -2671,7 +4182,7 @@ async function saveQuantity(item, quantity) {
     if (!response.ok || !result.success) throw new Error(result.error || 'Unable to update inventory.');
     if (clientId !== state.activeClientId || !state.auth) return;
     item.qty = quantity;
-    item.status = getStatusText(getItemStatus(item));
+    if (!isFulfillmentClient(clientId)) item.status = getStatusText(getItemStatus({ ...item, status: '' }));
     inventorySignature = null;
     updateSummary();
     renderTable();
@@ -2710,13 +4221,14 @@ async function setExactQty() {
   await saveQuantity(item, Math.max(0, val));
 }
 
+let productCreateBusy = false;
 async function createProduct() {
+  if (productCreateBusy) return;
   const form = ITEM_FORMS.inventory;
   const clientId = state.activeClientId || state.session?.clientId || 'CL-001';
-  const config = getClientInventoryFields(clientId);
   const isCardClient = clientId === 'CL-003';
 
-  if (config.readOnly) {
+  if (!canAddInventoryItems(clientId)) {
     showToast('This client is in read-only mode', 'error');
     return;
   }
@@ -2741,6 +4253,10 @@ async function createProduct() {
     return;
   }
 
+  const session = state.session;
+  const button = document.getElementById(form.submit);
+  productCreateBusy = true;
+  if (button) button.disabled = true;
   try {
     const response = await fetch(CREATE_ITEM_URL, {
       method: 'POST',
@@ -2752,6 +4268,7 @@ async function createProduct() {
     if (!response.ok || !result.success) {
       throw new Error(result.error || 'Create failed');
     }
+    if (!state.auth || state.session !== session || state.activeClientId !== clientId) return;
 
     ['Sku', 'Title'].forEach((suffix) => {
       const input = document.getElementById(`${form.prefix}${suffix}`);
@@ -2759,14 +4276,18 @@ async function createProduct() {
     });
     const qtyInput = document.getElementById(`${form.prefix}Qty`);
     if (qtyInput) qtyInput.value = '0';
-    config.fields.forEach((field) => {
+    allowedFields.forEach((field) => {
       const input = document.getElementById(`${form.fieldPrefix}${field.key}`);
       if (input) input.value = '';
     });
+    resetCatalogSync();
     await fetchInventory(clientId);
     showToast('Item added successfully', 'success');
   } catch (error) {
     showToast(error.message || 'Unable to add product', 'error');
+  } finally {
+    productCreateBusy = false;
+    if (button) button.disabled = !canAddInventoryItems();
   }
 }
 
@@ -2780,6 +4301,106 @@ const tableWrap = document.getElementById('inventoryTableWrap');
 if (tableWrap) {
   tableWrap.addEventListener('scroll', scheduleTableScrollUpdate, { passive: true });
 }
+inventoryBody?.addEventListener?.('dblclick', (event) => {
+  if (event.target.closest('button, a, input, select, textarea')) return;
+  const row = event.target.closest('tr[data-item-id]');
+  if (row) openInventoryItemDialog(row.dataset.itemId);
+});
+inventoryBody?.addEventListener?.('keydown', (event) => {
+  if (event.key !== 'Enter' || !event.target.matches('tr[data-item-id]')) return;
+  event.preventDefault();
+  openInventoryItemDialog(event.target.dataset.itemId);
+});
+document.getElementById('inventoryItemForm')?.addEventListener('submit', saveInventoryItemDialog);
+document.getElementById('barcodeScanForm')?.addEventListener('submit', scanBarcode);
+document.getElementById('trackingSearchForm')?.addEventListener('submit', searchTracking);
+document.getElementById('catalogSyncForm')?.addEventListener('submit', syncCatalog);
+['packagingProfile', 'settingsPackagingProfile'].forEach((id) => {
+  document.getElementById(id)?.addEventListener('click', (event) => {
+    if (event.target.closest('[data-edit-packaging]')) openPackagingDialog();
+  });
+});
+document.getElementById('packagingForm')?.addEventListener('submit', savePackagingNotes);
+document.getElementById('packagingClose')?.addEventListener('click', closePackagingDialog);
+document.getElementById('packagingDialog')?.addEventListener('cancel', closePackagingDialog);
+document.getElementById('inboundForm')?.addEventListener('submit', submitInboundShipment);
+document.getElementById('inboundClose')?.addEventListener('click', closeInboundDialog);
+document.getElementById('inboundDialog')?.addEventListener('cancel', () => { inboundDraftId = null; });
+document.getElementById('inboundAddLine')?.addEventListener('click', addInboundLine);
+document.getElementById('inboundContents')?.addEventListener('click', (event) => {
+  if (!event.target.closest('[data-inbound-remove]')) return;
+  event.target.closest('.inbound-line')?.remove();
+  document.getElementById('inboundAddLine').disabled = false;
+});
+['inboundDashboard', 'inboundTracking'].forEach((id) => {
+  document.getElementById(id)?.addEventListener('click', (event) => {
+    const button = event.target.closest('[data-inbound-action]');
+    if (!button) return;
+    if (button.dataset.inboundAction === 'add') openInboundDialog();
+    else if (button.dataset.inboundAction === 'refresh') loadInboundShipments();
+    else if (button.dataset.inboundAction === 'arrive') {
+      const shipment = inboundState.shipments?.find((entry) => entry.id === button.dataset.shipmentId);
+      if (shipment) checkInInboundShipment(shipment.trackingNumber, shipment.id);
+    }
+  });
+  document.getElementById(id)?.addEventListener('submit', (event) => {
+    if (!event.target.matches('.inbound-scan')) return;
+    event.preventDefault();
+    checkInInboundShipment(new FormData(event.target).get('code'));
+  });
+});
+document.getElementById('storeConnectionForm')?.addEventListener('submit', saveStoreConnection);
+document.getElementById('storeConnectionReload')?.addEventListener('click', loadStoreConnection);
+document.getElementById('storePlatform')?.addEventListener('change', () => { clearStoreSecrets(); syncStorePlatform(); });
+document.getElementById('storeRemoveCredentials')?.addEventListener('change', clearStoreSecrets);
+document.getElementById('storeDisconnect')?.addEventListener('click', () => saveStoreConnection(null, true));
+window.addEventListener('pagehide', clearStoreSecrets);
+document.getElementById('catalogApplyProduct')?.addEventListener('click', applyCatalogProduct);
+document.getElementById('catalogManualEntry')?.addEventListener('click', () => {
+  resetCatalogSync();
+  const button = document.getElementById('catalogSyncSubmit');
+  if (button) button.disabled = !canAddInventoryItems();
+  document.getElementById('newProductTitle')?.focus();
+});
+document.getElementById('customProductFields')?.addEventListener('input', (event) => {
+  if (event.target === catalogInput('imageUrl')) previewCatalogImage();
+});
+document.getElementById('catalogImagePreview')?.addEventListener('error', () => {
+  document.getElementById('catalogImagePreview').hidden = true;
+  document.getElementById('catalogImageMessage').textContent = 'Image preview could not load. Edit the image URL or leave it blank; manual entry is still available.';
+});
+document.getElementById('trackingShowAll')?.addEventListener('click', () => {
+  document.getElementById('trackingSearchInput').value = '';
+  state.tracking.query = '';
+  renderTracking();
+});
+document.getElementById('trackingRefresh')?.addEventListener('click', async () => {
+  if (await loadTracking() === 401) handleExpiredSession();
+});
+document.getElementById('barcodeConfirmForm')?.addEventListener('submit', confirmBarcodeCheckIn);
+document.getElementById('barcodeScanMatch')?.addEventListener('change', previewBarcodeCheckIn);
+document.getElementById('barcodeCameraStart')?.addEventListener('click', startBarcodeCamera);
+document.getElementById('barcodeCameraStop')?.addEventListener('click', stopBarcodeCamera);
+window.addEventListener('pagehide', stopBarcodeCamera);
+document.getElementById('staffAccountForm')?.addEventListener('submit', saveStaffAccount);
+document.getElementById('staffAccountsRefresh')?.addEventListener('click', loadStaffAccounts);
+document.getElementById('loginHistoryRefresh')?.addEventListener('click', loadLoginHistory);
+document.getElementById('staffAccountCancel')?.addEventListener('click', () => {
+  if (!staffAccountBusy) {
+    resetStaffAccountForm();
+    staffAccountMessage('');
+  }
+});
+document.getElementById('inventoryItemClose')?.addEventListener('click', () => closeInventoryItemDialog());
+document.getElementById('inventoryItemDialog')?.addEventListener('cancel', (event) => {
+  event.preventDefault();
+  closeInventoryItemDialog();
+});
+document.getElementById('inventoryItemDialog')?.addEventListener('keydown', (event) => {
+  if (event.key !== 'Escape') return;
+  event.preventDefault();
+  closeInventoryItemDialog();
+});
 document.getElementById('tableScrollLeft')?.addEventListener('click', () => scrollInventoryTable(-1));
 document.getElementById('tableScrollRight')?.addEventListener('click', () => scrollInventoryTable(1));
 
@@ -2788,6 +4409,8 @@ document.addEventListener('click', (event) => {
   if (!element) return;
 
   const action = element.dataset.action;
+  if (action === 'inventory-view') selectInventoryView(element.dataset.view);
+  if (action === 'edit-staff-account') editStaffAccount(element.dataset.username);
 
   if (action === 'select-item') {
     selectItem(element.dataset.id);
@@ -2929,6 +4552,8 @@ function readClientSettingsForm(prefix) {
   const mode = document.getElementById(`${prefix}QuickEditMode`)?.value || 'enabled';
   return {
     quickEditMode: mode,
+    inventoryMode: document.getElementById(`${prefix}InventoryMode`)?.value || undefined,
+    enableShippedTab: Boolean(document.getElementById(`${prefix}EnableShippedTab`)?.checked),
     quickEditPin: mode === 'password' ? String(document.getElementById(`${prefix}QuickEditPin`)?.value || '').trim() : '',
     overstockLevel: overstock > 0 ? overstock : null
   };
@@ -2992,6 +4617,8 @@ async function submitNewClient() {
     driveFolderUrl: document.getElementById('acDriveFolderUrl')?.value || '',
     portalTitle: document.getElementById('acPortalTitle')?.value || '',
     accentColor: document.getElementById('acAccentColor')?.value || '',
+    websiteUrl: document.getElementById('acWebsiteUrl')?.value || '',
+    logoUrl: document.getElementById('acLogoUrl')?.value || '',
     enableAddItem: Boolean(document.getElementById('acEnableAddItem')?.checked),
     allowChat: Boolean(document.getElementById('acAllowChat')?.checked),
     allowLogs: Boolean(document.getElementById('acAllowLogs')?.checked),
@@ -3014,7 +4641,11 @@ async function submitNewClient() {
     showAddClientMessage(`${clientId} created. Give the client this login info — Username: "${result.username}", Activation Code: "${result.activationCode}". They'll use "Create Account" on the sign-in screen to set their own password.`, 'success');
     state.newClientFields = [];
     renderClientFieldRows();
-    ['acClientId', 'acClientName', 'acUsername', 'acEmail', 'acDriveFolderUrl', 'acPortalTitle', 'acAccentColor', 'acQuickEditPin', 'acOverstockLevel'].forEach((id) => {
+    const shippedTab = document.getElementById('acEnableShippedTab');
+    if (shippedTab) shippedTab.checked = true;
+    const inventoryMode = document.getElementById('acInventoryMode');
+    if (inventoryMode) inventoryMode.value = 'custom';
+    ['acClientId', 'acClientName', 'acUsername', 'acEmail', 'acDriveFolderUrl', 'acPortalTitle', 'acAccentColor', 'acWebsiteUrl', 'acLogoUrl', 'acQuickEditPin', 'acOverstockLevel'].forEach((id) => {
       const el = document.getElementById(id);
       if (el) el.value = '';
     });
@@ -3030,6 +4661,178 @@ async function submitNewClient() {
 
 function adminHeaders(extra = {}) {
   return { ...extra, Authorization: `Bearer ${state.session?.notificationToken || ''}` };
+}
+
+let loginHistoryRequest = 0;
+
+function clearLoginHistory() {
+  loginHistoryRequest += 1;
+  const section = document.getElementById('loginHistorySection');
+  if (section) section.hidden = true;
+  const rows = document.getElementById('loginHistoryRows');
+  if (rows) rows.innerHTML = '';
+  const message = document.getElementById('loginHistoryMessage');
+  if (message) message.textContent = '';
+}
+
+async function loadLoginHistory() {
+  if (!canConfigureStaff()) return;
+  const rows = document.getElementById('loginHistoryRows');
+  const message = document.getElementById('loginHistoryMessage');
+  if (!rows || !message) return;
+  const session = state.session;
+  const request = ++loginHistoryRequest;
+  rows.innerHTML = '';
+  message.textContent = 'Loading login activity...';
+  try {
+    const response = await fetch(ADMIN_LOGINS_URL, { headers: adminHeaders({ Accept: 'application/json' }) });
+    const entries = await response.json();
+    if (session !== state.session || request !== loginHistoryRequest || !canConfigureStaff()) return;
+    if (!response.ok || !Array.isArray(entries)) throw new Error(entries.error || 'Unable to load login history.');
+    rows.innerHTML = entries.map((entry) => {
+      const date = new Date(entry.timestamp);
+      const timestamp = Number.isNaN(date.getTime()) ? entry.timestamp : date.toLocaleString();
+      return `<tr><td>${escapeHtml(timestamp)}</td><td>${escapeHtml(entry.username)}</td><td>${escapeHtml(entry.clientId)}</td><td>${escapeHtml(entry.authType)}</td></tr>`;
+    }).join('');
+    message.textContent = entries.length ? `Showing ${entries.length} recent sign-ins.` : 'No sign-ins recorded yet.';
+  } catch (error) {
+    if (session === state.session && request === loginHistoryRequest) {
+      message.textContent = error.message || 'Unable to load login history. Use Refresh login activity to retry.';
+    }
+  }
+}
+
+let staffAccounts = [];
+let staffAccountEditing = null;
+let staffAccountBusy = false;
+let staffAccountsRequest = 0;
+
+function canConfigureStaff() {
+  return state.auth && state.session?.role === 'admin';
+}
+
+function staffAccountMessage(message, isError = false) {
+  const host = document.getElementById('staffAccountMessage');
+  if (!host) return;
+  host.textContent = message;
+  host.classList.toggle('is-error', isError);
+}
+
+function resetStaffAccountForm() {
+  staffAccountEditing = null;
+  const form = document.getElementById('staffAccountForm');
+  if (form) form.reset?.();
+  const username = document.getElementById('staffAccountUsername');
+  if (username) username.readOnly = false;
+  const title = document.getElementById('staffAccountFormTitle');
+  if (title) title.textContent = 'Register staff account';
+  const save = document.getElementById('staffAccountSave');
+  if (save) save.textContent = 'Register staff';
+  const cancel = document.getElementById('staffAccountCancel');
+  if (cancel) cancel.hidden = true;
+}
+
+function clearStaffAccounts() {
+  staffAccountsRequest += 1;
+  staffAccounts = [];
+  resetStaffAccountForm();
+  const section = document.getElementById('staffAccountsSection');
+  if (section) section.hidden = true;
+  const list = document.getElementById('staffAccountsList');
+  if (list) list.replaceChildren?.();
+  staffAccountMessage('');
+}
+
+function renderStaffAccounts() {
+  const host = document.getElementById('staffAccountsList');
+  if (!host || !canConfigureStaff()) return;
+  host.innerHTML = staffAccounts.length ? staffAccounts.map((account) => `
+    <div class="staff-account-row">
+      <div><strong>${escapeHtml(account.name)}</strong><p>${escapeHtml(account.username)} · ${account.role === 'admin' ? 'Administrator' : 'Staff'} · ${account.activated ? 'Active' : 'Awaiting activation'}</p>${account.email ? `<p>${escapeHtml(account.email)}</p>` : ''}</div>
+      ${account.role === 'staff' ? `<button type="button" class="filter-clear" data-action="edit-staff-account" data-username="${escapeHtml(account.username)}"${staffAccountBusy ? ' disabled' : ''}>Edit</button>` : ''}
+    </div>`).join('') : '<p class="billing-hint">No staff accounts found.</p>';
+}
+
+async function loadStaffAccounts() {
+  if (!canConfigureStaff()) return;
+  const host = document.getElementById('staffAccountsList');
+  if (!host) return;
+  const session = state.session;
+  const request = ++staffAccountsRequest;
+  host.textContent = 'Loading staff accounts...';
+  try {
+    const response = await fetch(ADMIN_STAFF_URL, { headers: adminHeaders({ Accept: 'application/json' }) });
+    const result = await response.json();
+    if (state.session !== session || request !== staffAccountsRequest || !canConfigureStaff()) return;
+    if (!response.ok || !Array.isArray(result)) throw new Error(result.error || 'Unable to load staff accounts.');
+    staffAccounts = result;
+    renderStaffAccounts();
+  } catch (error) {
+    if (state.session === session && request === staffAccountsRequest) {
+      staffAccounts = [];
+      host.textContent = error.message || 'Unable to load staff accounts. Use Refresh accounts to retry.';
+    }
+  }
+}
+
+function editStaffAccount(username) {
+  if (!canConfigureStaff() || staffAccountBusy) return;
+  const account = staffAccounts.find((entry) => entry.username === username && entry.role === 'staff');
+  if (!account) {
+    staffAccountMessage('Staff account is no longer available. Refresh accounts and try again.', true);
+    return;
+  }
+  staffAccountEditing = account.username;
+  document.getElementById('staffAccountUsername').value = account.username;
+  document.getElementById('staffAccountUsername').readOnly = true;
+  document.getElementById('staffAccountName').value = account.name;
+  document.getElementById('staffAccountEmail').value = account.email;
+  document.getElementById('staffAccountFormTitle').textContent = 'Edit staff profile';
+  document.getElementById('staffAccountSave').textContent = 'Save staff profile';
+  document.getElementById('staffAccountCancel').hidden = false;
+  staffAccountMessage('');
+  document.getElementById('staffAccountName').focus();
+}
+
+async function saveStaffAccount(event) {
+  event.preventDefault();
+  if (!canConfigureStaff() || staffAccountBusy) return;
+  const session = state.session;
+  const editing = staffAccountEditing;
+  const username = document.getElementById('staffAccountUsername').value.trim();
+  const body = {
+    name: document.getElementById('staffAccountName').value.trim(),
+    email: document.getElementById('staffAccountEmail').value.trim(),
+    ...(editing ? {} : { username })
+  };
+  staffAccountBusy = true;
+  const form = document.getElementById('staffAccountForm');
+  form.inert = true;
+  document.getElementById('staffAccountSave').disabled = true;
+  renderStaffAccounts();
+  staffAccountMessage(editing ? 'Saving staff profile...' : 'Registering staff account...');
+  try {
+    const response = await fetch(editing ? `${ADMIN_STAFF_URL}/${encodeURIComponent(editing)}` : ADMIN_STAFF_URL, {
+      method: editing ? 'PUT' : 'POST',
+      headers: adminHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify(body)
+    });
+    const result = await response.json();
+    if (state.session !== session || !canConfigureStaff()) return;
+    if (!response.ok || !result.success) throw new Error(result.error || 'Unable to save staff account.');
+    resetStaffAccountForm();
+    staffAccountMessage(editing
+      ? 'Staff profile saved.'
+      : `Staff account registered.\nUsername: ${result.username}\nActivation code: ${result.activationCode}\nShare these details securely. The staff member selects Create Account and sets their own password.`);
+    await loadStaffAccounts();
+  } catch (error) {
+    if (state.session === session) staffAccountMessage(error.message || 'Unable to save staff account.', true);
+  } finally {
+    staffAccountBusy = false;
+    form.inert = false;
+    document.getElementById('staffAccountSave').disabled = false;
+    renderStaffAccounts();
+  }
 }
 
 function populateEditClientSelect() {
@@ -3076,6 +4879,8 @@ async function loadClientForEdit(clientId) {
   document.getElementById('ecDriveFolderUrl').value = profile.driveFolderUrl || '';
   document.getElementById('ecPortalTitle').value = profile.portalTitle || '';
   document.getElementById('ecAccentColor').value = profile.accentColor || '';
+  if (document.getElementById('ecWebsiteUrl')) document.getElementById('ecWebsiteUrl').value = profile.websiteUrl || '';
+  if (document.getElementById('ecLogoUrl')) document.getElementById('ecLogoUrl').value = profile.logoUrl || '';
   document.getElementById('ecEnableAddItem').checked = Boolean(profile.enableAddItem);
   document.getElementById('ecAllowChat').checked = Boolean(profile.allowChat);
   document.getElementById('ecAllowLogs').checked = Boolean(profile.allowLogs);
@@ -3083,6 +4888,8 @@ async function loadClientForEdit(clientId) {
   document.getElementById('ecReadOnly').checked = Boolean(profile.readOnly);
 
   const modeSelect = document.getElementById('ecQuickEditMode');
+  const inventoryMode = document.getElementById('ecInventoryMode');
+  if (inventoryMode) inventoryMode.value = profile.inventoryMode === 'custom' ? 'custom' : 'inventory';
   if (modeSelect) {
     modeSelect.value = profile.quickEditMode || 'enabled';
     modeSelect.disabled = state.editClientId === 'CL-002';
@@ -3096,6 +4903,8 @@ async function loadClientForEdit(clientId) {
   syncQuickEditPinField('ec');
   const overstockInput = document.getElementById('ecOverstockLevel');
   if (overstockInput) overstockInput.value = profile.overstockLevel || '';
+  const shippedTab = document.getElementById('ecEnableShippedTab');
+  if (shippedTab) shippedTab.checked = ![false, 'false', 0, '0'].includes(profile.enableShippedTab);
 
   const attributeMap = profile.attributeMap || {};
   [['ecAttrBundled', 'bundled'], ['ecAttrFragile', 'fragile'], ['ecAttrOversized', 'oversized']].forEach(([id, attribute]) => {
@@ -3199,6 +5008,8 @@ async function submitClientEdit() {
     driveFolderUrl: document.getElementById('ecDriveFolderUrl')?.value || '',
     portalTitle: document.getElementById('ecPortalTitle')?.value || '',
     accentColor: document.getElementById('ecAccentColor')?.value || '',
+    websiteUrl: document.getElementById('ecWebsiteUrl')?.value || '',
+    logoUrl: document.getElementById('ecLogoUrl')?.value || '',
     enableAddItem: Boolean(document.getElementById('ecEnableAddItem')?.checked),
     allowChat: Boolean(document.getElementById('ecAllowChat')?.checked),
     allowLogs: Boolean(document.getElementById('ecAllowLogs')?.checked),
@@ -3219,11 +5030,16 @@ async function submitClientEdit() {
     }
 
     showEditClientMessage('Changes saved.', 'success');
-    await fetchClientRoster();
+    cacheClientView(state.editClientId, { profile: result.profile });
     if (state.activeClientId === state.editClientId) {
-      await fetchClientProfile(state.activeClientId);
+      state.clientProfile = result.profile;
+      renderClientHeader();
       renderProductForm();
       renderTable();
+    }
+    await fetchClientRoster();
+    if (state.activeClientId === state.editClientId) {
+      saveSession();
     }
     await loadClientForEdit(state.editClientId);
   } catch (error) {
@@ -3320,6 +5136,11 @@ function getBillingMonth() {
 
 async function loadBillingSummary(clientId = state.activeClientId) {
   if (!state.auth) return 401;
+  if (state.session?.role === 'staff') {
+    state.billing = null;
+    renderBilling('Warehouse staff cannot access billing.');
+    return 403;
+  }
   const month = getBillingMonth();
   const dateInput = document.getElementById('billingDate');
   if (dateInput && !dateInput.value.startsWith(month)) {
@@ -3345,7 +5166,7 @@ async function loadBillingSummary(clientId = state.activeClientId) {
     state.billing = await response.json();
     renderBilling();
     // Only refill the rate-card form when the client changes so polling never wipes unsaved edits.
-    if (state.isAdmin && state.rateCardClientId !== clientId) {
+    if (canConfigureStaff() && state.rateCardClientId !== clientId) {
       state.rateCardClientId = clientId;
       fillRateCardForm(state.billing.rateCard);
     }
@@ -3364,7 +5185,7 @@ function renderBilling(message = '') {
   }
   ['billingAdminEntry', 'billingAdminRates', 'billingAdminHistory'].forEach((id) => {
     const el = document.getElementById(id);
-    if (el) el.hidden = !(state.isAdmin && summary);
+    if (el) el.hidden = !(canConfigureStaff() && summary);
   });
   const host = document.getElementById('billingSummary');
   if (!host) return;
@@ -3391,7 +5212,7 @@ function renderBilling(message = '') {
   `).join('') : '<tr><td colspan="2" class="billing-empty">Nothing billed for this month yet.</td></tr>';
 
   host.innerHTML = `
-    ${summary.configured ? '' : `<div class="ac-note">No rate card saved yet${state.isAdmin ? ' — add this client\'s services below.' : '.'}</div>`}
+    ${summary.configured ? '' : `<div class="ac-note">No rate card saved yet${canConfigureStaff() ? ' — add this client\'s services below.' : '.'}</div>`}
     <div class="billing-totals">
       <div class="billing-total primary"><span>${finalMonth ? 'Month total' : 'Estimated end of month'}</span><strong>${formatMoney(finalMonth ? totals.total : totals.projected)}</strong>${estimateNote ? `<small>${escapeHtml(estimateNote)}</small>` : ''}</div>
       <div class="billing-total"><span>Billed so far</span><strong>${formatMoney(totals.total)}</strong></div>
@@ -3772,7 +5593,7 @@ async function saveRateCard() {
 async function syncBillingTab() {
   const tab = document.getElementById('tabBilling');
   if (!tab) return;
-  if (!state.auth) {
+  if (!state.auth || state.session?.role === 'staff') {
     tab.style.display = 'none';
     return;
   }

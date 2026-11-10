@@ -1,3 +1,5 @@
+const { CATALOG_FIELDS } = require('./catalogFields');
+
 const LEGACY_FIELD_HEADERS = {
   'CL-002': {
     upc: ['upc'],
@@ -77,13 +79,13 @@ function toGenericRows({ rows, oldFields, newFields, titleLabel = 'Product Title
       skuIndex = legacyIndexes.upc;
       titleIndex = legacyIndexes.productDescription;
       qtyIndex = legacyIndexes.quantityOrdered;
-      statusIndex = -1;
+      statusIndex = sourceHeaders.indexOf('status');
       notesIndex = legacyIndexes.notes;
     } else {
       skuIndex = legacyIndexes.productName;
       titleIndex = legacyIndexes.productName;
       qtyIndex = legacyIndexes.quantityReceived;
-      statusIndex = -1;
+      statusIndex = sourceHeaders.indexOf('status');
       notesIndex = legacyIndexes.notes;
     }
   }
@@ -91,17 +93,19 @@ function toGenericRows({ rows, oldFields, newFields, titleLabel = 'Product Title
   const oldIndexes = new Map(oldFields.map((field, index) => [field.key, 2 + index]));
   const fieldIndexes = hasLegacyLayout ? legacyIndexes : Object.fromEntries(oldIndexes);
   const retainedKeys = new Set(newFields.map((field) => field.key));
+  const isCatalogField = (field, catalog) => catalog.aliases.includes(String(field.key).toLowerCase())
+    || catalog.aliases.includes(String(field.label).toLowerCase());
   const archiveLabels = new Set();
   const archivedFields = [];
 
   if (hasLegacyLayout && legacyClientId !== 'CL-001') {
     oldFields.forEach((field) => {
       if (['upc', 'productDescription', 'productName', 'notes'].includes(field.key)) return;
-      if (!retainedKeys.has(field.key)) archivedFields.push({ key: field.key, label: field.label });
+      if (!retainedKeys.has(field.key) && !CATALOG_FIELDS.some((catalog) => isCatalogField(field, catalog))) archivedFields.push({ key: field.key, label: field.label });
     });
   } else if (!hasLegacyLayout) {
     oldFields.forEach((field) => {
-      if (!retainedKeys.has(field.key)) archivedFields.push({ key: field.key, label: field.label });
+      if (!retainedKeys.has(field.key) && !CATALOG_FIELDS.some((catalog) => isCatalogField(field, catalog))) archivedFields.push({ key: field.key, label: field.label });
     });
   }
 
@@ -109,7 +113,9 @@ function toGenericRows({ rows, oldFields, newFields, titleLabel = 'Product Title
   if (!hasLegacyLayout) {
     for (let index = notesIndex + 1; index < (rows[0] || []).length; index += 1) {
       const label = String(rows[0][index] || '').trim();
-      if (/^Archived:/i.test(label)) {
+      const catalog = CATALOG_FIELDS.find((field) => field.aliases.includes(label.toLowerCase()));
+      if (catalog && newFields.some((field) => isCatalogField(field, catalog))) continue;
+      if (label === 'Check_In_Timestamp' || CATALOG_FIELDS.some((field) => field.aliases.includes(label.toLowerCase())) || /^Archived:/i.test(label)) {
         existingArchiveColumns.push({ index, label });
         archiveLabels.add(label.toLowerCase());
       } else if (label) {
@@ -117,6 +123,24 @@ function toGenericRows({ rows, oldFields, newFields, titleLabel = 'Product Title
       }
     }
   }
+  if (hasLegacyLayout) {
+    const index = sourceHeaders.indexOf('check_in_timestamp');
+    if (index >= 0) existingArchiveColumns.push({ index, label: 'Check_In_Timestamp' });
+  }
+  CATALOG_FIELDS.forEach((catalog) => {
+    const oldField = oldFields.find((field) => isCatalogField(field, catalog));
+    const sourceIndex = oldField && fieldIndexes[oldField.key] !== undefined
+      ? fieldIndexes[oldField.key]
+      : normalizedHeaders(hasLegacyLayout ? sourceHeaderRow : rows[0]).findIndex((header) => catalog.aliases.includes(header));
+    if (sourceIndex < 0) return;
+    const retained = newFields.find((field) => isCatalogField(field, catalog));
+    if (retained) {
+      fieldIndexes[retained.key] = sourceIndex;
+      oldIndexes.set(retained.key, sourceIndex);
+    } else if (!existingArchiveColumns.some((column) => column.index === sourceIndex)) {
+      existingArchiveColumns.push({ index: sourceIndex, label: catalog.label });
+    }
+  });
 
   const archivedColumns = [
     ...existingArchiveColumns.map((column) => ({ ...column, key: null })),

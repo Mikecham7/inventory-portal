@@ -8,6 +8,13 @@ const { JWT } = require('google-auth-library');
 const { normalizeInventoryRow, getSheetNameForClient, isAdminClient, getChatSenderRole, getClientInventoryFields, getDashboardColumns, getCreateFormTitleConfig, getChatDriveFolderForClient, isGoogleDriveUrl, normalizeDriveFolderUrl, getShipmentStage, findShipmentFieldKeys, SHIPMENT_STATUS_TEXT } = require('./portalLogic');
 const { mapClientSettings, settingsFromInput, isValidQuickEditPin, planClientSettingsMigration } = require('./clientSchema');
 const { toGenericRows } = require('./inventoryLayout');
+const { FULFILLMENT_STATUSES, STOCK_STATUSES, fulfillmentStatus, shipmentStatus } = require('./inventoryStatus');
+const { fetchPublicPage, parseCatalog, catalogFeedUrl } = require('./catalogSync');
+const { CATALOG_FIELDS, catalogFieldKeys, catalogColumns, validateCatalogValues } = require('./catalogFields');
+const { integrationStorageReady, validateStoreConnection, parseStoreConnection, encryptStoreCredentials, readSubmittedCredentials } = require('./storeIntegration');
+const { INBOUND_SHEET, INBOUND_HEADERS, normalizeInboundTracking, validateInboundShipment, inboundFromRow } = require('./inboundShipments');
+const { credentialRole, validSessionRole, warehouseAccess } = require('./permissions');
+const { validateBranding, scrapeBranding } = require('./branding');
 const { RATE_SHEET, ENTRY_SHEET, HISTORY_SHEET, BILLING_RATE_HEADERS, BILLING_ENTRY_HEADERS, BILLING_HISTORY_HEADERS, MONTH_PATTERN, sanitizeRateCard, rateCardFromRow, entryFromRow, sanitizeEntry, historyFromRow, sanitizeHistory, currentMonth, summarizeBilling } = require('./billing');
 
 dotenv.config();
@@ -139,13 +146,14 @@ function signNotificationSession(username, clientId, role) {
 }
 
 function readNotificationSession(req) {
-  return readToken(String(req.get('Authorization') || '').replace(/^Bearer\s+/i, ''), 'notifications');
+  const session = readToken(String(req.get('Authorization') || '').replace(/^Bearer\s+/i, ''), 'notifications');
+  return validSessionRole(session) ? session : null;
 }
 
 const QUICK_EDIT_UNLOCK_MS = 30 * 60 * 1000;
 
 function isStaffSession(session) {
-  return Boolean(session) && (session.role === 'admin' || session.clientId === 'CL-000');
+  return warehouseAccess(session);
 }
 
 function getServiceAccountAuth() {
@@ -288,13 +296,21 @@ async function getOrCreateSheet(sheetName, headers = []) {
     }
 
     // Extra trailing columns are tolerated so a newer deploy's added columns aren't wiped.
-    const headersMatch = headers.every((header, index) => String(currentHeaders[index] || '').trim().toLowerCase() === String(header).trim().toLowerCase());
+    const existingHeaders = new Set(currentHeaders.map((header) => String(header).trim().toLowerCase()));
+    const missingCredentialHeaders = headers.filter((header) => !existingHeaders.has(header.toLowerCase()));
+    const headersMatch = sheetName === 'User_Credentials'
+      ? !missingCredentialHeaders.length
+      : headers.every((header, index) => String(currentHeaders[index] || '').trim().toLowerCase() === String(header).trim().toLowerCase());
 
     if (!headersMatch) {
-      if (Number(sheet.columnCount) < headers.length) {
-        await withRetry(() => sheet.resize({ rowCount: sheet.rowCount, columnCount: headers.length }));
+      // Older registries have portal settings before Role; append missing columns without relabelling stored values.
+      const nextHeaders = sheetName === 'User_Credentials'
+        ? [...currentHeaders, ...missingCredentialHeaders]
+        : [...headers, ...currentHeaders.slice(headers.length)];
+      if (Number(sheet.columnCount) < nextHeaders.length) {
+        await withRetry(() => sheet.resize({ rowCount: sheet.rowCount, columnCount: nextHeaders.length }));
       }
-      await withRetry(() => sheet.setHeaderRow([...headers, ...currentHeaders.slice(headers.length)]));
+      await withRetry(() => sheet.setHeaderRow(nextHeaders));
     }
     verifiedHeaderSheets.add(sheet);
   }
@@ -342,12 +358,21 @@ const USER_CREDENTIALS_HEADERS = [
   'Portal_Title', 'Portal_Subtitle', 'Inventory_Mode', 'Enable_Add_Item', 'Accent_Color',
   'Allow_Chat', 'Allow_Logs', 'Allow_Update', 'Drive_Folder_URL', 'Read_Only', 'Require_Pin',
   'Title_Field_Label', 'Title_Field_Placeholder', 'Fields_JSON',
-  'Activation_Code', 'Recovery_Code_Hash', 'Client_Settings_JSON', 'Quick_Edit_PIN_Hash'
+  'Activation_Code', 'Recovery_Code_Hash', 'Client_Settings_JSON', 'Quick_Edit_PIN_Hash',
+  'Store_Integration_JSON', 'Store_Integration_Secret', 'Packaging_Notes', 'Website_URL', 'Logo_URL'
 ];
 const LEGACY_CLIENT_IDS = ['CL-001', 'CL-002', 'CL-003'];
+const USER_LOGINS_HEADERS = ['Timestamp', 'Username', 'ClientID', 'AuthType'];
+
+async function recordUserLogin(username, clientId) {
+  const sheet = await getOrCreateSheet('User_Logins', USER_LOGINS_HEADERS);
+  await withRetry(() => sheet.addRow({
+    Timestamp: new Date().toISOString(), Username: username, ClientID: clientId, AuthType: 'Credentials'
+  }));
+}
 
 // getDashboardColumns() returns hand-picked label text/order for legacy clients that
-// doesn't line up 1:1 with the add-item `fields` array (e.g. CL-002 folds upc/productDescription
+// doesn't line up 1:1 with the add-item `fields` array (e.g. CL-002 folds upc
 // into SKU/Title, and CL-003 shows no custom columns at all on the dashboard). This maps
 // each legacy client's dashboard columns back to the field keys used to look up cell values.
 const LEGACY_DASHBOARD_FIELD_KEYS = {
@@ -419,8 +444,10 @@ async function autoDetectFieldsFromSheet(sheetName) {
     if (!sheet) return [];
     await withRetry(() => sheet.loadHeaderRow());
     const headers = (sheet.headerValues || []).filter(Boolean);
+    const quantityIndex = headers.findIndex((header) => String(header).trim().toLowerCase() === 'qty');
+    const fieldHeaders = quantityIndex >= 0 ? headers.slice(0, quantityIndex) : headers;
     const skip = new Set(['sku', 'product title', 'title', 'qty', 'status', 'notes', 'client_id']);
-    return headers
+    return fieldHeaders
       .filter((header) => !skip.has(String(header).trim().toLowerCase()))
       .map((header, index) => ({
         key: slugifyFieldKey(header, index),
@@ -461,6 +488,10 @@ function applyClientSettings(profile, row) {
   // The folder on the client's own credentials row wins; there is never a cross-client fallback.
   profile.driveFolderUrl = normalizeDriveFolderUrl(row ? row.get('Drive_Folder_URL') : '') || normalizeDriveFolderUrl(profile.driveFolderUrl);
   profile.hasEmail = Boolean(row && String(row.get('Email') || '').trim());
+  profile.packagingNotes = row ? String(row.get('Packaging_Notes') || '').trim() : '';
+  profile.websiteUrl = row ? String(row.get('Website_URL') || '').trim() : '';
+  profile.logoUrl = row ? String(row.get('Logo_URL') || '').trim() : '';
+  profile.accentColor = row ? String(row.get('Accent_Color') || '').trim() || profile.accentColor : profile.accentColor;
   profile.driveAccessReady = Boolean(profile.driveFolderUrl && profile.hasEmail);
   return profile;
 }
@@ -492,7 +523,7 @@ async function loadClientProfile(clientId) {
         portalTitle: 'ECL Inventory Portal',
         portalSubtitle: 'Professional Prep & Fulfillment Services',
         accentColor: '#F5C518',
-        inventoryMode: inventoryConfig.fields.length ? 'custom' : 'legacy',
+        inventoryMode: inventoryConfig.fields.length ? 'custom' : 'inventory',
         enableAddItem: !inventoryConfig.readOnly,
         allowChat: true,
         allowLogs: true,
@@ -529,7 +560,7 @@ async function loadClientProfile(clientId) {
     driveFolderUrl: isBuiltInClient ? getChatDriveFolderForClient(safeClientId) : '',
     titleField: {
       ...getCreateFormTitleConfig(safeClientId),
-      label: safeClientId === 'CL-003' ? 'Product Description / Name' : safeClientId === 'CL-002' ? 'Product Description' : 'Product Title'
+      label: safeClientId === 'CL-003' ? 'Product Description / Name' : 'Product Title'
     },
     fields: []
   };
@@ -570,13 +601,15 @@ async function loadClientProfile(clientId) {
   }
 
   applyClientSettings(profile, credentialsRow);
+  // Keep legacy custom columns in the storage schema, but not in CL-002's views.
+  const dashboardFields = profile.fields.filter((field) => safeClientId !== 'CL-002' || field.key !== 'productDescription');
   profile.dashboardColumns = withEditColumn([
     'PRODUCT TITLE',
-    ...profile.fields.map((field) => String(field.label || field.key).toUpperCase()),
+    ...dashboardFields.map((field) => String(field.label || field.key).toUpperCase()),
     ...(profile.hideQtyColumn ? [] : ['QTY']),
     'STATUS'
   ], profile);
-  profile.dashboardFieldKeys = profile.fields.map((field) => field.key);
+  profile.dashboardFieldKeys = dashboardFields.map((field) => field.key);
   return profile;
 }
 
@@ -585,7 +618,7 @@ function normalizeClientRow(row = {}) {
   const clientName = String(row.get('clientName') || row.get('Client_Name') || row.get('ClientName') || clientId || 'Client').trim();
   const username = String(row.get('username') || row.get('Username') || '').trim();
   const password = String(row.get('password') || row.get('Password') || '').trim();
-  const role = String(row.get('role') || row.get('Role') || (clientId === 'CL-000' ? 'admin' : 'client')).trim().toLowerCase();
+  const role = credentialRole(row.get('role') || row.get('Role'), clientId);
 
   return {
     clientId,
@@ -603,7 +636,7 @@ async function getClientRoster() {
     const rows = await withRetry(() => sheet.getRows());
     const roster = rows
       .map(normalizeClientRow)
-      .filter((entry) => entry.role !== 'retired' && (entry.clientId || entry.username));
+      .filter((entry) => validSessionRole(entry) && (entry.clientId || entry.username));
 
     if (roster.length) return roster;
     if (rows.length) return [];
@@ -619,7 +652,7 @@ function listInventoryForClient(targetClientId) {
   return cachedRead(key, INVENTORY_CACHE_MS, () => loadInventoryForClient(targetClientId));
 }
 
-async function loadInventoryForClient(targetClientId) {
+async function loadInventoryForClient(targetClientId, strict = false) {
   const sheetName = getSheetNameForClient(targetClientId);
   try {
     // Once clients are deletable, a stale/typo'd clientId must not silently fall back to
@@ -631,6 +664,26 @@ async function loadInventoryForClient(targetClientId) {
     const rows = await loadSheetRows(sheetName, sheetName === 'CL-001' ? null : 500);
     const result = [];
     const profile = await getClientProfile(targetClientId);
+    const catalog = catalogColumns(rows, profile);
+    const catalogMetadata = (row) => Object.fromEntries(CATALOG_FIELDS.map(({ key }) => [key, String(row[catalog.columns[key]] ?? '').trim()]));
+    const trackingHeaders = profile.legacy && sheetName === 'CL-001'
+      ? rows.find((row) => row.some((value) => /sku code/i.test(String(value)))) || []
+      : rows[0] || [];
+    const timestampColumn = trackingHeaders.findIndex((value) => String(value || '').trim() === 'Check_In_Timestamp');
+    const trackingColumns = trackingHeaders.flatMap((header, index) => {
+      const label = String(header || '').trim();
+      const key = !profile.legacy ? profile.fields[index - 2]?.key || '' : '';
+      return !/^Archived:/i.test(label) && /tracking/i.test(`${label} ${key}`) ? [{ label, index }] : [];
+    });
+    const trackingMetadata = (row) => {
+      return {
+        checkInTimestamp: String(row[timestampColumn] || '').trim(),
+        trackingNumbers: trackingColumns.flatMap(({ label, index }) => {
+          const number = String(row[index] ?? '').trim();
+          return number ? [{ label, number }] : [];
+        })
+      };
+    };
 
     const parseGenericSheetRow = (row) => {
       const rowText = String((row || []).slice(0, 8).join(' ')).toLowerCase();
@@ -685,23 +738,27 @@ async function loadInventoryForClient(targetClientId) {
       for (let index = 1; index < rows.length; index += 1) {
         const row = rows[index];
         const description = String(row[columnIndexes.description >= 0 ? columnIndexes.description : 1] || '').trim();
-        if (!description || description.toLowerCase() === 'product description') continue;
+        const upc = String(row[columnIndexes.upc >= 0 ? columnIndexes.upc : 0] ?? '').trim();
+        const asinValue = String(row[columnIndexes.asin >= 0 ? columnIndexes.asin : 7] ?? '').trim();
+        if (description.toLowerCase() === 'product description' || (!description && !upc && !asinValue)) continue;
+        const displayTitle = description || upc || asinValue;
 
         const orderedValue = row[columnIndexes.quantityOrdered >= 0 ? columnIndexes.quantityOrdered : 2] || '';
         const qtyValue = Number(String(orderedValue).replace(/[^0-9.-]/g, '')) || 0;
-        const asinValue = String(row[columnIndexes.asin >= 0 ? columnIndexes.asin : 7] || '').trim();
 
         const item = {
           id: `CL-002-${index}`,
           clientId: 'CL-002',
-          sku: String(row[columnIndexes.upc >= 0 ? columnIndexes.upc : 0] || '').trim() || description,
-          title: description,
-          itemName: description,
+          sku: upc || displayTitle,
+          title: displayTitle,
+          itemName: displayTitle,
           qty: qtyValue,
           quantity: qtyValue,
           reorderLevel: 0,
-          status: String(row[columnIndexes.notes >= 0 ? columnIndexes.notes : 12] || '').trim() || 'In Stock',
-          upc: String(row[columnIndexes.upc >= 0 ? columnIndexes.upc : 0] || '').trim(),
+          status: profile.inventoryMode === 'custom'
+            ? fulfillmentStatus(row[normalizedHeaders.indexOf('status')], row[columnIndexes.quantityReceived >= 0 ? columnIndexes.quantityReceived : 3], row[columnIndexes.quantityShipped >= 0 ? columnIndexes.quantityShipped : 4])
+            : String(row[normalizedHeaders.indexOf('status')] || 'In Stock'),
+          upc,
           description,
           productDescription: description,
           quantityOrdered: String(orderedValue).trim(),
@@ -717,6 +774,7 @@ async function loadInventoryForClient(targetClientId) {
           notes: String(row[columnIndexes.notes >= 0 ? columnIndexes.notes : 12] || '').trim(),
           asinDisplay: asinValue
         };
+        Object.assign(item, trackingMetadata(row), catalogMetadata(row));
 
         result.push(item);
       }
@@ -751,7 +809,9 @@ async function loadInventoryForClient(targetClientId) {
           qty: Number(String(row[map.quantityReceived] || '').replace(/[^0-9.-]/g, '')) || 0,
           quantity: Number(String(row[map.quantityReceived] || '').replace(/[^0-9.-]/g, '')) || 0,
           reorderLevel: 0,
-          status: 'In Stock',
+          status: profile.inventoryMode === 'custom'
+            ? fulfillmentStatus(row[headerText.indexOf('status')], row[map.quantityReceived], row[map.quantityShipped])
+            : String(row[headerText.indexOf('status')] || 'In Stock'),
           productName,
           quantityOrdered: String(row[map.quantityOrdered] || '').trim(),
           quantityReceived: String(row[map.quantityReceived] || '').trim(),
@@ -759,7 +819,8 @@ async function loadInventoryForClient(targetClientId) {
           merchant: String(row[map.merchant] || '').trim(),
           carrier: String(row[map.carrier] || '').trim(),
           trackingNumber: String(row[map.trackingNumber] || '').trim(),
-          notes: String(row[map.notes] || '').trim()
+          notes: String(row[map.notes] || '').trim(),
+          ...trackingMetadata(row), ...catalogMetadata(row)
         });
       }
       return result;
@@ -795,6 +856,7 @@ async function loadInventoryForClient(targetClientId) {
 
         const normalized = normalizeInventoryRow(row, sheetName);
         if (normalized && normalized.sku && normalized.sku !== 'N/A' && normalized.title && normalized.title !== 'Untitled') {
+          Object.assign(normalized, trackingMetadata(row), catalogMetadata(row));
           result.push(normalized);
         }
       }
@@ -805,7 +867,6 @@ async function loadInventoryForClient(targetClientId) {
     // SKU | Product Title | ...custom fields (in the order configured)... | Qty | Status | Notes.
     // Reading it generically here means new clients need zero code changes to appear correctly.
     if (!profile.legacy) {
-      if (profile.fields.length || profile.inventoryMode === 'custom') {
         const customFieldCount = profile.fields.length;
         const qtyCol = 2 + customFieldCount;
         const statusCol = qtyCol + 1;
@@ -834,11 +895,15 @@ async function loadInventoryForClient(targetClientId) {
           profile.fields.forEach((field, fieldIndex) => {
             item[field.key] = String(row[2 + fieldIndex] || '').trim();
           });
+          if (profile.inventoryMode === 'custom') {
+            const keys = findShipmentFieldKeys(profile.fields);
+            item.status = fulfillmentStatus(row[statusCol], keys ? item[keys.received] : 0, keys ? item[keys.shipped] : 0);
+          }
+          Object.assign(item, trackingMetadata(row), catalogMetadata(row));
 
           result.push(item);
         }
         return result;
-      }
     }
 
     for (const row of rows) {
@@ -850,7 +915,7 @@ async function loadInventoryForClient(targetClientId) {
 
     return result;
   } catch (error) {
-    if (error?.response?.status === 429) throw error;
+    if (strict || error?.response?.status === 429) throw error;
     console.warn(`Inventory sheet ${sheetName} did not load:`, error.message);
     return [];
   }
@@ -867,18 +932,112 @@ app.use((req, res, next) => {
 });
 
 app.get('/api/clients', async (req, res) => {
+  res.set('Cache-Control', 'no-store');
   const session = readNotificationSession(req);
   if (!session) return res.status(401).json({ message: 'Sign-in required.' });
   try {
-    const isAdmin = session.role === 'admin' || session.clientId === 'CL-000';
+    const isAdmin = isStaffSession(session);
     const roster = (await getClientRoster())
       .filter((entry) => isAdmin || normalizeClientId(entry.clientId) === normalizeClientId(session.clientId));
     // Never leak password hashes (or legacy plain-text passwords) to the client.
-    const publicRoster = roster.map(({ password, ...rest }) => rest);
+    const publicRoster = roster.filter((entry) => entry.clientId !== 'CL-000').map(({ password, ...rest }) => rest);
     return res.json(publicRoster);
   } catch (error) {
     console.error('Client roster error:', error);
     return res.status(500).json({ message: 'Unable to fetch client roster.' });
+  }
+});
+
+function brandingAccess(req, res) {
+  const session = readNotificationSession(req);
+  if (!session) { res.status(401).json({ success: false, error: 'Sign in to manage branding.' }); return null; }
+  const clientId = normalizeClientId(req.body?.clientId);
+  if (!/^CL-\d{3,}$/.test(clientId) || clientId === 'CL-000'
+    || (!isStaffSession(session) && normalizeClientId(session.clientId) !== clientId)) {
+    res.status(403).json({ success: false, error: 'Select your own client account to manage branding.' });
+    return null;
+  }
+  return clientId;
+}
+
+const brandingRequests = new Map();
+app.post('/api/branding/fetch', async (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  const clientId = brandingAccess(req, res);
+  if (!clientId) return;
+  let input;
+  try {
+    input = validateBranding({ websiteUrl: req.body?.websiteUrl, logoUrl: '', accentColor: '' });
+    if (!input.websiteUrl) throw new Error('Enter a public Client Website URL first.');
+  } catch (error) { return res.status(400).json({ success: false, error: error.message }); }
+  const username = readNotificationSession(req).username;
+  const now = Date.now();
+  for (const [user, started] of brandingRequests) if (now - started > 60000) brandingRequests.delete(user);
+  if (brandingRequests.has(username)) return res.status(429).json({ success: false, error: 'Wait one minute before fetching branding again. Manual logo and color entry remain available.' });
+  brandingRequests.set(username, now);
+  try {
+    if (!await findCredentialsRow(clientId)) return res.status(404).json({ success: false, error: 'Client profile not found.' });
+    const branding = await scrapeBranding(input.websiteUrl);
+    return res.json({ success: true, clientId, branding });
+  } catch (error) {
+    console.warn('Branding fetch failed:', error.message);
+    return res.status(422).json({ success: false, error: 'Could not fetch website branding. The site may block public access; enter a logo URL and hex color manually.' });
+  }
+});
+
+app.put('/api/branding', async (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  const clientId = brandingAccess(req, res);
+  if (!clientId) return;
+  let branding;
+  try { branding = validateBranding(req.body || {}); }
+  catch (error) { return res.status(400).json({ success: false, error: error.message }); }
+  try {
+    const sheet = await getOrCreateSheet('User_Credentials', USER_CREDENTIALS_HEADERS);
+    const rows = await withRetry(() => sheet.getRows());
+    const row = rows.find(entry => normalizeClientId(entry.get('Client_ID')) === clientId);
+    if (!row) return res.status(404).json({ success: false, error: 'Client profile not found.' });
+    row.set('Website_URL', branding.websiteUrl);
+    row.set('Logo_URL', branding.logoUrl);
+    row.set('Accent_Color', branding.accentColor);
+    await withRetry(() => row.save({ raw: true }));
+    invalidateReadCache(`profile:${clientId}`);
+    return res.json({ success: true, clientId, branding });
+  } catch (error) {
+    console.error('Branding save failed:', error.message);
+    return res.status(500).json({ success: false, error: 'Branding save was not confirmed. Refresh the account before retrying.' });
+  }
+});
+
+app.put('/api/packaging-notes', async (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  const session = readNotificationSession(req);
+  if (!session) return res.status(401).json({ success: false, error: 'Sign in to edit packaging notes.' });
+  const clientId = normalizeClientId(req.body?.clientId);
+  if (!/^CL-\d{3,}$/.test(clientId) || clientId === 'CL-000'
+    || (session.role !== 'admin' && (session.role !== 'client' || normalizeClientId(session.clientId) !== clientId))) {
+    return res.status(403).json({ success: false, error: 'Only this client or an administrator can edit its packaging notes.' });
+  }
+  const notes = req.body?.packagingNotes;
+  if (typeof notes !== 'string' || notes.length > 5000 || /[\u0000-\u0008\u000b\u000c\u000e-\u001f]/.test(notes)) {
+    return res.status(400).json({ success: false, error: 'Packaging notes must be text of 5000 characters or fewer without control characters.' });
+  }
+  try {
+    const sheet = await getOrCreateSheet('User_Credentials', USER_CREDENTIALS_HEADERS);
+    const rows = await withRetry(() => sheet.getRows());
+    const row = rows.find((entry) => normalizeClientId(entry.get('Client_ID')) === clientId);
+    if (!row) return res.status(404).json({ success: false, error: 'Client profile not found.' });
+    const previous = String(row.get('Packaging_Notes') || '').trim();
+    if (typeof req.body?.previousNotes !== 'string' || req.body.previousNotes !== previous) {
+      return res.status(409).json({ success: false, error: 'Packaging notes changed. Close this form and refresh the account before editing again.' });
+    }
+    row.set('Packaging_Notes', notes.trim());
+    await withRetry(() => row.save({ raw: true }));
+    invalidateReadCache(`profile:${clientId}`);
+    return res.json({ success: true, clientId, packagingNotes: notes.trim() });
+  } catch (error) {
+    console.error('Packaging notes save failed:', error.message);
+    return res.status(500).json({ success: false, error: 'Packaging notes were not confirmed. Refresh the account before retrying.' });
   }
 });
 
@@ -898,18 +1057,221 @@ app.get('/api/client-profile', async (req, res) => {
   }
 });
 
+function integrationSummary(row) {
+  const config = parseStoreConnection(row.get('Store_Integration_JSON'));
+  return {
+    platform: config?.platform || 'shopify', domain: config?.domain || '',
+    updatedAt: config?.updatedAt || '', hasCredentials: Boolean(row.get('Store_Integration_Secret')),
+    storageReady: integrationStorageReady(), automationEnabled: false
+  };
+}
+
+function integrationClient(req) {
+  const session = readNotificationSession(req);
+  if (!session) return { status: 401, error: 'Sign in again to manage store settings.' };
+  const clientId = normalizeClientId(req.method === 'GET' ? req.query.clientId : req.body?.clientId);
+  if (!/^CL-\d{3,}$/.test(clientId) || clientId === 'CL-000'
+    || (session.role !== 'admin' && (session.role !== 'client' || normalizeClientId(session.clientId) !== clientId))) {
+    return { status: 403, error: 'Only this client or an administrator can manage its store connection.' };
+  }
+  return { session, clientId };
+}
+
+app.get('/api/store-connection', async (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  const access = integrationClient(req);
+  if (access.error) return res.status(access.status).json({ success: false, error: access.error });
+  try {
+    const row = await findCredentialsRow(access.clientId);
+    if (!row) return res.status(404).json({ success: false, error: 'Client profile not found.' });
+    return res.json({ success: true, clientId: access.clientId, connection: integrationSummary(row) });
+  } catch (error) {
+    console.error('Store connection read failed.');
+    return res.status(500).json({ success: false, error: 'Unable to load store settings. Please retry.' });
+  }
+});
+
+app.put('/api/store-connection', async (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  const access = integrationClient(req);
+  if (access.error) return res.status(access.status).json({ success: false, error: access.error });
+  try {
+    const sheet = await getOrCreateSheet('User_Credentials', USER_CREDENTIALS_HEADERS);
+    const rows = await withRetry(() => sheet.getRows());
+    const row = rows.find((entry) => normalizeClientId(entry.get('Client_ID')) === access.clientId);
+    if (!row) return res.status(404).json({ success: false, error: 'Client profile not found.' });
+    if (req.body?.disconnect === true) {
+      row.set('Store_Integration_JSON', '');
+      row.set('Store_Integration_Secret', '');
+    } else {
+      let config;
+      let credentials;
+      try {
+        config = validateStoreConnection(req.body || {});
+        credentials = readSubmittedCredentials(req.body || {}, config.platform);
+      } catch (error) {
+        return res.status(400).json({ success: false, error: error.message });
+      }
+      if (credentials && req.body?.removeCredentials === true) {
+        return res.status(400).json({ success: false, error: 'Choose either replacement credentials or Remove saved credentials, not both.' });
+      }
+      const previous = parseStoreConnection(row.get('Store_Integration_JSON'));
+      const savedSecret = String(row.get('Store_Integration_Secret') || '');
+      const changed = previous && (previous.platform !== config.platform || previous.domain !== config.domain);
+      if (savedSecret && changed && !credentials && req.body?.removeCredentials !== true) {
+        return res.status(400).json({ success: false, error: 'Changing the store or platform requires replacement credentials or Remove saved credentials.' });
+      }
+      let secret = req.body?.removeCredentials === true ? '' : savedSecret;
+      if (credentials) {
+        if (!integrationStorageReady()) return res.status(503).json({ success: false, error: 'Credential storage is not configured. Save the store domain without tokens, or ask ECL to enable encrypted storage.' });
+        secret = encryptStoreCredentials(credentials, access.clientId, config);
+      }
+      row.set('Store_Integration_JSON', JSON.stringify({ ...config, updatedAt: new Date().toISOString() }));
+      row.set('Store_Integration_Secret', secret);
+    }
+    await withRetry(() => row.save());
+    return res.json({ success: true, clientId: access.clientId, connection: integrationSummary(row) });
+  } catch (error) {
+    console.error('Store connection save failed.');
+    return res.status(500).json({ success: false, error: 'Unable to save store settings. Your changes were not confirmed. Please retry.' });
+  }
+});
+
 app.use('/api/admin', (req, res, next) => {
   const session = readNotificationSession(req);
-  if (!session || (session.role !== 'admin' && session.clientId !== 'CL-000')) {
+  if (!session) {
     return res.status(401).json({ success: false, error: 'Admin sign-in required.' });
   }
+  if (session.role !== 'admin') return res.status(403).json({ success: false, error: 'Only administrators can access master settings and billing.' });
   req.adminSession = session;
   next();
+});
+
+app.use('/api/admin/staff', (req, res, next) => {
+  if (req.adminSession.role !== 'admin') {
+    return res.status(403).json({ success: false, error: 'Only administrators can configure staff accounts.' });
+  }
+  next();
+});
+
+app.get('/api/admin/logins', async (req, res) => {
+  if (req.adminSession.role !== 'admin') {
+    return res.status(403).json({ success: false, error: 'Only administrators can view login history.' });
+  }
+  try {
+    const sheet = await getOrCreateSheet('User_Logins', USER_LOGINS_HEADERS);
+    const rows = await withRetry(() => sheet.getRows());
+    const entries = rows.slice(-100).reverse().map((row) => ({
+      timestamp: String(row.get('Timestamp') || ''),
+      username: String(row.get('Username') || ''),
+      clientId: String(row.get('ClientID') || ''),
+      authType: String(row.get('AuthType') || '')
+    }));
+    return res.json(entries);
+  } catch (error) {
+    console.error('Login history error:', error.message);
+    return res.status(error?.response?.status === 429 ? 429 : 500).json({ success: false, error: 'Unable to load login history.' });
+  }
+});
+
+function publicStaffAccount(row) {
+  const account = normalizeClientRow(row);
+  return {
+    clientId: 'CL-000', username: account.username, name: account.clientName, email: account.email,
+    role: account.role, activated: Boolean(String(row.get('Password') || '').trim())
+  };
+}
+
+function staffAccountInput(body = {}) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return { error: 'Staff account details are required.' };
+  const name = typeof body.name === 'string' ? body.name.trim() : '';
+  const email = typeof body.email === 'string' ? body.email.trim() : '';
+  if (!name || name.length > 100) return { error: 'Enter a staff name of 1-100 characters.' };
+  if (email && (email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))) {
+    return { error: 'Enter a valid email address or leave it blank.' };
+  }
+  if (body.role !== undefined && body.role !== 'staff') return { error: 'Staff accounts cannot be promoted through this form.' };
+  if (body.clientId !== undefined && body.clientId !== 'CL-000') return { error: 'Staff accounts must belong to CL-000.' };
+  return { name, email };
+}
+
+app.get('/api/admin/staff', async (req, res) => {
+  try {
+    const sheet = await getOrCreateSheet('User_Credentials', USER_CREDENTIALS_HEADERS);
+    const rows = await withRetry(() => sheet.getRows());
+    const accounts = rows.filter((row) => {
+      const account = normalizeClientRow(row);
+      return account.clientId === 'CL-000' && ['admin', 'staff'].includes(account.role);
+    }).map(publicStaffAccount);
+    return res.json(accounts);
+  } catch (error) {
+    console.error('Staff list error:', error.message);
+    return res.status(error?.response?.status === 429 ? 429 : 500).json({ success: false, error: 'Unable to load staff accounts.' });
+  }
+});
+
+app.post('/api/admin/staff', async (req, res) => {
+  try {
+    const input = staffAccountInput(req.body);
+    if (input.error) return res.status(400).json({ success: false, error: input.error });
+    const username = typeof req.body?.username === 'string' ? req.body.username.trim() : '';
+    if (!/^[A-Za-z0-9][A-Za-z0-9._@-]{2,63}$/.test(username)) {
+      return res.status(400).json({ success: false, error: 'Username must be 3-64 letters, numbers, dots, underscores, @ signs or hyphens.' });
+    }
+    const sheet = await getOrCreateSheet('User_Credentials', USER_CREDENTIALS_HEADERS);
+    const rows = await withRetry(() => sheet.getRows());
+    if (rows.some((row) => normalizeClientRow(row).username.toLowerCase() === username.toLowerCase())) {
+      return res.status(409).json({ success: false, error: 'That username is already in use.' });
+    }
+    if (input.email && rows.some((row) => normalizeClientRow(row).email.toLowerCase() === input.email.toLowerCase())) {
+      return res.status(409).json({ success: false, error: 'That email address is already associated with an account.' });
+    }
+    const activationCode = `${generateCode(4)}-${generateCode(4)}`;
+    await withRetry(() => sheet.addRow({
+      Client_ID: 'CL-000', Username: username, Password: '', Client_Name: input.name,
+      Email: input.email, Role: 'staff', Activation_Code: activationCode, Recovery_Code_Hash: ''
+    }));
+    return res.status(201).json({ success: true, username, activationCode });
+  } catch (error) {
+    console.error('Staff registration error:', error.message);
+    return res.status(error?.response?.status === 429 ? 429 : 500).json({ success: false, error: 'Unable to register staff account.' });
+  }
+});
+
+app.put('/api/admin/staff/:username', async (req, res) => {
+  try {
+    const input = staffAccountInput(req.body);
+    if (input.error) return res.status(400).json({ success: false, error: input.error });
+    const username = String(req.params.username || '').trim();
+    if (req.body?.username !== undefined && req.body.username !== username) {
+      return res.status(400).json({ success: false, error: 'Staff usernames cannot be changed.' });
+    }
+    const sheet = await getOrCreateSheet('User_Credentials', USER_CREDENTIALS_HEADERS);
+    const rows = await withRetry(() => sheet.getRows());
+    const row = rows.find((entry) => {
+      const account = normalizeClientRow(entry);
+      return account.username === username && account.clientId === 'CL-000' && account.role === 'staff';
+    });
+    if (!row) return res.status(404).json({ success: false, error: 'Staff account not found. Administrator accounts are not editable here.' });
+    if (input.email && rows.some((entry) => entry !== row && normalizeClientRow(entry).email.toLowerCase() === input.email.toLowerCase())) {
+      return res.status(409).json({ success: false, error: 'That email address is already associated with an account.' });
+    }
+    row.set('Client_Name', input.name);
+    row.set('Email', input.email);
+    await withRetry(() => row.save());
+    return res.json({ success: true, account: publicStaffAccount(row) });
+  } catch (error) {
+    console.error('Staff update error:', error.message);
+    return res.status(error?.response?.status === 429 ? 429 : 500).json({ success: false, error: 'Unable to update staff account.' });
+  }
 });
 
 app.post('/api/admin/clients/:clientId/reset-password', async (req, res) => {
   try {
     const clientId = normalizeClientId(req.params.clientId);
+    if (clientId === 'CL-000') {
+      return res.status(400).json({ success: false, error: 'Staff accounts cannot be reset through client account controls.' });
+    }
     const credentialsSheet = await getOrCreateSheet('User_Credentials', USER_CREDENTIALS_HEADERS);
     const rows = await withRetry(() => credentialsSheet.getRows());
     const row = rows.find((entry) => normalizeClientId(entry.get('Client_ID')) === clientId);
@@ -938,6 +1300,12 @@ app.post('/api/admin/clients/:clientId/reset-password', async (req, res) => {
 app.post('/api/admin/clients', async (req, res) => {
   try {
     const body = req.body || {};
+    let branding;
+    try { branding = validateBranding({ websiteUrl: body.websiteUrl || '', logoUrl: body.logoUrl || '', accentColor: body.accentColor || '' }); }
+    catch (error) { return res.status(400).json({ success: false, error: error.message }); }
+    if (body.inventoryMode !== undefined && !['inventory', 'custom'].includes(body.inventoryMode)) {
+      return res.status(400).json({ success: false, error: 'Choose a valid inventory mode.' });
+    }
     const clientId = normalizeClientId(body.clientId);
     const clientName = String(body.clientName || '').trim();
     const username = String(body.username || '').trim();
@@ -998,9 +1366,11 @@ app.post('/api/admin/clients', async (req, res) => {
       Role: 'client',
       Portal_Title: String(body.portalTitle || '').trim(),
       Portal_Subtitle: String(body.portalSubtitle || '').trim(),
-      Inventory_Mode: 'custom',
+      Inventory_Mode: body.inventoryMode || 'custom',
       Enable_Add_Item: body.enableAddItem === false ? 'false' : 'true',
-      Accent_Color: String(body.accentColor || '').trim(),
+      Accent_Color: branding.accentColor,
+      Website_URL: branding.websiteUrl,
+      Logo_URL: branding.logoUrl,
       Allow_Chat: body.allowChat === false ? 'false' : 'true',
       Allow_Logs: body.allowLogs === false ? 'false' : 'true',
       Allow_Update: body.allowUpdate === false ? 'false' : 'true',
@@ -1079,6 +1449,9 @@ app.put('/api/admin/clients/:clientId', async (req, res) => {
     }
 
     const body = req.body || {};
+    if (body.inventoryMode !== undefined && !['inventory', 'custom'].includes(body.inventoryMode)) {
+      return res.status(400).json({ success: false, error: 'Choose a valid inventory mode.' });
+    }
     const email = body.email === undefined ? null : String(body.email || '').trim();
     if (email && (email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))) {
       return res.status(400).json({ success: false, error: 'Enter a valid email address.' });
@@ -1091,6 +1464,14 @@ app.put('/api/admin/clients/:clientId', async (req, res) => {
       return res.status(400).json({ success: false, error: 'Drive folder must be a Google Drive folder link or folder ID.' });
     }
 
+    let branding;
+    try {
+      branding = validateBranding({
+        websiteUrl: body.websiteUrl ?? row.get('Website_URL') ?? '',
+        logoUrl: body.logoUrl ?? row.get('Logo_URL') ?? '',
+        accentColor: body.accentColor ?? row.get('Accent_Color') ?? ''
+      });
+    } catch (error) { return res.status(400).json({ success: false, error: error.message }); }
     const legacyLayout = isBuiltIn && !parseFieldsJson(row.get('Fields_JSON'));
     const oldFields = legacyLayout
       ? getClientInventoryFields(clientId).fields.filter((field) => !['upc', 'productDescription', 'productName', 'notes'].includes(field.key))
@@ -1139,10 +1520,12 @@ app.put('/api/admin/clients/:clientId', async (req, res) => {
     }
 
     row.set('Client_Name', String(body.clientName || row.get('Client_Name') || clientId).trim());
-    row.set('Inventory_Mode', 'custom');
+    row.set('Inventory_Mode', body.inventoryMode || String(row.get('Inventory_Mode') || (clientId === 'CL-001' ? 'inventory' : 'custom')));
     row.set('Portal_Title', String(body.portalTitle ?? row.get('Portal_Title') ?? '').trim());
     row.set('Portal_Subtitle', String(body.portalSubtitle ?? row.get('Portal_Subtitle') ?? '').trim());
-    row.set('Accent_Color', String(body.accentColor ?? row.get('Accent_Color') ?? '').trim());
+    row.set('Accent_Color', branding.accentColor);
+    row.set('Website_URL', branding.websiteUrl);
+    row.set('Logo_URL', branding.logoUrl);
     row.set('Drive_Folder_URL', normalizeDriveFolderUrl(body.driveFolderUrl ?? row.get('Drive_Folder_URL')));
     row.set('Enable_Add_Item', body.enableAddItem === undefined
       ? String(row.get('Enable_Add_Item') || String(clientId !== 'CL-001'))
@@ -1194,7 +1577,7 @@ app.delete('/api/admin/clients/:clientId', async (req, res) => {
     row.set('Role', 'retired');
     [
       'Username', 'Password', 'Email', 'Edit_PIN', 'Activation_Code', 'Recovery_Code_Hash',
-      'Quick_Edit_PIN_Hash', 'Fields_JSON', 'Client_Settings_JSON'
+      'Quick_Edit_PIN_Hash', 'Fields_JSON', 'Client_Settings_JSON', 'Store_Integration_JSON', 'Store_Integration_Secret'
     ].forEach((field) => row.set(field, ''));
     await withRetry(() => row.save());
     if (inventorySheet) {
@@ -1298,7 +1681,7 @@ app.get('/api/notifications', async (req, res) => {
   try {
     const session = readNotificationSession(req);
     if (!session) return res.status(401).json({ message: 'Sign in again to view notifications.' });
-    const isStaff = session.role === 'admin' || session.clientId === 'CL-000';
+    const isStaff = isStaffSession(session);
     const requestedClientId = normalizeClientId(req.query.clientId || session.clientId);
     const clientId = isStaff ? requestedClientId : session.clientId;
     const [chatRows, eventRows, seenRows] = await Promise.all([
@@ -1358,7 +1741,7 @@ app.post('/api/notifications/read', async (req, res) => {
   try {
     const session = readNotificationSession(req);
     if (!session) return res.status(401).json({ message: 'Sign in again to clear notifications.' });
-    const isStaff = session.role === 'admin' || session.clientId === 'CL-000';
+    const isStaff = isStaffSession(session);
     const clientId = isStaff ? normalizeClientId(req.body?.clientId || session.clientId) : session.clientId;
     const kind = req.body?.kind;
     if (!clientId || !['chat', 'inventory', 'all'].includes(kind)) {
@@ -1427,16 +1810,65 @@ app.post('/api/chat', async (req, res) => {
   }
 });
 
+const catalogSyncRequests = new Map();
+app.post('/api/catalog/sync', async (req, res) => {
+  const session = readNotificationSession(req);
+  if (!session) return res.status(401).json({ success: false, error: 'Sign in again to sync product details.' });
+  const clientId = normalizeClientId(req.body?.clientId);
+  if (!clientId || clientId === 'CL-000' || (!isStaffSession(session) && normalizeClientId(session.clientId) !== clientId)) {
+    return res.status(403).json({ success: false, error: 'Select your own client account to sync products.' });
+  }
+  const key = session.username;
+  const now = Date.now();
+  for (const [user, started] of catalogSyncRequests) if (now - started > 60000) catalogSyncRequests.delete(user);
+  if (catalogSyncRequests.has(key)) return res.status(429).json({ success: false, error: 'Please wait one minute before fetching another website. Manual entry remains available.' });
+  try {
+    const profile = await getClientProfile(clientId);
+    if (profile.readOnly && !isStaffSession(session)) return res.status(403).json({ success: false, error: 'This account is view-only.' });
+    const url = String(req.body?.url || '').trim();
+    if (!url || url.length > 2000) return res.status(400).json({ success: false, error: 'Enter a public product page or feed URL (maximum 2000 characters).' });
+    catalogSyncRequests.set(key, now);
+    let page = await fetchPublicPage(url);
+    const feed = catalogFeedUrl(page.body, page.url);
+    if (feed) page = await fetchPublicPage(feed);
+    return res.json({ success: true, ...parseCatalog(page.body, page.url) });
+  } catch (error) {
+    console.warn('Product metadata sync failed:', error.message);
+    return res.status(422).json({ success: false, error: `${error.message} Manual entry is always available.` });
+  }
+});
+
+async function prepareCatalogHeaders(sheet, rows, catalog, rowIndex) {
+  const last = catalog.headers.reduce((index, value, column) => String(value || '').trim() ? column : index, 0);
+  if (Number(sheet.columnCount) <= last) {
+    await withRetry(() => sheet.resize({ rowCount: sheet.rowCount, columnCount: last + 1 }));
+    await withRetry(() => sheet.loadCells(`A1:${columnIndexToLetter(last + 1)}${Math.max(rowIndex + 1, catalog.headerRowIndex + 1)}`));
+  }
+  catalog.headers.forEach((value, column) => {
+    if (value && value !== rows[catalog.headerRowIndex]?.[column]) sheet.getCell(catalog.headerRowIndex, column).value = value;
+  });
+}
+
 app.post('/api/inventory/create', async (req, res) => {
+  const session = readNotificationSession(req);
+  if (!session) return res.status(401).json({ success: false, error: 'Sign in again to add products.' });
   try {
     const { clientId, sku, title, qty, notes, extraFields = {} } = req.body || {};
     const kind = req.body?.kind === 'order' ? 'order' : 'inventory';
     const status = kind === 'order' ? 'Not Shipped' : req.body?.status;
     const targetClientId = String(clientId || 'CL-001').trim() || 'CL-001';
+    if (targetClientId === 'CL-000' || (!isStaffSession(session) && normalizeClientId(session.clientId) !== targetClientId)) {
+      return res.status(403).json({ success: false, error: 'You can only add products to your own account.' });
+    }
     const itemSku = String(sku || '').trim();
     const itemTitle = String(title || '').trim();
     const values = extraFields && typeof extraFields === 'object' ? { ...extraFields } : {};
     const profile = await getClientProfile(targetClientId);
+    if (profile.readOnly && !isStaffSession(session)) return res.status(403).json({ success: false, error: 'This account is view-only.' });
+    const catalogKeys = catalogFieldKeys(profile);
+    try { validateCatalogValues(values, catalogKeys); } catch (error) {
+      return res.status(400).json({ success: false, error: error.message });
+    }
     // Staff status comes from the signed session, never from what the browser claims.
     const adminAccess = isStaffSession(readNotificationSession(req));
 
@@ -1457,9 +1889,10 @@ app.post('/api/inventory/create', async (req, res) => {
     if (profile.legacy && targetClientId === 'CL-002') {
       row = [
         String(values.upc || itemSku || ''),
-        String(values.productDescription || itemTitle || ''),
+        String(itemTitle || values.productDescription || values.description || ''),
         String(values.quantityOrdered ?? qty ?? ''),
-        ...(adminAccess ? [String(values.quantityReceived ?? ''), String(values.quantityShipped ?? '')] : []),
+        String(adminAccess ? values.quantityReceived ?? '' : ''),
+        String(adminAccess ? values.quantityShipped ?? '' : ''),
         String(values.expDate || ''),
         String(values.merchant || ''),
         String(values.asin || ''),
@@ -1473,10 +1906,11 @@ app.post('/api/inventory/create', async (req, res) => {
       row = [
         String(values.productName || itemTitle || ''),
         String(values.quantityOrdered ?? qty ?? ''),
+        String(adminAccess ? values.quantityReceived ?? '' : ''),
+        String(adminAccess ? values.quantityShipped ?? '' : ''),
         String(values.merchant || ''),
         String(values.carrier || ''),
         String(values.trackingNumber || ''),
-        ...(adminAccess ? [String(values.quantityReceived ?? ''), String(values.quantityShipped ?? '')] : []),
         String(values.notes || notes || '')
       ];
     } else if (!profile.legacy) {
@@ -1495,7 +1929,9 @@ app.post('/api/inventory/create', async (req, res) => {
           ['CL-002', 'CL-003'].includes(targetClientId) && field.key === 'quantityOrdered' ? qty ?? '' : ''
         ))),
         baseQuantity,
-        shipmentKeys
+        profile.inventoryMode === 'custom'
+          ? fulfillmentStatus('', shipmentKeys ? values[shipmentKeys.received] : 0, shipmentKeys ? values[shipmentKeys.shipped] : 0)
+          : shipmentKeys
           ? SHIPMENT_STATUS_TEXT[getShipmentStage(values[shipmentKeys.received], values[shipmentKeys.shipped])]
           : String(status || (Number(qty) <= 5 ? 'Low Stock' : 'In Stock')),
         String(notes || '')
@@ -1515,7 +1951,18 @@ app.post('/api/inventory/create', async (req, res) => {
       return res.status(400).json({ success: false, error: 'SKU and product title are required.' });
     }
 
-    await withRetry(() => sheet.addRow(row));
+    if (CATALOG_FIELDS.some(({ key }) => key in values || catalogKeys[key] in values)) {
+      const rows = await loadSheetRows(sheetName);
+      const catalog = catalogColumns(rows, profile, row.length);
+      await prepareCatalogHeaders(sheet, rows, catalog, 0);
+      await withRetry(() => sheet.saveUpdatedCells());
+      await withRetry(() => sheet.loadHeaderRow(catalog.headerRowIndex + 1));
+      for (const { key } of CATALOG_FIELDS) {
+        row[catalog.columns[key]] = String(values[catalogKeys[key]] ?? values[key] ?? '');
+      }
+      row = Array.from({ length: row.length }, (_, index) => row[index] ?? '');
+    }
+    await withRetry(() => sheet.addRow(row, { raw: true }));
     invalidateReadCache('inventory:');
     await recordInventoryEvent(targetClientId, `Added ${kind === 'order' ? 'order ' : ''}${itemTitle || itemSku}`, readNotificationSession(req)?.username);
     return res.json({ success: true, sheet: sheetName, item: row });
@@ -1591,11 +2038,12 @@ async function getShipmentColumns(clientId, rows) {
     return index >= 0 ? index : fallback;
   };
   const profile = await getClientProfile(clientId);
+  if (profile.inventoryMode === 'inventory') return null;
   if (profile.legacy && clientId === 'CL-002') {
-    return { title: find('product description', 1), received: find('quantity received', 3), shipped: find('quantity shipped', 4), status: -1 };
+    return { title: find('product description', 1), upc: find('upc', 0), asin: find('asin', 7), received: find('quantity received', 3), shipped: find('quantity shipped', 4), status: workflowStatusColumn(rows, 13) };
   }
   if (profile.legacy && clientId === 'CL-003') {
-    return { title: find('product description/name', 0), received: find('quantity received', 2), shipped: find('quantity shipped', 3), status: -1 };
+    return { title: find('product description/name', 0), received: find('quantity received', 2), shipped: find('quantity shipped', 3), status: workflowStatusColumn(rows, 8) };
   }
   if (profile.legacy) return null;
   const { fields } = profile;
@@ -1603,6 +2051,22 @@ async function getShipmentColumns(clientId, rows) {
   if (!keys) return null;
   const indexOf = (key) => 2 + fields.findIndex((field) => field.key === key);
   return { title: 1, received: indexOf(keys.received), shipped: indexOf(keys.shipped), status: 2 + fields.length + 1 };
+}
+
+function workflowStatusColumn(rows, minimum) {
+  const headers = rows[0] || [];
+  const existing = headers.findIndex((value) => String(value || '').trim().toLowerCase() === 'status');
+  if (existing >= 0) return existing;
+  return Math.max(minimum, headers.reduce((last, value, index) => String(value || '').trim() ? index + 1 : last, 0));
+}
+
+async function prepareWorkflowStatusColumn(sheet, rows, column, rowIndex) {
+  if (String(rows[0]?.[column] || '').trim().toLowerCase() === 'status') return;
+  if (Number(sheet.columnCount) <= column) {
+    await withRetry(() => sheet.resize({ rowCount: sheet.rowCount, columnCount: column + 1 }));
+    await withRetry(() => sheet.loadCells(`A1:${columnIndexToLetter(column + 1)}${rowIndex + 1}`));
+  }
+  sheet.getCell(0, column).value = 'Status';
 }
 
 app.put('/api/inventory/shipment', async (req, res) => {
@@ -1630,29 +2094,117 @@ app.put('/api/inventory/shipment', async (req, res) => {
     const columns = await getShipmentColumns(clientId, rows);
     if (!columns) return res.status(400).json({ success: false, error: 'This client does not track received and shipped quantities.' });
     const rowIndex = Number(match[2]);
-    const rowTitle = String(rows[rowIndex]?.[columns.title] || '').trim();
+    const rowTitle = String(rows[rowIndex]?.[columns.title] || (
+      clientId === 'CL-002' ? rows[rowIndex]?.[columns.upc] || rows[rowIndex]?.[columns.asin] : ''
+    ) || '').trim();
     // Row numbers shift if someone inserts rows in the sheet, so confirm it is still the same product.
     if (rowIndex < 1 || !rowTitle || rowTitle !== String(req.body?.title || '').trim()) {
       return res.status(409).json({ success: false, error: 'This item moved in the sheet. Refresh and try again.' });
     }
+    if ('expectedReceived' in req.body || 'expectedShipped' in req.body) {
+      const expectedReceived = req.body.expectedReceived;
+      const expectedShipped = req.body.expectedShipped;
+      if (![expectedReceived, expectedShipped].every((value) => Number.isSafeInteger(value) && value >= 0)) {
+        return res.status(400).json({ success: false, error: 'Expected shipment totals must be non-negative whole numbers.' });
+      }
+      const currentReceived = Number(rows[rowIndex][columns.received] || 0);
+      const currentShipped = Number(rows[rowIndex][columns.shipped] || 0);
+      if (currentReceived !== expectedReceived || currentShipped !== expectedShipped) {
+        return res.status(409).json({ success: false, error: 'Shipment totals changed. Refresh and verify this item before checking in again.' });
+      }
+    }
 
+    const profile = await getClientProfile(clientId);
     const stage = getShipmentStage(received, shipped);
+    const status = profile.inventoryMode === 'custom'
+      ? shipmentStatus(rows[rowIndex][columns.status], rows[rowIndex][columns.received], received, shipped)
+      : SHIPMENT_STATUS_TEXT[stage];
+    await prepareWorkflowStatusColumn(sheet, rows, columns.status, rowIndex);
     sheet.getCell(rowIndex, columns.received).value = received;
     sheet.getCell(rowIndex, columns.shipped).value = shipped;
-    if (columns.status >= 0) sheet.getCell(rowIndex, columns.status).value = SHIPMENT_STATUS_TEXT[stage];
+    sheet.getCell(rowIndex, columns.status).value = status;
     await withRetry(() => sheet.saveUpdatedCells());
     invalidateReadCache('inventory:');
     await recordInventoryEvent(clientId, `Received ${received}, shipped ${shipped}: ${rowTitle}`, session.username);
-    return res.json({ success: true, received, shipped, stage, status: SHIPMENT_STATUS_TEXT[stage] });
+    return res.json({ success: true, received, shipped, stage, status });
   } catch (error) {
     console.error('Shipment update error:', error.message);
     return res.status(error?.response?.status === 429 ? 429 : 500).json({ success: false, error: 'Unable to update shipment.' });
   }
 });
 
+app.post('/api/inventory/check-in', async (req, res) => {
+  const session = readNotificationSession(req);
+  if (!isStaffSession(session)) return res.status(403).json({ success: false, error: 'Only ECL staff can check in items.' });
+  try {
+    const clientId = normalizeClientId(req.body?.clientId);
+    const code = String(req.body?.code || '').trim().toUpperCase();
+    const itemId = String(req.body?.itemId || '');
+    if (!clientId || clientId === 'CL-000' || !code || code.length > 200) {
+      return res.status(400).json({ success: false, error: 'Select a client and scan a valid barcode.' });
+    }
+    const profile = await getClientProfile(clientId);
+    if (profile.inventoryMode !== 'custom') return res.status(400).json({ success: false, error: 'Arrival check-in requires an order-fulfillment account.' });
+    const items = await loadInventoryForClient(clientId);
+    const item = items.find((entry) => entry.id === itemId);
+    const keys = ['sku', 'upc', 'trackingNumber', 'tracking', ...profile.fields
+      .filter((field) => /sku|upc|tracking/i.test(`${field.key} ${field.label}`)).map((field) => field.key)];
+    if (!item || !keys.some((key) => String(item[key] || '').trim().toUpperCase() === code)) {
+      return res.status(409).json({ success: false, error: 'This barcode no longer matches the selected item. Scan again.' });
+    }
+    if (['Shipped out', 'Received & Verified', 'In Prep'].includes(item.status)) {
+      return res.status(409).json({ success: false, error: 'This item has already advanced past arrival. Its stage was not changed.' });
+    }
+    const sheet = await findSheetByTitle(clientId);
+    const rows = await loadSheetRows(clientId);
+    const layout = await getItemEditColumns(clientId, rows);
+    const rowIndex = Number(itemId.match(/-(\d+)$/)?.[1]);
+    const title = String(rows[rowIndex]?.[layout.columns[layout.titleKey]] || (
+      profile.legacy && clientId === 'CL-002' ? rows[rowIndex]?.[layout.columns.upc] || rows[rowIndex]?.[layout.columns.asin] : ''
+    ) || '').trim();
+    if (!rowIndex || title !== item.title) return res.status(409).json({ success: false, error: 'This item moved. Refresh and scan again.' });
+    if (!keys.some((key) => layout.columns[key] !== undefined && String(rows[rowIndex][layout.columns[key]] || '').trim().toUpperCase() === code)) {
+      return res.status(409).json({ success: false, error: 'This barcode changed. Refresh and scan again.' });
+    }
+    const receivedKey = profile.fields.find((field) => /received/i.test(`${field.key} ${field.label}`))?.key;
+    const shippedKey = profile.fields.find((field) => /shipped/i.test(`${field.key} ${field.label}`))?.key;
+    const currentStatus = fulfillmentStatus(
+      rows[rowIndex][layout.columns.status],
+      rows[rowIndex][layout.columns[receivedKey]],
+      rows[rowIndex][layout.columns[shippedKey]]
+    );
+    if (['Shipped out', 'Received & Verified', 'In Prep'].includes(currentStatus)) {
+      return res.status(409).json({ success: false, error: 'This item advanced past arrival. Refresh inventory before scanning again.' });
+    }
+    const headers = rows[0] || [];
+    let timestampColumn = headers.findIndex((value) => String(value || '').trim() === 'Check_In_Timestamp');
+    const statusColumn = layout.columns.status;
+    if (timestampColumn >= 0 && rows[rowIndex][timestampColumn]) {
+      return res.json({ success: true, alreadyCheckedIn: true, timestamp: String(rows[rowIndex][timestampColumn]), status: item.status });
+    }
+    if (timestampColumn < 0) timestampColumn = Math.max(statusColumn + 1, headers.reduce((last, value, index) => String(value || '').trim() ? index + 1 : last, 0));
+    if (Number(sheet.columnCount) <= timestampColumn) {
+      await withRetry(() => sheet.resize({ rowCount: sheet.rowCount, columnCount: timestampColumn + 1 }));
+      await withRetry(() => sheet.loadCells(`A1:${columnIndexToLetter(timestampColumn + 1)}${rowIndex + 1}`));
+    }
+    const timestamp = new Date().toISOString();
+    sheet.getCell(0, statusColumn).value = 'Status';
+    sheet.getCell(0, timestampColumn).value = 'Check_In_Timestamp';
+    sheet.getCell(rowIndex, statusColumn).value = 'Arrived / Check-In';
+    sheet.getCell(rowIndex, timestampColumn).value = timestamp;
+    await withRetry(() => sheet.saveUpdatedCells());
+    invalidateReadCache('inventory:');
+    await recordInventoryEvent(clientId, `Barcode check-in ${item.title} at ${timestamp}`, session.username);
+    return res.json({ success: true, timestamp, status: 'Arrived / Check-In' });
+  } catch (error) {
+    console.error('Barcode check-in error:', error.message);
+    return res.status(error?.response?.status === 429 ? 429 : 500).json({ success: false, error: 'Unable to record arrival. Refresh inventory before scanning again.' });
+  }
+});
+
 // Sheet columns a product's details can be edited in, matching how loadInventoryForClient reads each layout.
 // Received/shipped quantities are deliberately absent: only staff change them, through /api/inventory/shipment.
-async function getItemEditColumns(clientId, rows) {
+async function getBaseItemEditColumns(clientId, rows) {
   const headers = (rows[0] || []).map((cell) => String(cell || '').trim().toLowerCase());
   const find = (test, fallback) => {
     const index = headers.findIndex((name) => (typeof test === 'function' ? test(name) : name.includes(test)));
@@ -1665,10 +2217,11 @@ async function getItemEditColumns(clientId, rows) {
       titleKey: 'productDescription',
       numeric: new Set(['quantityOrdered', 'bundleQty']),
       columns: {
-        upc: find('upc', 0), productDescription: find('product description', 1), quantityOrdered: find('quantity ordered', 2),
+        upc: find('upc', 0), title: find('product description', 1), productDescription: find('product description', 1), quantityOrdered: find('quantity ordered', 2),
         expDate: find('exp date', 5), merchant: find('merchant', 6), asin: find('asin', 7),
         fulfillment: find((name) => name.includes('fbm') || name.includes('fba'), 8), transparencyCode: find('transparency', 9),
-        bundled: find('bundled', 10), bundleQty: find('bundle quantity', 11), notes: find('notes', 12)
+        bundled: find('bundled', 10), bundleQty: find('bundle quantity', 11), notes: find('notes', 12),
+        status: workflowStatusColumn(rows, 13)
       }
     };
   }
@@ -1681,21 +2234,37 @@ async function getItemEditColumns(clientId, rows) {
       columns: {
         productName: find(exact('product description/name'), 0), quantityOrdered: find(exact('quantity ordered'), 1),
         merchant: find(exact('merchant'), 4), carrier: find(exact('carrier'), 5),
-        trackingNumber: find(exact('tracking #', 'tracking number'), 6), notes: find(exact('notes'), 7)
+        trackingNumber: find(exact('tracking #', 'tracking number'), 6), notes: find(exact('notes'), 7),
+        status: workflowStatusColumn(rows, 8)
       }
     };
   }
   if (profile.legacy && clientId === 'CL-001') {
-    return { locate: 'sku', titleKey: 'title', numeric: new Set(), columns: { sku: 1, title: 2 } };
+    return { locate: 'sku', titleKey: 'title', numeric: new Set(['qty']), columns: { sku: 1, title: 2, qty: 3, status: 4, notes: 5 } };
   }
   const { fields } = profile;
   const shipmentKeys = findShipmentFieldKeys(fields);
   const columns = { sku: 0, title: 1, notes: 2 + fields.length + 2 };
+  if (profile.inventoryMode === 'custom') columns.status = 3 + fields.length;
   fields.forEach((field, index) => {
     if (shipmentKeys && (field.key === shipmentKeys.received || field.key === shipmentKeys.shipped)) return;
     columns[field.key] = 2 + index;
   });
-  return { locate: 'index', titleKey: 'title', numeric: new Set(fields.filter((field) => field.type === 'number').map((field) => field.key)), columns };
+  if (profile.inventoryMode === 'inventory' || (!shipmentKeys && !['CL-002', 'CL-003'].includes(clientId))) {
+    columns.qty = 2 + fields.length;
+    columns.status = 3 + fields.length;
+  }
+  return { locate: 'index', titleKey: 'title', numeric: new Set(['qty', ...fields.filter((field) => field.type === 'number').map((field) => field.key)]), columns };
+}
+
+async function getItemEditColumns(clientId, rows) {
+  const layout = await getBaseItemEditColumns(clientId, rows);
+  const profile = await getClientProfile(clientId);
+  const catalog = catalogColumns(rows, profile, Math.max(...Object.values(layout.columns)) + 1);
+  if (layout.columns.status !== undefined && !catalog.headers[layout.columns.status] && catalog.headerRowIndex === 0) catalog.headers[layout.columns.status] = 'Status';
+  Object.assign(layout.columns, catalog.columns);
+  layout.numeric.add('bundleQty');
+  return { ...layout, catalog };
 }
 
 app.put('/api/inventory/item', async (req, res) => {
@@ -1715,21 +2284,49 @@ app.put('/api/inventory/item', async (req, res) => {
     if (shipmentKeys && (shipmentKeys.received in values || shipmentKeys.shipped in values)) {
       return res.status(403).json({ success: false, error: 'Only ECL staff can change received and shipped quantities.' });
     }
+    if ('status' in values && profile.inventoryMode === 'custom' && !staff) {
+      return res.status(403).json({ success: false, error: 'Only ECL staff can change fulfillment stages.' });
+    }
+    if ('qty' in values || ('status' in values && profile.inventoryMode !== 'custom')) {
+      if (profile.inventoryMode === 'custom' && (shipmentKeys || ['CL-002', 'CL-003'].includes(clientId))) {
+        return res.status(400).json({ success: false, error: 'Quantity and status are managed through the shipment workflow.' });
+      }
+      if (!staff) {
+        const denied = await checkQuickEditAccess(req, session, clientId);
+        if (denied) return res.status(403).json({ success: false, ...denied });
+      }
+    }
 
     const sheet = await findSheetByTitle(clientId);
     if (!sheet) return res.status(404).json({ success: false, error: 'Inventory sheet not found.' });
     const rows = await loadSheetRows(clientId, LEGACY_CLIENT_IDS.includes(clientId) ? null : 500);
     const layout = await getItemEditColumns(clientId, rows);
+    try { validateCatalogValues(values, layout.catalog.keys); } catch (error) {
+      return res.status(400).json({ success: false, error: error.message });
+    }
 
     const updates = [];
     for (const [key, raw] of Object.entries(values)) {
       if (!(key in layout.columns)) return res.status(400).json({ success: false, error: `"${key}" can't be edited here.` });
-      const text = String(raw ?? '').trim().slice(0, 500);
-      if (key === layout.titleKey && !text) return res.status(400).json({ success: false, error: 'The product name cannot be blank.' });
+      const text = String(raw ?? '').trim();
+      const maxLength = key === 'prepInstructions' || key === layout.catalog.keys.prepInstructions ? 5000
+        : key === 'imageUrl' || key === layout.catalog.keys.imageUrl ? 2000 : 500;
+      if (text.length > maxLength) return res.status(400).json({ success: false, error: `This product field must be ${maxLength} characters or fewer.` });
+      if ((key === layout.titleKey || key === 'title') && !text) return res.status(400).json({ success: false, error: 'The product name cannot be blank.' });
+      if (key === 'qty' && (!text || !Number.isSafeInteger(Number(text)) || Number(text) < 0)) {
+        return res.status(400).json({ success: false, error: 'Quantity must be a non-negative whole number.' });
+      }
+      if (key === 'status' && !(profile.inventoryMode === 'custom' ? FULFILLMENT_STATUSES : STOCK_STATUSES).includes(text)) {
+        return res.status(400).json({ success: false, error: 'Choose a valid status for this inventory mode.' });
+      }
       if (layout.numeric.has(key) && text && !Number.isFinite(Number(text))) return res.status(400).json({ success: false, error: 'Quantities must be numbers.' });
       updates.push([layout.columns[key], layout.numeric.has(key) && text ? Number(text) : text]);
     }
     if (!updates.length) return res.status(400).json({ success: false, error: 'Nothing to update.' });
+    if ('qty' in values && !('status' in values) && profile.inventoryMode !== 'custom') {
+      const quantity = Number(values.qty);
+      updates.push([layout.columns.status, quantity === 0 ? 'Out of Stock' : quantity <= 5 ? 'Low Stock' : 'In Stock']);
+    }
 
     let rowIndex = -1;
     if (layout.locate === 'sku') {
@@ -1739,15 +2336,31 @@ app.put('/api/inventory/item', async (req, res) => {
       const match = String(req.body?.itemId || '').match(/-(\d+)$/);
       rowIndex = match ? Number(match[1]) : -1;
       // Row numbers shift if rows are inserted in the sheet, so confirm it is still the same product.
-      const rowTitle = String(rows[rowIndex]?.[layout.columns[layout.titleKey]] || '').trim();
+      const rowTitle = String(rows[rowIndex]?.[layout.columns[layout.titleKey]] || (
+        profile.legacy && clientId === 'CL-002' ? rows[rowIndex]?.[layout.columns.upc] || rows[rowIndex]?.[layout.columns.asin] : ''
+      ) || '').trim();
       if (rowIndex < 1 || !rowTitle || rowTitle !== String(req.body?.title || '').trim()) rowIndex = -1;
     }
     if (rowIndex < 1) return res.status(409).json({ success: false, error: 'This item moved in the sheet. Refresh and try again.' });
 
+    if ('status' in values && profile.inventoryMode === 'custom') {
+      const shipmentColumns = await getShipmentColumns(clientId, rows);
+      if (shipmentColumns && Number(rows[rowIndex][shipmentColumns.shipped]) > 0
+        && Number(rows[rowIndex][shipmentColumns.shipped]) >= Number(rows[rowIndex][shipmentColumns.received])
+        && values.status !== 'Shipped out') {
+        return res.status(400).json({ success: false, error: 'This item is fully shipped. Correct the shipment totals before changing its stage.' });
+      }
+    }
+    if (CATALOG_FIELDS.some(({ key }) => key in values || layout.catalog.keys[key] in values)) {
+      await prepareCatalogHeaders(sheet, rows, layout.catalog, rowIndex);
+    }
+    if ('status' in values && profile.legacy && profile.inventoryMode === 'custom') {
+      await prepareWorkflowStatusColumn(sheet, rows, layout.columns.status, rowIndex);
+    }
     updates.forEach(([column, value]) => { sheet.getCell(rowIndex, column).value = value; });
     await withRetry(() => sheet.saveUpdatedCells());
     invalidateReadCache('inventory:');
-    const title = String(values[layout.titleKey] ?? req.body?.title ?? '').trim();
+    const title = String(values[layout.titleKey] ?? values.title ?? req.body?.title ?? '').trim();
     await recordInventoryEvent(clientId, `Edited details: ${title}`, session.username);
     return res.json({ success: true });
   } catch (error) {
@@ -1761,14 +2374,14 @@ app.put('/api/inventory/quantity', async (req, res) => {
     const session = readNotificationSession(req);
     if (!session) return res.status(401).json({ success: false, error: 'Sign in again to update inventory.' });
     const clientId = normalizeClientId(req.body?.clientId);
-    const isStaff = session.role === 'admin' || session.clientId === 'CL-000';
+    const isStaff = isStaffSession(session);
     const sku = String(req.body?.sku || '').trim();
     const quantity = Number(req.body?.qty);
     if (!clientId || !sku || !Number.isSafeInteger(quantity) || quantity < 0 || (!isStaff && session.clientId !== clientId)) {
       return res.status(400).json({ success: false, error: 'Invalid inventory update.' });
     }
     const profile = await getClientProfile(clientId);
-    if (clientId === 'CL-002') return res.status(400).json({ success: false, error: 'Use the shipment workflow for this client.' });
+    if (profile.inventoryMode === 'custom' && (clientId === 'CL-002' || findShipmentFieldKeys(profile.fields))) return res.status(400).json({ success: false, error: 'Use the shipment workflow for this client.' });
     if (!isStaff) {
       const denied = await checkQuickEditAccess(req, session, clientId);
       if (denied) return res.status(403).json({ success: false, ...denied });
@@ -1798,7 +2411,7 @@ app.put('/api/inventory/quantity', async (req, res) => {
     }
     if (rowIndex < 0) return res.status(404).json({ success: false, error: 'Item not found.' });
     sheet.getCell(rowIndex, quantityColumn).value = quantity;
-    if (statusColumn >= 0) sheet.getCell(rowIndex, statusColumn).value = quantity === 0 ? 'Out of Stock' : quantity <= 5 ? 'Low Stock' : 'In Stock';
+    if (statusColumn >= 0 && profile.inventoryMode !== 'custom') sheet.getCell(rowIndex, statusColumn).value = quantity === 0 ? 'Out of Stock' : quantity <= 5 ? 'Low Stock' : 'In Stock';
     await withRetry(() => sheet.saveUpdatedCells());
     invalidateReadCache('inventory:');
     await recordInventoryEvent(clientId, `Updated ${sku} to ${quantity}`, session.username);
@@ -1849,10 +2462,17 @@ app.post('/api/login', authRateLimit, async (req, res) => {
 
     if (!passwordOk) return invalidCredentials();
 
-    const clientId = normalizeClientId(user.get('clientId') || user.get('Client_ID') || user.get('ClientID')) || 'CL-001';
+    const clientId = normalizeClientId(user.get('clientId') || user.get('Client_ID') || user.get('ClientID'));
     const clientName = String(user.get('clientName') || user.get('Client_Name') || user.get('ClientName') || clientId || 'Client').trim();
-    const role = String(user.get('role') || user.get('Role') || (clientId === 'CL-000' ? 'admin' : 'client')).trim().toLowerCase();
+    const role = credentialRole(user.get('role') || user.get('Role'), clientId);
+    if (!validSessionRole({ role, clientId })) return invalidCredentials();
+    await getOrCreateSheet('User_Credentials', USER_CREDENTIALS_HEADERS);
+    if (!String(user.get('Role') || user.get('role') || '').trim()) {
+      user.set('Role', role);
+      await withRetry(() => user.save());
+    }
 
+    await recordUserLogin(String(user.get('Username') || user.get('username') || '').trim(), clientId);
     return res.json({
       success: true,
       message: 'Login successful',
@@ -1894,15 +2514,17 @@ app.post('/api/account/activate', authRateLimit, async (req, res) => {
     if (!codesMatch(activationCode, storedCode)) return invalid();
 
     const recoveryCode = `${generateCode(4)}-${generateCode(4)}`;
-    const clientId = normalizeClientId(user.get('Client_ID')) || 'CL-001';
+    const clientId = normalizeClientId(user.get('Client_ID'));
     const clientName = String(user.get('Client_Name') || clientId).trim();
-    const role = String(user.get('Role') || (clientId === 'CL-000' ? 'admin' : 'client')).trim().toLowerCase();
+    const role = credentialRole(user.get('Role'), clientId);
+    if (!validSessionRole({ role, clientId })) return invalid();
     const notificationToken = signNotificationSession(safeUsername, clientId, role);
     user.set('Password', await hashSecret(safePassword));
     user.set('Activation_Code', '');
     user.set('Recovery_Code_Hash', await hashSecret(recoveryCode));
     await withRetry(() => user.save());
 
+    await recordUserLogin(safeUsername, clientId);
     return res.json({ success: true, username: safeUsername, clientId, clientName, role, notificationToken, recoveryCode });
   } catch (error) {
     console.error('Account activation error:', error);
@@ -1989,8 +2611,13 @@ async function attachActivityDates(items, fallbackClientId = '') {
 }
 
 app.get('/api/inventory', async (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  const session = readNotificationSession(req);
+  if (!session) return res.status(401).json({ message: 'Sign in to view inventory.' });
   try {
-    const clientId = String(req.query.clientId || '').trim();
+    const clientId = normalizeClientId(req.query.clientId || session.clientId);
+    if (!isStaffSession(session) && clientId !== session.clientId) return res.status(403).json({ message: 'You can only view your own inventory.' });
+    if (!/^CL-\d{3,}$/.test(clientId)) return res.status(400).json({ message: 'Choose a valid client account.' });
 
     if (clientId && clientId.toUpperCase() === 'CL-000') {
       const roster = await getClientRoster();
@@ -2009,6 +2636,146 @@ app.get('/api/inventory', async (req, res) => {
       ? 'Google Sheets configuration is missing or invalid. Update the .env values for GOOGLE_SERVICE_ACCOUNT_EMAIL, GOOGLE_PRIVATE_KEY, and GOOGLE_SHEET_ID.'
       : 'Unable to fetch inventory items.';
     res.status(error?.response?.status === 429 ? 429 : 500).json({ message });
+  }
+});
+
+async function inboundAccess(req, res) {
+  res.set('Cache-Control', 'no-store');
+  const session = readNotificationSession(req);
+  if (!session) {
+    res.status(401).json({ success: false, error: 'Sign in to view inbound shipments.' });
+    return null;
+  }
+  const clientId = normalizeClientId(req.method === 'GET' ? req.query.clientId || session.clientId : req.body?.clientId);
+  if (!/^CL-\d{3,}$/.test(clientId) || clientId === 'CL-000') {
+    res.status(400).json({ success: false, error: 'Select a client account.' });
+    return null;
+  }
+  if (!isStaffSession(session) && clientId !== normalizeClientId(session.clientId)) {
+    res.status(403).json({ success: false, error: 'You can only manage inbound shipments for your own account.' });
+    return null;
+  }
+  if (!(await findCredentialsRow(clientId))) {
+    res.status(404).json({ success: false, error: 'Client profile not found.' });
+    return null;
+  }
+  const profile = await getClientProfile(clientId);
+  if (profile.inventoryMode !== 'inventory') {
+    res.status(400).json({ success: false, error: 'Inbound restock notifications are for stock-level accounts.' });
+    return null;
+  }
+  return { session, clientId };
+}
+
+app.get('/api/inbound-shipments', async (req, res) => {
+  try {
+    const access = await inboundAccess(req, res);
+    if (!access) return;
+    const sheet = await findSheetByTitle(INBOUND_SHEET);
+    const rows = sheet ? await withRetry(() => sheet.getRows()) : [];
+    const shipments = rows.filter((row) => normalizeClientId(row.get('Client_ID')) === access.clientId)
+      .map(inboundFromRow).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+    return res.json({ success: true, clientId: access.clientId, shipments });
+  } catch (error) {
+    console.error('Inbound shipment read failed:', error.message);
+    return res.status(500).json({ success: false, error: 'Unable to load inbound shipments. Please retry.' });
+  }
+});
+
+app.post('/api/inbound-shipments', async (req, res) => {
+  try {
+    const access = await inboundAccess(req, res);
+    if (!access) return;
+    let shipment;
+    try { shipment = validateInboundShipment(req.body); }
+    catch (error) { return res.status(400).json({ success: false, error: error.message }); }
+    const id = req.body?.shipmentId;
+    if (typeof id !== 'string' || !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(id)) {
+      return res.status(400).json({ success: false, error: 'Invalid shipment reference. Reopen the form and retry.' });
+    }
+    const sheet = await getOrCreateSheet(INBOUND_SHEET, INBOUND_HEADERS);
+    const rows = await withRetry(() => sheet.getRows());
+    const duplicate = rows.find((row) => normalizeClientId(row.get('Client_ID')) === access.clientId
+      && (row.get('Shipment_ID') === id || normalizeInboundTracking(row.get('Tracking_Number')) === shipment.trackingNumber));
+    if (duplicate) {
+      const saved = inboundFromRow(duplicate);
+      if (saved.id === id && saved.carrier === shipment.carrier && saved.trackingNumber === shipment.trackingNumber
+        && saved.expectedDeliveryDate === shipment.expectedDeliveryDate && JSON.stringify(saved.contents) === JSON.stringify(shipment.contents)) {
+        return res.json({ success: true, clientId: access.clientId, shipment: saved, alreadySaved: true });
+      }
+      return res.status(409).json({ success: false, error: 'This tracking number or shipment reference is already logged. Refresh the inbound list before retrying.' });
+    }
+    const values = {
+      Shipment_ID: id, Client_ID: access.clientId, Carrier: shipment.carrier, Tracking_Number: shipment.trackingNumber,
+      Expected_Delivery_Date: shipment.expectedDeliveryDate, Contents_JSON: JSON.stringify(shipment.contents),
+      Status: 'In Transit to Warehouse', Created_At: new Date().toISOString(), Created_By: access.session.username,
+      Arrived_At: '', Arrived_By: ''
+    };
+    // A retry after an uncertain append must first re-read by shipment ID, not append a second box.
+    await sheet.addRow(values, { raw: true });
+    return res.status(201).json({ success: true, clientId: access.clientId, shipment: inboundFromRow({ get: (key) => values[key] }) });
+  } catch (error) {
+    console.error('Inbound shipment save failed:', error.message);
+    return res.status(500).json({ success: false, error: 'Shipment save was not confirmed. Refresh the list or retry the same form before creating another notification.' });
+  }
+});
+
+app.post('/api/inbound-shipments/check-in', async (req, res) => {
+  if (!isStaffSession(readNotificationSession(req))) return res.status(403).json({ success: false, error: 'Only ECL staff can record inbound arrivals.' });
+  try {
+    const access = await inboundAccess(req, res);
+    if (!access) return;
+    const code = normalizeInboundTracking(req.body?.code);
+    if (!/^[A-Z0-9]{4,100}$/.test(code)) return res.status(400).json({ success: false, error: 'Scan or enter a valid tracking number.' });
+    const sheet = await findSheetByTitle(INBOUND_SHEET);
+    const rows = sheet ? await withRetry(() => sheet.getRows()) : [];
+    const matches = rows.filter((row) => normalizeClientId(row.get('Client_ID')) === access.clientId
+      && normalizeInboundTracking(row.get('Tracking_Number')) === code);
+    const selected = matches.filter((row) => !req.body?.shipmentId || row.get('Shipment_ID') === req.body.shipmentId);
+    if (!selected.length) return res.status(404).json({ success: false, error: 'No matching inbound shipment in this account. Confirm the selected client and tracking number.' });
+    if (selected.length > 1) return res.status(409).json({ success: false, error: 'Multiple shipments match this barcode. Use the arrival button on the correct shipment card.' });
+    const row = selected[0];
+    if (row.get('Arrived_At')) return res.json({ success: true, clientId: access.clientId, shipment: inboundFromRow(row), alreadyCheckedIn: true });
+    row.set('Status', 'Arrived at Warehouse');
+    row.set('Arrived_At', new Date().toISOString());
+    row.set('Arrived_By', access.session.username);
+    await withRetry(() => row.save({ raw: true }));
+    return res.json({ success: true, clientId: access.clientId, shipment: inboundFromRow(row) });
+  } catch (error) {
+    console.error('Inbound shipment arrival failed:', error.message);
+    return res.status(500).json({ success: false, error: 'Arrival was not confirmed. Refresh the inbound list before retrying. Stock quantities have not been changed.' });
+  }
+});
+
+app.get('/api/tracking', async (req, res) => {
+  const session = readNotificationSession(req);
+  if (!session) return res.status(401).json({ message: 'Sign-in required.' });
+  const clientId = normalizeClientId(req.query.clientId || session.clientId);
+  if (!isStaffSession(session) && clientId !== normalizeClientId(session.clientId)) {
+    return res.status(403).json({ message: 'You can only track items in your own account.' });
+  }
+  if (!/^CL-\d{3,}$/.test(clientId) || clientId === 'CL-000') {
+    return res.status(400).json({ message: 'Select a client account to view tracking.' });
+  }
+  res.set('Cache-Control', 'no-store');
+  try {
+    if (!(await findSheetByTitle(clientId))) return res.status(404).json({ message: 'Inventory sheet not found for this account.' });
+    const profile = await getClientProfile(clientId);
+    const items = await loadInventoryForClient(clientId, true);
+    const stages = { 'In Transit to Warehouse': 0, 'Arrived / Check-In': 1, 'Received & Verified': 1, 'In Prep': 2, 'Shipped out': 3 };
+    return res.json({
+      clientId,
+      updatedAt: new Date().toISOString(),
+      items: items.map((item) => ({
+        id: item.id, sku: item.sku, title: item.title, status: item.status,
+        stage: profile.inventoryMode === 'custom' ? stages[item.status] ?? null : null,
+        checkInTimestamp: item.checkInTimestamp || '',
+        trackingNumbers: item.trackingNumbers || [], prepInstructions: item.prepInstructions || ''
+      }))
+    });
+  } catch (error) {
+    console.error('Tracking fetch error:', error.message);
+    return res.status(error?.response?.status === 429 ? 429 : 500).json({ message: 'Unable to load ECL tracking. Please retry.' });
   }
 });
 
@@ -2034,6 +2801,7 @@ function isBillableClient(clientId) {
 app.get('/api/billing/summary', async (req, res) => {
   const session = readNotificationSession(req);
   if (!session) return res.status(401).json({ message: 'Sign-in required.' });
+  if (session.role === 'staff') return res.status(403).json({ message: 'Warehouse staff cannot access billing.' });
   try {
     const staff = isStaffSession(session);
     const clientId = staff ? normalizeClientId(req.query.clientId) : normalizeClientId(session.clientId);

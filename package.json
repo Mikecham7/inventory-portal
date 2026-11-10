@@ -5,12 +5,14 @@
   "description": "Inventory management portal connected to Google Sheets and served by Netlify.",
   "main": "api/server.js",
   "scripts": {
+    "prestart": "npm run build",
+    "predev": "npm run build",
     "start": "node api/server.js",
     "dev": "node api/server.js",
     "test": "node --test tests/portal.test.js",
     "migrate:clients": "node scripts/migrate-client-settings.js",
     "archive:chat": "node scripts/archive-chat.js",
-    "build": "echo \"No build step required for this static frontend.\""
+    "build": "node scripts/copy-scanner.js"
   },
   "keywords": [
     "inventory",
@@ -21,11 +23,14 @@
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
+    "cheerio": "1.0.0",
     "bcryptjs": "^3.0.3",
     "dotenv": "^16.4.5",
     "express": "^4.21.2",
     "google-auth-library": "^9.15.0",
     "google-spreadsheet": "^4.1.2",
+    "html5-qrcode": "^2.3.8",
+    "ipaddr.js": "^2.2.0",
     "serverless-http": "^3.0.0"
   }
 }

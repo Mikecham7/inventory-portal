@@ -9,7 +9,7 @@
     <link rel="icon" type="image/png" sizes="192x192" href="icons/icon-192.png?v=1" />
     <link rel="apple-touch-icon" sizes="180x180" href="icons/icon-180.png?v=1" />
     <meta name="theme-color" content="#0D1B2A" />
-    <link rel="stylesheet" href="styles.css?v=20261015m" />
+    <link rel="stylesheet" href="styles.css?v=20261110g" />
   </head>
   <body>
     <div class="portal-login-overlay" id="portalLoginWindow">
@@ -149,12 +149,34 @@
       <button type="button" class="tab" onclick="goToLogs()">Activity</button>
       <button type="button" class="tab" onclick="showPage('chat')">Chat</button>
       <button type="button" class="tab" id="tabBilling" onclick="showPage('billing')" style="display:none;">Billing</button>
-      <button type="button" class="tab" id="tabClients" onclick="showPage('clients')" style="display:none;">Client setup</button>
+      <button type="button" class="tab" id="tabClients" onclick="showPage('clients')" style="display:none;">Account setup</button>
+      <button type="button" class="tab" id="tabTracking" onclick="showPage('tracking')">ECL Tracking</button>
+      <button type="button" class="tab" id="tabStoreSettings" onclick="showPage('store-settings')">Settings</button>
       <button type="button" class="tab" id="tabHelp" onclick="showPage('help')">Help</button>
     </nav>
 
     <div id="loadingScreen" class="content" style="display:none;">
       <div class="loading-screen"><div class="spinner"></div>Loading portal...</div>
+    </div>
+
+    <div id="page-tracking" class="page content">
+      <header class="tracking-header">
+        <img src="https://static.wixstatic.com/media/32ab39_dfd6e4b0422f4d30ac72594477453225~mv2.png" alt="Electric City Logistics" width="64" height="64" />
+        <div><p class="tracking-eyebrow">Electric City Logistics</p><h2>ECL Tracking</h2><p>From incoming shipment to warehouse prep and dispatch.</p></div>
+      </header>
+      <section class="tracking-search" aria-label="Find a shipment">
+        <form id="trackingSearchForm">
+          <div><label for="trackingSearchInput">Tracking number, SKU or item name</label><input id="trackingSearchInput" type="search" autocomplete="off" spellcheck="false" maxlength="200" placeholder="Enter tracking number or find an item" aria-describedby="trackingSourceNote" /></div>
+          <button type="submit" class="btn-set">Find shipment</button>
+          <button type="button" class="filter-clear" id="trackingShowAll">Show all</button>
+        </form>
+        <p id="trackingSourceNote">Progress reflects ECL sheet updates, including barcode check-ins, and refreshes every 30 seconds while in use. Carrier details open in a new tab; this page does not fetch live carrier events.</p>
+        <div id="trackingCarrierPreview"></div>
+      </section>
+      <div class="tracking-toolbar"><p id="trackingSummary" role="status" aria-live="polite"></p><button type="button" class="filter-clear" id="trackingRefresh">Refresh status</button></div>
+      <div id="trackingError" class="tracking-error" role="alert" hidden></div>
+      <section id="inboundTracking" class="inbound-section" aria-label="Inbound restock shipments" hidden></section>
+      <div id="trackingResults" aria-busy="false"></div>
     </div>
 
     <div id="page-dashboard" class="page content active" style="display:block;">
@@ -171,6 +193,12 @@
         <div class="summary-card warn"><div class="num" id="s-low">—</div><div class="lbl">LOW STOCK</div></div>
         <div class="summary-card" id="s-partial-card" style="display:none;"><div class="num" id="s-partial">—</div><div class="lbl">PARTIALLY SHIPPED</div></div>
         <div class="summary-card danger"><div class="num" id="s-out">—</div><div class="lbl">OUT OF STOCK</div></div>
+      </div>
+      <section id="packagingProfile" class="update-card" aria-label="Client packaging notes" hidden></section>
+      <section id="inboundDashboard" class="inbound-section" aria-label="Inbound restock shipments" hidden></section>
+      <div class="inventory-views" id="inventoryViews" role="group" aria-label="Inventory view" hidden>
+        <button type="button" class="inventory-view" data-action="inventory-view" data-view="active" aria-pressed="true">Active / Non-Shipped</button>
+        <button type="button" class="inventory-view" data-action="inventory-view" data-view="shipped" aria-pressed="false">Shipped Items</button>
       </div>
       <div class="filter-bar">
         <div class="filter-toolbar">
@@ -194,6 +222,7 @@
         </div>
       </div>
       <div class="data-cards" id="inventoryCards"></div>
+      <p class="inventory-table-hint">Double-click an item, or focus its row and press Enter, to view details and edit permitted fields.</p>
       <div class="table-shell">
         <button class="table-scroll-btn left" id="tableScrollLeft" type="button" aria-label="Scroll left">←</button>
         <button class="table-scroll-btn right" id="tableScrollRight" type="button" aria-label="Scroll right">→</button>
@@ -215,6 +244,27 @@
 
     <div id="page-update" class="page content" style="display:none;">
       <header class="page-heading"><h2>Inventory updates</h2><p>Find an item, then update its quantities, shipment progress, or details.</p></header>
+      <div id="warehousePackagingBanner"></div>
+      <section class="update-card barcode-checkin" aria-labelledby="barcodeCheckInHeading">
+        <h3 id="barcodeCheckInHeading">Scan to check in</h3>
+        <p class="billing-hint" id="barcodeScanHint">Scan a UPC, SKU or tracking number with your USB scanner and press Enter, or use your camera. A unique active match records arrival without changing quantities. Staff access is required.</p>
+        <form id="barcodeScanForm" class="barcode-scan-form">
+          <div><label for="barcodeScanInput">UPC, SKU or tracking number</label><input id="barcodeScanInput" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" aria-describedby="barcodeScanHint" placeholder="Click here, then scan a barcode" /></div>
+          <button type="submit" class="btn-set" id="barcodeScanSubmit">Check in</button>
+          <button type="button" class="btn-set" id="barcodeCameraStart">Scan Barcode</button>
+        </form>
+        <div id="barcodeCameraPanel" hidden>
+          <div id="barcodeCameraReader"></div>
+          <button type="button" class="filter-clear" id="barcodeCameraStop">Stop camera</button>
+        </div>
+        <p id="barcodeScanMessage" class="barcode-scan-message" role="status" aria-live="polite"></p>
+        <div id="scanPackagingBanner"></div>
+        <form id="barcodeConfirmForm" class="barcode-confirm-form" hidden>
+          <div><label for="barcodeScanMatch">Matched inventory item</label><select id="barcodeScanMatch"></select></div>
+          <p id="barcodeScanPreview" class="billing-hint"></p>
+          <button type="submit" class="btn-set" id="barcodeConfirmSubmit">Check in selected item</button>
+        </form>
+      </section>
       <div class="update-card">
         <h3>Find an item</h3>
         <label for="searchInput">Search by SKU or product name</label>
@@ -223,6 +273,7 @@
           <div class="search-results" id="searchResults" style="display:none;"></div>
         </div>
         <div id="selectedItem" style="display:none;">
+          <div id="selectedPackagingBanner"></div>
           <div class="selected-banner">
             <div class="sl">SELECTED ITEM</div>
             <div class="ss" id="selSku"></div>
@@ -288,28 +339,39 @@
     </div>
 
     <div id="page-order" class="page content" style="display:none;">
-      <header class="page-heading"><h2>Add an item</h2><p>Create a new inventory record for the selected client.</p></header>
-      <div class="update-card" id="addProductCard">
-        <h3>Item information</h3>
-        <p style="color:#666;font-size:12px;margin-bottom:12px;">Adds a new item for this client. Items that track received and shipped quantities start as "Not Received" — update them from the Update tab as they arrive and ship.</p>
-        <div id="createProductReadOnlyNotice" style="display:none; color:#b45309; background:#fff7ed; border:1px solid #fed7aa; padding:8px 10px; border-radius:8px; margin-bottom:12px; font-size:12px; font-weight:700;"></div>
-        <div class="item-create-grid">
-          <div id="newProductSkuWrap">
-            <label class="ac-label" for="newProductSku">SKU (optional)</label>
-            <input type="text" id="newProductSku" class="ac-input" placeholder="A-25-Cu-01" />
+      <header class="page-heading"><h2>Add an item</h2></header>
+        <div class="update-card item-entry-card" id="addProductCard">
+          <div id="createProductReadOnlyNotice" class="item-entry-notice" role="status" style="display:none;"></div>
+          <details class="catalog-sync" id="catalogSyncPanel">
+            <summary>Sync from Website URL</summary>
+            <p>Optional: import public product details, then review and edit below. Nothing is saved until you add the item.</p>
+            <form id="catalogSyncForm">
+              <label class="ac-label" for="catalogSourceUrl">Public product page, store URL or JSON/RSS feed</label>
+              <div class="catalog-sync-controls"><input id="catalogSourceUrl" class="ac-input" type="url" maxlength="2000" placeholder="https://your-store.com/products/item" required /><button type="submit" class="btn-set" id="catalogSyncSubmit">Fetch details</button><button type="button" class="filter-clear" id="catalogManualEntry">Use manual entry</button></div>
+            </form>
+            <p id="catalogSyncMessage" role="status" aria-live="polite"></p>
+            <div id="catalogProductPicker" hidden><label class="ac-label" for="catalogProductSelect">Choose a product (up to 50 shown)</label><select class="ac-input" id="catalogProductSelect"></select><label class="catalog-replace"><input type="checkbox" id="catalogReplaceExisting" /> Replace existing title, SKU, image and bundle details</label><button class="filter-clear" type="button" id="catalogApplyProduct">Prefill selected product</button></div>
+          </details>
+            <div class="item-create-grid">
+              <div id="newProductSkuWrap">
+                <label class="ac-label" for="newProductSku">SKU (optional)</label>
+                <input type="text" id="newProductSku" class="ac-input" placeholder="A-25-Cu-01" />
+              </div>
+              <div id="newProductTitleWrap">
+                <label class="ac-label" id="newProductTitleLabel" for="newProductTitle">Product Title</label>
+                <input type="text" id="newProductTitle" class="ac-input" placeholder="Copper Marker" />
+              </div>
+              <div>
+                <label class="ac-label" for="newProductQty">Quantity</label>
+                <input type="number" id="newProductQty" class="ac-input" value="0" min="0" />
+              </div>
+              <div id="customProductFields" hidden></div>
+              <div class="item-field-wide"><img id="catalogImagePreview" alt="Product thumbnail preview" referrerpolicy="no-referrer" hidden /><p id="catalogImageMessage" role="status"></p></div>
+            </div>
+          <div class="item-entry-footer">
+            <button id="createProductSubmit" class="btn-set item-entry-submit" type="button" onclick="createProduct()">Add to inventory</button>
           </div>
-          <div id="newProductTitleWrap">
-            <label class="ac-label" id="newProductTitleLabel" for="newProductTitle">Product Title</label>
-            <input type="text" id="newProductTitle" class="ac-input" placeholder="Copper Marker" />
-          </div>
-          <div>
-            <label class="ac-label" for="newProductQty">Qty</label>
-            <input type="number" id="newProductQty" class="ac-input" value="0" min="0" />
-          </div>
-          <button id="createProductSubmit" class="btn-set" onclick="createProduct()">Add</button>
         </div>
-        <div id="customProductFields" style="margin-top:12px; display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:10px;"></div>
-      </div>
     </div>
 
     <div id="page-logs" class="page content" style="display:none;">
@@ -336,13 +398,13 @@
         <div class="identity-bar">
           <span>Session: <strong id="displayIdentity">—</strong></span>
           <span class="staff-presence" id="staffPresenceTag"><span class="pdot"></span>Staff is viewing</span>
-          <a id="driveFolderLink" href="#" target="_blank" rel="noreferrer" style="color:#0f766e; font-weight:700; text-decoration:none;">Open Drive Folder</a>
-          <span style="font-size:11px; color:#64748b;">Must be signed in with the email you provided us for Google Drive access.</span>
+          <a id="driveFolderLink" href="#" target="_blank" rel="noreferrer">Open Drive Folder</a>
+          <span class="chat-drive-hint">Must be signed in with the email you provided us for Google Drive access.</span>
         </div>
         <div class="messages-box" id="msgBox"></div>
         <div class="typing-indicator" id="typingIndicator" style="display:none;">Someone is typing…</div>
-        <div class="chat-file-row" style="padding:0 12px 10px; display:flex; gap:8px; align-items:center; background:#f8fafc; border-top:1px solid #e2e8f0;">
-          <input type="url" id="chatFileUrl" placeholder="Google Drive file URL (optional)" style="flex:1; padding:10px 12px; border:1px solid #dfe7f1; border-radius:8px; font-size:12px;" />
+        <div class="chat-file-row">
+          <input type="url" id="chatFileUrl" aria-label="Google Drive file URL (optional)" placeholder="Google Drive file URL (optional)" />
         </div>
         <div class="input-area">
           <button class="action-btn" onclick="insertEmoji('😊')" title="Smile">😊</button>
@@ -454,7 +516,40 @@
     </div>
 
     <div id="page-clients" class="page content" style="display:none;">
-      <header class="page-heading"><h2>Client setup</h2><p>Manage existing clients, onboard a new account, or reset access. Expand only what you need.</p></header>
+      <header class="page-heading"><h2>Account setup</h2><p>Manage clients and staff access. Expand only what you need.</p></header>
+      <details class="update-card section-panel" id="loginHistorySection" hidden>
+        <summary><span>Login activity<small>Administrator-only authentication audit log</small></span></summary>
+        <div class="section-body">
+          <p class="billing-hint">The most recent 100 successful sign-ins, newest first. Times are shown in your local timezone. Full history is retained in User_Logins. Restoring an existing portal session is not a new sign-in.</p>
+          <button type="button" class="btn-set" id="loginHistoryRefresh">Refresh login activity</button>
+          <p id="loginHistoryMessage" role="status" aria-live="polite"></p>
+          <div class="table-shell"><div class="table-wrap">
+            <table aria-label="Successful login activity">
+              <thead><tr><th>Timestamp</th><th>Username</th><th>Client ID</th><th>Authentication</th></tr></thead>
+              <tbody id="loginHistoryRows"></tbody>
+            </table>
+          </div></div>
+        </div>
+      </details>
+      <details class="update-card section-panel" id="staffAccountsSection" hidden>
+        <summary><span>Staff accounts<small>Administrator-only registration and staff profiles for CL-000</small></span></summary>
+        <div class="section-body">
+          <p class="billing-hint">Staff can work across client inventory and record warehouse arrivals. Only administrators can register or edit staff accounts. Existing administrator accounts are listed for reference.</p>
+          <div class="staff-accounts-toolbar"><h3>Team access</h3><button type="button" class="btn-set" id="staffAccountsRefresh">Refresh accounts</button></div>
+          <div id="staffAccountsList" class="staff-accounts-list" aria-live="polite"></div>
+          <form id="staffAccountForm" class="staff-account-form">
+            <h3 id="staffAccountFormTitle">Register staff account</h3>
+            <div class="portal-form-grid">
+              <div><label class="ac-label" for="staffAccountUsername">Username</label><input class="ac-input" id="staffAccountUsername" type="text" minlength="3" maxlength="64" required autocomplete="off" aria-describedby="staffAccountUsernameHint" /><p class="billing-hint" id="staffAccountUsernameHint">Unique sign-in name. Usernames cannot be changed after registration.</p></div>
+              <div><label class="ac-label" for="staffAccountName">Staff name</label><input class="ac-input" id="staffAccountName" type="text" maxlength="100" required /></div>
+              <div><label class="ac-label" for="staffAccountEmail">Email (optional)</label><input class="ac-input" id="staffAccountEmail" type="email" maxlength="254" /></div>
+            </div>
+            <p class="billing-hint">New staff receive a one-time activation code. They choose Create Account on the sign-in page and set their own password.</p>
+            <div class="staff-account-actions"><button type="submit" class="btn-set" id="staffAccountSave">Register staff</button><button type="button" class="filter-clear" id="staffAccountCancel" hidden>Cancel edit</button></div>
+          </form>
+          <p id="staffAccountMessage" class="staff-account-message" role="status" aria-live="polite"></p>
+        </div>
+      </details>
       <details class="update-card section-panel">
         <summary><span>Add a new client<small>Create an account, inventory sheet, and portal settings</small></span></summary>
         <div class="section-body">
@@ -491,6 +586,8 @@
             <label class="ac-label" for="acAccentColor">Accent Color (optional)</label>
             <input type="text" id="acAccentColor" placeholder="#F5C518" style="width:100%;padding:10px 12px;border:1px solid #dfe7f1;border-radius:8px;" />
           </div>
+          <div><label class="ac-label" for="acWebsiteUrl">Client Website URL (optional)</label><input class="ac-input" id="acWebsiteUrl" type="text" maxlength="2000" placeholder="https://your-company.com" /></div>
+          <div><label class="ac-label" for="acLogoUrl">Logo image URL (optional)</label><input class="ac-input" id="acLogoUrl" type="url" maxlength="2000" placeholder="https://your-company.com/logo.png" /></div>
         </div>
 
         <details class="section-panel">
@@ -501,10 +598,15 @@
           <label class="ac-check"><input type="checkbox" id="acAllowChat" checked /> Allow chat</label>
           <label class="ac-check"><input type="checkbox" id="acAllowLogs" checked /> Allow logs</label>
           <label class="ac-check"><input type="checkbox" id="acAllowUpdate" checked /> Allow update</label>
+          <label class="ac-check"><input type="checkbox" id="acEnableShippedTab" checked /> Enable Shipped/Orders View</label>
           <label class="ac-check"><input type="checkbox" id="acReadOnly" /> Read-only dashboard</label>
         </div>
 
         <div class="ac-settings-grid">
+          <div>
+            <label class="ac-label" for="acInventoryMode">Status workflow</label>
+            <select id="acInventoryMode" class="ac-input"><option value="custom">Order fulfillment</option><option value="inventory">Stock levels</option></select>
+          </div>
           <div>
             <label class="ac-label" for="acQuickEditMode">Quick Edit (table +/− buttons)</label>
             <select id="acQuickEditMode" class="ac-input" onchange="syncQuickEditPinField('ac')">
@@ -579,6 +681,8 @@
               <label class="ac-label" for="ecAccentColor">Accent Color</label>
               <input type="text" id="ecAccentColor" style="width:100%;padding:10px 12px;border:1px solid #dfe7f1;border-radius:8px;" />
             </div>
+            <div><label class="ac-label" for="ecWebsiteUrl">Client Website URL</label><input class="ac-input" id="ecWebsiteUrl" type="text" maxlength="2000" placeholder="https://your-company.com" /></div>
+            <div><label class="ac-label" for="ecLogoUrl">Logo image URL</label><input class="ac-input" id="ecLogoUrl" type="url" maxlength="2000" placeholder="https://your-company.com/logo.png" /></div>
           </div>
 
           <div style="margin-top:14px;display:flex;gap:16px;flex-wrap:wrap;">
@@ -586,6 +690,7 @@
             <label class="ac-check"><input type="checkbox" id="ecAllowChat" /> Allow chat</label>
             <label class="ac-check"><input type="checkbox" id="ecAllowLogs" /> Allow logs</label>
             <label class="ac-check"><input type="checkbox" id="ecAllowUpdate" /> Allow update</label>
+            <label class="ac-check"><input type="checkbox" id="ecEnableShippedTab" /> Enable Shipped/Orders View</label>
             <label class="ac-check"><input type="checkbox" id="ecReadOnly" /> Read-only dashboard</label>
           </div>
           </div>
@@ -593,6 +698,10 @@
           </div>
 
           <div class="ac-settings-grid">
+            <div>
+              <label class="ac-label" for="ecInventoryMode">Status workflow</label>
+              <select id="ecInventoryMode" class="ac-input"><option value="inventory">Stock levels</option><option value="custom">Order fulfillment</option></select>
+            </div>
             <div>
               <label class="ac-label" for="ecQuickEditMode">Quick Edit (table +/− buttons)</label>
               <select id="ecQuickEditMode" class="ac-input" onchange="syncQuickEditPinField('ec')">
@@ -663,6 +772,54 @@
       </details>
     </div>
 
+    <div id="page-store-settings" class="page content" style="display:none;">
+      <header class="page-heading"><h2>Settings</h2><p>Manage your client preferences and optional store configuration.</p></header>
+      <section class="update-card store-settings-card" id="settingsBranding" aria-label="Client website and branding" hidden>
+        <h3>Client website &amp; branding</h3>
+        <div id="settingsBrandingForm"></div>
+      </section>
+      <section id="settingsPackagingProfile" class="update-card store-settings-card" aria-label="Client packaging settings" hidden></section>
+      <section class="update-card store-settings-card" data-owner-settings>
+        <h3>Appearance</h3>
+        <p class="integration-description">Switch between light and dark mode. Your preference is saved in this browser.</p>
+        <button type="button" class="filter-clear" data-action="toggle-theme">Toggle light / dark mode</button>
+      </section>
+      <div class="update-card store-settings-card" data-owner-settings>
+        <h3>Optional store API integration</h3>
+        <p class="integration-notice" role="note"><strong>Still in development / Beta (testing):</strong> API integration may not work correctly and may change. Do not rely on it for order processing. Saving configuration does not activate automatic order sync.</p>
+        <p class="integration-notice"><strong>API integration is completely optional for every platform.</strong> Manual inventory management and <strong>Add item &rarr; Sync from Website URL</strong> remain fully supported without API keys. Public URL imports depend on the product metadata a website makes available; manual entry is always available.</p>
+        <p class="integration-description">Saving these settings does not connect to your store, validate credentials, import orders, or create a webhook. Automatic order sync is not enabled in this portal.</p>
+        <button type="button" class="filter-clear" onclick="openIntegrationGuide()">Read the store integration guide</button>
+        <p id="storeConnectionStatus" role="status" aria-live="polite"></p>
+        <button type="button" class="filter-clear" id="storeConnectionReload">Reload settings</button>
+        <form id="storeConnectionForm" autocomplete="off">
+          <fieldset id="storeConnectionFields" disabled>
+            <div class="ac-settings-grid">
+              <div><label class="ac-label" for="storePlatform">Platform</label><select class="ac-input" id="storePlatform"><option value="shopify">Shopify</option><option value="woocommerce">WooCommerce</option><option value="bigcommerce">BigCommerce</option><option value="amazon">Amazon</option><option value="wix">Wix</option><option value="custom">Other / Custom Storefront</option></select></div>
+              <div><label class="ac-label" for="storeDomain">Store address</label><input class="ac-input" id="storeDomain" type="text" maxlength="500" placeholder="your-store.myshopify.com" required /></div>
+            </div>
+            <p id="storeCredentialStatus" class="integration-description"></p>
+            <p id="storeStorageWarning" class="integration-notice" hidden>Encrypted credential storage is not configured on the API server. You can save the platform and domain without credentials or connection details. Ask ECL to configure STORE_INTEGRATION_KEY before entering tokens or connection details.</p>
+            <div id="shopifyCredentialFields"><label class="ac-label" for="storeAccessToken">Admin API access token (optional)</label><input class="ac-input" id="storeAccessToken" type="password" maxlength="4096" autocomplete="new-password" placeholder="Leave blank to keep saved credentials" /></div>
+            <div id="wooCredentialFields" class="ac-settings-grid" hidden>
+              <div><label class="ac-label" for="storeConsumerKey">Consumer Key (optional)</label><input class="ac-input" id="storeConsumerKey" type="password" maxlength="4096" autocomplete="new-password" placeholder="ck_..." /></div>
+              <div><label class="ac-label" for="storeConsumerSecret">Consumer Secret (optional)</label><input class="ac-input" id="storeConsumerSecret" type="password" maxlength="4096" autocomplete="new-password" placeholder="cs_..." /></div>
+            </div>
+            <div id="genericCredentialFields" hidden>
+              <label class="ac-label" for="storeApiToken">API token / key (optional)</label>
+              <input class="ac-input" id="storeApiToken" type="password" maxlength="4096" autocomplete="new-password" placeholder="Leave blank to keep saved credentials" />
+              <label class="ac-label" for="storeConnectionDetails">Additional connection details (optional)</label>
+              <textarea class="ac-input" id="storeConnectionDetails" rows="4" maxlength="5000" autocomplete="off" placeholder="For example: store hash, seller / marketplace ID, Wix site ID, API endpoint or developer-provided connection notes"></textarea>
+              <p class="integration-description">Details are encrypted and never displayed again. Do not enter your store login password. Saving these values does not authorize an app, exchange tokens, or enable an Amazon, BigCommerce, Wix or custom API connection. When replacing saved credentials, re-enter all token/key and connection details you want to keep.</p>
+            </div>
+            <label class="store-remove-label"><input id="storeRemoveCredentials" type="checkbox" /> Remove saved credentials on save</label>
+            <p class="integration-description">Blank credential fields keep existing credentials for the same store. Tokens are encrypted before storage and are never displayed again. Keep your own secure copy; revoke tokens in your store if access is no longer needed.</p>
+            <div class="store-actions"><button type="submit" class="btn-set">Save configuration</button><button type="button" class="filter-clear" id="storeDisconnect">Remove configuration</button></div>
+          </fieldset>
+        </form>
+      </div>
+    </div>
+
     <div id="page-help" class="page content" style="display:none;">
       <header class="page-heading help-heading">
         <div>
@@ -678,6 +835,102 @@
         <input type="search" id="faqSearch" class="ac-input" placeholder="e.g. password, add item, activity..." autocomplete="off" oninput="filterFaq()" aria-describedby="faqCount" />
         <p class="faq-count" id="faqCount" role="status" aria-live="polite"></p>
         <div class="faq-list" id="faqList">
+          <details class="faq-item" data-keywords="branding logo website color colour accent scrape theme header">
+            <summary>How do I personalize my client logo and brand color?</summary>
+            <div class="faq-answer">
+              <p>Open Settings &rarr; Client website &amp; branding. Enter your public Client Website URL and select Fetch website branding. The portal looks for logo images, Apple touch icons or Open Graph images, plus primary brand CSS colors, supported storefront theme settings and theme-color metadata. Up to two public stylesheets, including CDN-hosted theme files, may be inspected; site scripts are never executed.</p>
+              <p>Review the results, paste a different public logo image URL or a hex color such as #2463EB if needed, and select Save branding. Fetching alone never changes saved branding. Missing metadata or blocked websites show a message and do not prevent manual entry. Blank logo/color fields restore ECL defaults. This does not require an API connection and does not connect your store or sync products.</p>
+              <p>Clients can edit only their own branding. Administrators and warehouse staff can edit the selected client's branding. Changes apply to the dashboard header and active navigation/buttons with contrasting text. Image palettes are not analyzed; CSS/theme metadata provides the automatic color suggestion.</p>
+            </div>
+          </details>
+          <details class="faq-item" data-keywords="roles permissions admin administrator warehouse staff client billing access security">
+            <summary>What can each portal role access?</summary>
+            <div class="faq-answer">
+              <p><strong>Administrators</strong> can switch client accounts, manage client configuration and staff, and access billing and system settings.</p>
+              <p><strong>Warehouse staff</strong> can switch accounts for receiving, barcode check-in, inspection, fulfillment updates and activity logs. Administrators and warehouse staff can add inventory even when an account is view-only for its client. Staff Settings contains client branding only; warehouse staff cannot access billing, master settings, staff management or store credentials.</p>
+              <p><strong>Clients</strong> can access only their own inventory, inbound shipments, tracking, chat and activity. Item editing still follows their account's inventory permissions. Clients can maintain their own packaging notes and optional store configuration; billing is available only when shared by an administrator. The API enforces account boundaries as well as hiding restricted controls.</p>
+            </div>
+          </details>
+          <details class="faq-item" id="integrationGuide" data-keywords="store integration optional api keys shopify woocommerce bigcommerce amazon wix custom token webhook url sync manual scraping public feed consumer secret settings automation">
+            <summary>Store integrations: optional setup guide for Shopify, WooCommerce, BigCommerce, Amazon, Wix and custom stores</summary>
+            <div class="faq-answer integration-guide">
+              <p class="integration-notice"><strong>Beta (testing):</strong> Store integration settings are still being tested and may change. Automatic order sync is not enabled.</p>
+              <h3>Choose how you want to work</h3>
+              <p><strong>API integration is completely optional.</strong> You can manage everything manually, use public URL product imports, or prepare API configuration for a future integration. No subscription to an API service or store token is required for manual entry.</p>
+              <ol>
+                <li><strong>Manual:</strong> open Add item, type the product details, quantities, image URL and bundle information, then save. Double-click an inventory row to edit it later, subject to your account permissions.</li>
+                <li><strong>Public product URL or feed:</strong> open Add item &rarr; Sync from Website URL, paste a public product page, store homepage or JSON/RSS feed, and select Fetch details. Select one product, prefill, review and save. Imports support public Open Graph/JSON product metadata; supported Shopify homepages can discover a public products feed. Login-only pages, blocked sites or missing metadata may require a direct feed URL or manual entry.</li>
+                <li><strong>Optional API configuration:</strong> open Settings, choose a platform and enter your store address. Credentials are optional. Saving configuration alone does <strong>not</strong> validate keys, fetch orders, schedule synchronization or activate webhooks.</li>
+              </ol>
+              <h3>Before generating credentials</h3>
+              <ul>
+                <li>Use a store-owner account or ask your authorized store administrator. Never send tokens through portal Chat, email, screenshots, public feeds or URL query parameters.</li>
+                <li>Coordinate the required data and permissions with ECL first. Prefer read-only product/order access; do not grant write or broad customer access unless a separately approved integration requires it.</li>
+                <li>If Settings says encrypted storage is unavailable, save only your domain. ECL must configure its encryption key before you enter credentials. Stored tokens are never returned to the browser or exposed in profiles.</li>
+              </ul>
+              <h3>Shopify: create an app and obtain an access token</h3>
+              <ol>
+                <li>Find the permanent <strong>your-store.myshopify.com</strong> domain in your Shopify store settings. Use this in portal Settings, rather than a storefront custom domain.</li>
+                <li>With your store administrator/developer, open the <a href="https://dev.shopify.com/dashboard/" target="_blank" rel="noopener noreferrer">Shopify Dev Dashboard</a>, create an app, and configure a version with the minimum agreed Admin API scopes (for example read_products or read_orders). Order/customer data can require additional Shopify approval.</li>
+                <li>Release the app version and install the app on the intended store. Approve only the required scopes.</li>
+                <li>For an app and store belonging to the <strong>same Shopify organization</strong>, a developer can obtain a token server-side using the client credentials grant. The Client ID and Client secret are under the app's Settings in the Dev Dashboard. Exchange them with Shopify's token endpoint on the server; do not put the Client secret in this portal's Access token field.</li>
+                <li>New Dev Dashboard apps do not show an Admin API token to copy from Shopify admin. Client-credentials tokens expire after about 24 hours and require renewal. An app for another merchant needs the appropriate Shopify authorization/install flow, not this same-organization grant. This portal does not implement token exchange, OAuth or automatic renewal.</li>
+                <li>Only if you already have an appropriate Admin API access token, paste it into Settings &rarr; Shopify &rarr; Admin API access token. If you have an older custom app with an existing valid token, it may be used for configuration. Select Save configuration and keep a secure copy.</li>
+              </ol>
+              <p>Follow Shopify's current <a href="https://shopify.dev/docs/apps/build/authentication-authorization/client-credentials-grant" target="_blank" rel="noopener noreferrer">token setup guide</a> and <a href="https://shopify.dev/docs/apps/build/dev-dashboard/create-apps-using-dev-dashboard" target="_blank" rel="noopener noreferrer">Dev Dashboard app guide</a>. Store interfaces and eligibility can vary; involve your developer if the options differ.</p>
+              <h3>WooCommerce: generate a Consumer Key and Secret</h3>
+              <ol>
+                <li>In WordPress, go to Settings &rarr; Permalinks and choose a format other than Plain. Ensure your store uses HTTPS.</li>
+                <li>Go to WooCommerce &rarr; Settings &rarr; Advanced &rarr; REST API. Choose Add Key / Create an API key.</li>
+                <li>Use a recognizable description, such as ECL optional integration, and select an authorized WordPress user. Start with <strong>Read</strong> permissions for future product/order imports.</li>
+                <li>Select Generate API Key. Copy the <strong>Consumer Key (ck_...)</strong> and <strong>Consumer Secret (cs_...)</strong> into a secure password manager. The secret is shown only once.</li>
+                <li>In portal Settings, choose WooCommerce, enter the HTTPS store base address (including a WordPress subdirectory if applicable), and enter both credentials. Save configuration. Do not enter your WordPress password.</li>
+              </ol>
+              <p>See the official <a href="https://woocommerce.com/document/woocommerce-rest-api/" target="_blank" rel="noopener noreferrer">WooCommerce REST API key guide</a>.</p>
+              <h3>BigCommerce, Amazon, Wix and Other / Custom Storefront</h3>
+              <ol>
+                <li>In Settings, select the platform and enter its public HTTPS store address or storefront page. Use a URL without query parameters or fragments; you can keep a storefront path. For Amazon, use a public seller/storefront address, not a Seller Central login or authorization URL.</li>
+                <li>Save the address alone if you do not need credentials. Manual management and public URL product sync remain supported for every platform; some sites restrict metadata access, so manual entry may be needed.</li>
+                <li>Only if preparing a future integration with your developer, enter an optional API token/key and additional connection details. Examples include a BigCommerce store hash, Amazon seller/marketplace identifiers, Wix site ID, or a custom API endpoint. Platform-specific authorization and scopes must be arranged separately. Never enter your store login password.</li>
+                <li>Save configuration. Optional connection details are encrypted like credentials, are never returned to the browser, and require server-side encrypted storage. Leave both optional fields blank to preserve existing values for the same platform/address. To replace them, re-enter all values you want retained; select Remove saved credentials to clear them.</li>
+              </ol>
+              <p><strong>Configuration only, still in development:</strong> these options do not activate API connectors, OAuth, token exchange, credential validation, webhook receivers or automatic order sync.</p>
+              <h3>Webhooks: prepare only after a receiver is provisioned</h3>
+              <p><strong>This portal currently has no order webhook receiver and does not generate a webhook URL.</strong> A webhook URL is the receiving service's HTTPS endpoint, not your store URL or this portal's home page. Ask ECL for an approved, client-specific endpoint and signing-secret instructions when an automation service is actually available. Do not activate a webhook against a guessed URL.</p>
+              <ol>
+                <li>Agree with ECL which events and fields are needed, how SKUs/client accounts map, how duplicate deliveries are handled, and whether a test environment is available.</li>
+                <li><strong>Shopify:</strong> once ECL provides a working receiver, open Settings &rarr; Notifications &rarr; Webhooks in Shopify admin (where available), select Create webhook, choose the agreed order event and JSON format, paste the approved HTTPS URL, select the supported API version and save. Developer-managed apps may register subscriptions through Shopify's APIs instead.</li>
+                <li><strong>WooCommerce:</strong> open WooCommerce &rarr; Settings &rarr; Advanced &rarr; Webhooks &rarr; Add webhook. Set a name, agreed order topic, Delivery URL and a dedicated Secret. Keep it Paused until ECL is ready, then set Active and Save webhook. WooCommerce sends an initial ping when activated.</li>
+                <li>Exchange webhook signing secrets only through an approved secure channel. The receiver must verify Shopify/WooCommerce signatures and bind each webhook to the correct client before accepting events. Do not paste a webhook signing secret into the API-token fields.</li>
+                <li>Send a test event and have ECL confirm its receipt and mapping. Only then enable automated processing. Monitor delivery logs and failure alerts; webhook setup alone is not proof that orders are syncing.</li>
+              </ol>
+              <p>Official instructions: <a href="https://help.shopify.com/en/manual/fulfillment/setup/notifications/webhooks" target="_blank" rel="noopener noreferrer">Shopify webhooks</a> and <a href="https://woocommerce.com/document/webhooks/" target="_blank" rel="noopener noreferrer">WooCommerce webhooks</a>.</p>
+              <h3>Change, remove or troubleshoot a connection</h3>
+              <ul>
+                <li>Blank token fields preserve saved credentials for the same platform/domain. Enter replacement credentials to rotate them. Changing the store requires replacement credentials or selecting Remove saved credentials.</li>
+                <li>Remove configuration deletes the portal's saved domain and encrypted credentials. It does <strong>not</strong> revoke tokens, uninstall apps or delete webhooks in your store; do those separately in Shopify/WooCommerce.</li>
+                <li>A saved-credentials indicator means encrypted data is stored, not that Shopify/WooCommerce accepted it. This configuration view does not test credentials or renew expired Shopify tokens.</li>
+                <li>For public URL imports that fail, try a single public product page or a smaller feed (up to 2 MB / 50 product choices), or continue manually. You do not need to configure an API connection to resolve this.</li>
+                <li>If you need assistance, message ECL with the platform and error description only, never the secret. Manual management remains fully supported before, during and after integration setup.</li>
+              </ul>
+            </div>
+          </details>
+          <details class="faq-item" data-keywords="inbound restock shipment notify expected contents sku boxes dock scan tracking arrival">
+            <summary>How do I notify ECL about incoming restock boxes?</summary>
+            <div class="faq-answer">
+              <p>Stock-level accounts can select <strong>Notify Restock / Add Inbound Shipment</strong> on Dashboard or ECL Tracking, even when inventory editing is restricted. Enter the carrier, tracking number, expected delivery date and one SKU/expected-quantity line per item. Log one tracking number per shipment, then select Notify warehouse.</p>
+              <p>The inbound section shows en-route and arrived shipments with their expected contents. ECL staff select the client account, focus the <strong>Dock scan</strong> field, scan the tracking barcode with a USB scanner and press Enter. Staff can also use a shipment's arrival button. If a number matches more than one record, use the button on the correct shipment.</p>
+              <p>Arrival records include the time and staff member. Notifications and arrival scans <strong>never change stock quantities</strong>; physical contents must still be verified through the normal inventory workflow. This log reflects ECL check-ins, not live carrier delivery events.</p>
+            </div>
+          </details>
+          <details class="faq-item" data-keywords="packaging prep special instructions sop standard operating procedure bubble wrap thank you card">
+            <summary>Where do I save packaging and prep instructions?</summary>
+            <div class="faq-answer">
+              <p>In Settings, choose <strong>Edit client packaging notes</strong> under Standard Operating Procedure / Packaging Notes. Saved notes appear read-only on Dashboard and apply to every item in your account; an empty notes section is not shown on Dashboard. Clients can maintain their own notes even if inventory is view-only; administrators can edit notes for the selected client. Optional API integration in Settings is still in development and may not work correctly.</p>
+              <p>For SKU-specific requirements, use <strong>Special Prep Instructions</strong> in Add item or the item detail/edit view, subject to normal item-editing permissions. Each field supports up to 5,000 characters.</p>
+              <p>ECL staff see client-wide rules and item instructions together during receiving/check-in, item inspection, and prep/packing updates, as well as ECL Tracking. Neither field replaces the other. Inbound restock cards show prep instructions for SKUs already present in inventory; unknown SKUs must be reviewed separately. Contact ECL if instructions conflict.</p>
+            </div>
+          </details>
           <details class="faq-item" data-keywords="new item create sku product add inventory">
             <summary>How do I add a new inventory item?</summary>
             <div class="faq-answer">
@@ -784,6 +1037,61 @@
       </div>
     </div>
 
+    <dialog class="inventory-item-dialog" id="packagingDialog" aria-labelledby="packagingDialogTitle">
+      <form id="packagingForm">
+        <header class="inventory-dialog-header">
+          <h2 id="packagingDialogTitle">Client packaging notes</h2>
+          <button type="button" class="inventory-dialog-close" id="packagingClose" aria-label="Close packaging notes">&times;</button>
+        </header>
+        <p class="inventory-dialog-hint">These instructions apply to all items for this client. SKU-specific instructions are shown alongside them, not instead of them.</p>
+        <label for="packagingNotesInput">Standard Operating Procedure / Packaging Notes</label>
+        <textarea id="packagingNotesInput" rows="7" maxlength="5000" placeholder="Include custom thank-you card in all boxes"></textarea>
+        <p id="packagingError" class="inventory-dialog-error" role="alert"></p>
+        <footer class="inventory-dialog-footer"><button type="submit" class="btn-set" id="packagingSave">Save packaging notes</button></footer>
+      </form>
+    </dialog>
+
+    <dialog class="inventory-item-dialog" id="inboundDialog" aria-labelledby="inboundDialogTitle" aria-describedby="inboundDialogHint">
+      <form id="inboundForm">
+        <header class="inventory-dialog-header">
+          <div><p class="inventory-dialog-eyebrow">INBOUND RESTOCK</p><h2 id="inboundDialogTitle">Notify an inbound shipment</h2></div>
+          <button type="button" class="inventory-dialog-close" id="inboundClose" aria-label="Close inbound shipment">&times;</button>
+        </header>
+        <p id="inboundDialogHint" class="inventory-dialog-hint">Tell the warehouse what is on its way. This notification does not change stock quantities. Log one tracking number per shipment.</p>
+        <fieldset id="inboundFields" class="inbound-fields">
+          <div class="inventory-dialog-fields">
+            <div><label for="inboundCarrier">Carrier</label><select id="inboundCarrier" required><option value="">Choose carrier</option><option>UPS</option><option>FedEx</option><option>USPS</option><option>DHL</option><option>Other</option></select></div>
+            <div><label for="inboundTrackingNumber">Tracking number</label><input id="inboundTrackingNumber" maxlength="200" required autocomplete="off" /></div>
+            <div class="detail-wide"><label for="inboundExpectedDate">Expected delivery date</label><input id="inboundExpectedDate" type="date" required /></div>
+          </div>
+          <h3 class="inbound-contents-title">Expected contents</h3>
+          <div id="inboundContents"></div>
+          <datalist id="inboundSkuOptions"></datalist>
+          <button type="button" class="filter-clear" id="inboundAddLine">Add SKU line</button>
+        </fieldset>
+        <p id="inboundError" class="inventory-dialog-error" role="alert"></p>
+        <footer class="inventory-dialog-footer"><button type="submit" class="btn-set" id="inboundSave">Notify warehouse</button></footer>
+      </form>
+    </dialog>
+
+    <dialog class="inventory-item-dialog" id="inventoryItemDialog" aria-labelledby="inventoryItemTitle" aria-describedby="inventoryItemHint">
+      <form id="inventoryItemForm">
+        <header class="inventory-dialog-header">
+          <div><p class="inventory-dialog-eyebrow">ITEM DETAILS</p><h2 id="inventoryItemTitle">Item details</h2></div>
+          <button type="button" class="inventory-dialog-close" id="inventoryItemClose" aria-label="Close item details">&times;</button>
+        </header>
+        <p id="inventoryItemHint" class="inventory-dialog-hint"></p>
+        <div id="itemPackagingBanner"></div>
+        <div class="inventory-dialog-fields" id="inventoryItemFields"></div>
+        <div class="inventory-dialog-pin" id="inventoryItemPinWrap" hidden>
+          <label for="inventoryItemPin">Quick Edit PIN</label>
+          <input type="password" id="inventoryItemPin" maxlength="32" autocomplete="off" />
+        </div>
+        <p class="inventory-dialog-error" id="inventoryItemError" role="alert"></p>
+        <footer class="inventory-dialog-footer"><button type="submit" id="inventoryItemSave">Save changes</button></footer>
+      </form>
+    </dialog>
+
     <div class="pin-overlay" id="pinOverlay">
       <div class="pin-box">
         <h3 id="pinTitle">Protected Action</h3>
@@ -799,6 +1107,7 @@
     <div class="footer">Electric City Logistics LLC &nbsp;|&nbsp; eclsupport@electriccitylogistics.com &nbsp;|&nbsp; (406)-948-2719</div>
     <div class="toast" id="toast"></div>
 
-    <script src="app.js?v=20261015m"></script>
+    <script src="vendor/html5-qrcode.min.js"></script>
+    <script src="app.js?v=20261110p"></script>
   </body>
 </html>

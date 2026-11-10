@@ -62,7 +62,6 @@ const CLIENT_INVENTORY_FIELDS = {
     requirePin: false,
     fields: [
       { key: 'upc', label: 'UPC', type: 'text' },
-      { key: 'productDescription', label: 'Product Description', type: 'textarea' },
       { key: 'quantityOrdered', label: 'Quantity Ordered', type: 'number' },
       { key: 'quantityReceived', label: 'Quantity Received', type: 'number', readOnly: true },
       { key: 'quantityShipped', label: 'Quantity Shipped', type: 'number', readOnly: true },

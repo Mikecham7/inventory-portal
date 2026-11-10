@@ -1,4 +1,5 @@
 node_modules/
+frontend/vendor/
 .env
 .env.local
 .netlify/

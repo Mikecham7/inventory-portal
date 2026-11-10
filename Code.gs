@@ -11,7 +11,7 @@
  *
  * CL-002 sheet column layout (data rows start at row 2, no header block):
  *   Col A  (0)  = UPC
- *   Col B  (1)  = Product Description
+ *   Col B  (1)  = Product Title (legacy Product Description column, retained in place)
  *   Col C  (2)  = Quantity Ordered
  *   Col D  (3)  = Quantity Received
  *   Col E  (4)  = Quantity Shipped
@@ -32,6 +32,33 @@
  *   Col E (4) = Email          ← used for Google auto-login
  *   Col F (5) = Edit_PIN       ← per-row PIN for unlocking edits.
  *                                 Leave blank to fall back to the default "646".
+ *   Role is resolved by header and must be admin, staff or client. Explicit roles override Client_ID.
+ *   Legacy blank roles default to admin for CL-000 and client otherwise; the portal persists this on login.
+ *   Express enforces signed-session account scoping; warehouse staff cannot access master settings or billing.
+ *   Staff registration and profile edits use the administrator-only portal API.
+ *   Client_Settings_JSON.enableShippedTab defaults to true; explicit false keeps all inventory together.
+ *   Custom inventory uses fulfillment stages. The portal API appends Status to legacy shipment sheets;
+ *   only staff can edit stages. Quantity check-in defaults to Arrived / Check-In; full shipment sets Shipped out.
+ *   ECL Tracking reads these sheet stages and Check_In_Timestamp through the authenticated portal API.
+ *   Arrived at Warehouse is an alias for Arrived / Check-In. Carrier links do not fetch live carrier events.
+ *   Optional public catalog imports run through /api/catalog/sync, then require manual review and save.
+ *   Product Image URL, Is Bundled and Bundle Quantity reuse existing columns or append after existing data.
+ *   Website access is public-only; authenticated stores and feeds over 2 MB use manual entry instead.
+ *   Optional store configuration uses appended Store_Integration_JSON (platform/domain) and
+ *   Store_Integration_Secret (AES-256-GCM ciphertext) in User_Credentials via the authenticated API.
+ *   Platforms: Shopify, WooCommerce, BigCommerce, Amazon, Wix and custom storefronts.
+ *   Optional API tokens and extra connection details are encrypted; configuration does not enable sync.
+ *   Website_URL and Logo_URL append client branding metadata; Accent_Color stores its editable hex color.
+ *   Branding lookup and account-scoped saves run through the authenticated Express API.
+ *   Never place plaintext API tokens or STORE_INTEGRATION_KEY in the sheet or return ciphertext in profiles.
+ *   Saving configuration does not enable automatic order sync or provision a webhook receiver.
+ *   Stock-client restock notices use the dedicated Inbound_Shipments sheet via /api/inbound-shipments.
+ *   Headers: Shipment_ID, Client_ID, Carrier, Tracking_Number, Expected_Delivery_Date, Contents_JSON,
+ *   Status, Created_At, Created_By, Arrived_At, Arrived_By. Contents_JSON holds [{sku, quantity}].
+ *   Only ECL staff record arrivals by tracking barcode; inbound notices never change inventory quantities.
+ *   Packaging_Notes in User_Credentials holds client-wide SOP text (up to 5000 characters).
+ *   Special Prep Instructions is per-SKU metadata, appended without moving legacy inventory columns.
+ *   The portal shows both instructions at receiving/check-in, item inspection and fulfillment updates.
  */
 
 var CHAT_DRIVE_FOLDERS = {
@@ -87,11 +114,33 @@ function splitCL002Notes(notesStr, rowKey) {
   return { userNote: userNoteParts.join(" | "), logEntries: logEntries };
 }
 
+function fulfillmentStatus_(saved, received, shipped) {
+  var status = String(saved || "").trim();
+  var stages = ["In Transit to Warehouse", "Arrived / Check-In", "Received & Verified", "In Prep", "Shipped out"];
+  if ((Number(shipped) > 0 && Number(shipped) >= Number(received)) || /^(shipped|fully shipped|delivered|shipped out)$/i.test(status)) return stages[4];
+  if (/^arrived at warehouse$/i.test(status)) return stages[1];
+  if (stages.indexOf(status) >= 0) return status === stages[0] && Number(received) > 0 ? stages[1] : status;
+  return Number(received) > 0 ? stages[1] : stages[0];
+}
+
 function getInventoryData(clientId) {
   try {
     var sheetName = (clientId === "CL-000" || !clientId) ? "CL-001" : clientId;
     var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(sheetName);
     if (!sheet) throw new Error("Inventory sheet '" + sheetName + "' could not be found.");
+
+    if (getClientProfile(sheetName).inventoryMode === "custom") {
+      var grid = sheet.getDataRange().getValues();
+      var headers = grid[0].map(function(value) { return String(value || "").trim().toLowerCase(); });
+      var titleIndex = headers.findIndex(function(value) { return /product.*(title|description|name)/.test(value); });
+      if (titleIndex < 0) titleIndex = 1;
+      var qtyIndex = headers.indexOf("qty");
+      if (qtyIndex < 0) qtyIndex = headers.indexOf("quantity ordered");
+      return grid.slice(1).filter(function(row) { return row[titleIndex]; }).map(function(row) {
+        return [sheetName, row[0], row[titleIndex], Number(row[qtyIndex]) || 0,
+          fulfillmentStatus_(row[headers.indexOf("status")], row[headers.indexOf("quantity received")], row[headers.indexOf("quantity shipped")])];
+      });
+    }
 
     var lastRow = sheet.getLastRow();
     if (lastRow < 9) return [];
@@ -236,15 +285,17 @@ function getCL002ShipmentData() {
     var lastRow = sheet.getLastRow();
     if (lastRow < 2) return [];
 
-    var range = sheet.getRange(2, 1, lastRow - 1, 13);
+    var width = Math.max(13, sheet.getLastColumn());
+    var statusHeaders = sheet.getRange(1, 1, 1, width).getValues()[0].map(function(value) { return String(value || "").trim().toLowerCase(); });
+    var range = sheet.getRange(2, 1, lastRow - 1, width);
     var values = range.getValues();
     var results = [];
 
     for (var i = 0; i < values.length; i++) {
       var row = values[i];
       var rowNumber = 2 + i;
-      var desc = row[1] ? row[1].toString().trim() : "";
-      if (desc === "" || desc === "Product Description") continue;
+      var desc = getCL002DisplayTitle(row);
+      if (!desc) continue;
 
       var qtyOrdered  = row[2] ? row[2].toString().trim() : "";
       var qtyReceived = row[3] ? row[3].toString().trim() : "";
@@ -267,19 +318,8 @@ function getCL002ShipmentData() {
       var bundleQty   = row[11] ? row[11].toString().trim() : "";
       var expDate     = row[5] ? row[5].toString().trim() : "";
 
-      var noteForStatus = notesParsed.userNote.toUpperCase();
-      var status = "";
-      if (noteForStatus.indexOf("RETURNED") !== -1) {
-        status = "Returned";
-      } else if (typeof shipped === "number" && typeof received === "number" && shipped >= received && received > 0) {
-        status = "Shipped";
-      } else if (typeof received === "number" && received > 0) {
-        status = "In Prep";
-      } else {
-        status = "Pending";
-      }
-
-      var isActive = (status === "Pending" || status === "In Prep");
+      var status = fulfillmentStatus_(row[statusHeaders.indexOf("status")], received, shipped);
+      var isActive = status !== "Shipped out";
 
       results.push({
         rowNumber:        rowNumber,
@@ -296,6 +336,8 @@ function getCL002ShipmentData() {
         transparencyCode: transCode,
         bundled:          bundled,
         bundleQty:        bundleQty,
+        imageUrl:         String(row[statusHeaders.indexOf("product image url")] || ""),
+        prepInstructions: String(row[statusHeaders.indexOf("special prep instructions")] || ""),
         expDate:          expDate,
         notes:            notesParsed.userNote,
         notesRaw:         rawNotes,
@@ -310,6 +352,12 @@ function getCL002ShipmentData() {
     Logger.log("getCL002ShipmentData error: " + err.toString());
     throw new Error(err.message);
   }
+}
+
+function getCL002DisplayTitle(row) {
+  var description = String(row[1] == null ? "" : row[1]).trim();
+  if (description === "Product Description") return "";
+  return description || String(row[0] == null ? "" : row[0]).trim() || String(row[7] == null ? "" : row[7]).trim();
 }
 
 function getCL002ActivityLog() {
@@ -327,8 +375,8 @@ function getCL002ActivityLog() {
     for (var i = 0; i < values.length; i++) {
       var row = values[i];
       var rowNumber = 2 + i;
-      var desc = row[1] ? row[1].toString().trim() : "";
-      if (desc === "" || desc === "Product Description") continue;
+      var desc = getCL002DisplayTitle(row);
+      if (!desc) continue;
 
       var rawNotes = row[12] ? row[12].toString().trim() : "";
       if (!rawNotes) continue;
@@ -351,6 +399,12 @@ function getCL002ActivityLog() {
 
 function updateCL002Row(rowNumber, fields) {
   try {
+    fields = Object.assign({}, fields);
+    validateCatalogDetails_(fields);
+    if (!fields.hasOwnProperty("description")) {
+      if (fields.hasOwnProperty("title")) fields.description = fields.title;
+      else if (fields.hasOwnProperty("productDescription")) fields.description = fields.productDescription;
+    }
     rowNumber = parseInt(rowNumber);
     if (!rowNumber || rowNumber < 2) return { success: false, message: "Invalid row." };
 
@@ -363,6 +417,16 @@ function updateCL002Row(rowNumber, fields) {
       expDate: 6, merchant: 7, asin: 8, fulfillment: 9, transparencyCode: 10,
       bundled: 11, bundleQty: 12
     };
+    if (fields.hasOwnProperty("imageUrl")) {
+      var image = validateProductImageUrl_(fields.imageUrl);
+      var imageColumn = ensureProductImageColumn_(sheet);
+      fields.imageUrl = image;
+      colMap.imageUrl = imageColumn;
+    }
+    if (fields.hasOwnProperty("prepInstructions")) {
+      fields.prepInstructions = validatePrepInstructions_(fields.prepInstructions);
+      colMap.prepInstructions = ensurePrepInstructionsColumn_(sheet);
+    }
 
     var changedDescriptions = [];
     Object.keys(colMap).forEach(function(key) {
@@ -372,7 +436,7 @@ function updateCL002Row(rowNumber, fields) {
       var cell = sheet.getRange(rowNumber, col);
       var oldVal = cell.getValue();
       if (oldVal.toString().trim() === (newVal === null || newVal === undefined ? "" : newVal.toString().trim())) return;
-      cell.setValue(newVal);
+      cell.setValue(key === "prepInstructions" && String(newVal).charAt(0) === "=" ? "'" + newVal : newVal);
       changedDescriptions.push(key + ": '" + oldVal + "' → '" + newVal + "'");
     });
 
@@ -409,6 +473,7 @@ function updateCL002Row(rowNumber, fields) {
 
 function addCL002Row(fields) {
   try {
+    validateCatalogDetails_(fields);
     var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("CL-002");
     if (!sheet) return { success: false, message: "CL-002 sheet not found." };
 
@@ -420,7 +485,7 @@ function addCL002Row(fields) {
 
     var newRow = [
       fields.upc || "",
-      fields.description || "",
+      fields.title || fields.description || fields.productDescription || "",
       fields.qtyOrdered || "",
       fields.qtyReceived || "",
       fields.qtyShipped || "",
@@ -430,16 +495,72 @@ function addCL002Row(fields) {
       fields.fulfillment || "",
       fields.transparencyCode || "",
       fields.bundled || "",
-      fields.bundleQty || "",
+      fields.bundleQty == null ? "" : fields.bundleQty,
       noteParts.join(" | ")
     ];
+    if (fields.hasOwnProperty("imageUrl")) {
+      var image = validateProductImageUrl_(fields.imageUrl);
+      var imageColumn = ensureProductImageColumn_(sheet);
+      while (newRow.length < imageColumn) newRow.push("");
+      newRow[imageColumn - 1] = image;
+    }
 
+    if (fields.hasOwnProperty("prepInstructions")) {
+      var prep = validatePrepInstructions_(fields.prepInstructions);
+      var prepColumn = ensurePrepInstructionsColumn_(sheet);
+      while (newRow.length < prepColumn) newRow.push("");
+      newRow[prepColumn - 1] = prep.charAt(0) === "=" ? "'" + prep : prep;
+    }
     sheet.appendRow(newRow);
     return { success: true, rowNumber: sheet.getLastRow() };
   } catch (err) {
     Logger.log("addCL002Row error: " + err.toString());
     return { success: false, message: "Internal error: " + err.toString() };
   }
+}
+
+function validateProductImageUrl_(value) {
+  var image = String(value == null ? "" : value).trim();
+  if (image && (image.length > 2000 || !/^https?:\/\/[^\/\s@]+(?:\/[^\s]*)?$/i.test(image))) throw new Error("Enter a public HTTP or HTTPS product image URL without credentials.");
+  return image;
+}
+
+function validateCatalogDetails_(fields) {
+  if (fields.hasOwnProperty("prepInstructions")) validatePrepInstructions_(fields.prepInstructions);
+  if (fields.hasOwnProperty("imageUrl")) validateProductImageUrl_(fields.imageUrl);
+  if (fields.hasOwnProperty("bundled") && String(fields.bundled || "").trim() && !/^(y|n|yes|no|true|false|1|0)$/i.test(String(fields.bundled).trim())) throw new Error("Is Bundled must be Y or N.");
+  if (fields.hasOwnProperty("bundleQty") && String(fields.bundleQty == null ? "" : fields.bundleQty).trim()) {
+    var quantity = Number(fields.bundleQty);
+    if (!isFinite(quantity) || quantity < 0 || Math.floor(quantity) !== quantity || quantity > 9007199254740991) throw new Error("Bundle Quantity must be a non-negative whole number.");
+  }
+}
+
+function validatePrepInstructions_(value) {
+  var text = String(value == null ? "" : value).trim();
+  if (text.length > 5000 || /[\u0000-\u0008\u000b\u000c\u000e-\u001f]/.test(text)) throw new Error("Special Prep Instructions must be 5000 characters or fewer without control characters.");
+  return text;
+}
+
+function ensurePrepInstructionsColumn_(sheet) {
+  var width = Math.max(13, sheet.getLastColumn());
+  var headers = sheet.getRange(1, 1, 1, width).getValues()[0];
+  var index = headers.map(function(value) { return String(value || "").trim().toLowerCase(); }).indexOf("special prep instructions");
+  if (index >= 0) return index + 1;
+  var column = width + 1;
+  if (column > sheet.getMaxColumns()) sheet.insertColumnsAfter(sheet.getMaxColumns(), column - sheet.getMaxColumns());
+  sheet.getRange(1, column).setValue("Special Prep Instructions");
+  return column;
+}
+
+function ensureProductImageColumn_(sheet) {
+  var width = Math.max(13, sheet.getLastColumn());
+  var headers = sheet.getRange(1, 1, 1, width).getValues()[0];
+  var index = headers.map(function(value) { return String(value || "").trim().toLowerCase(); }).indexOf("product image url");
+  if (index >= 0) return index + 1;
+  var column = width + 1;
+  if (column > sheet.getMaxColumns()) sheet.insertColumnsAfter(sheet.getMaxColumns(), column - sheet.getMaxColumns());
+  sheet.getRange(1, column).setValue("Product Image URL");
+  return column;
 }
 
 function getCL003HeaderMap(sheet) {
@@ -601,6 +722,53 @@ function updateCL003Row(rowNumber, fields) {
   }
 }
 
+function getCredentialRole(headers, row) {
+  var roleIndex = headers.map(function(header) { return String(header).trim().toLowerCase(); }).indexOf("role");
+  var role = roleIndex >= 0 ? String(row[roleIndex] || "").trim().toLowerCase() : "";
+  role = role || (String(row[0] || "").trim() === "CL-000" ? "admin" : "client");
+  return String(row[0] || "").trim() && ["admin", "staff", "client"].indexOf(role) >= 0
+    && !(role === "client" && String(row[0] || "").trim() === "CL-000") ? role : "";
+}
+
+function persistCredentialRole_(sheet, rowIndex, role) {
+  var lock = LockService.getDocumentLock();
+  lock.waitLock(30000);
+  try {
+    var data = sheet.getDataRange().getValues();
+    var roleIndex = data[0].map(function(header) { return String(header).trim().toLowerCase(); }).indexOf("role");
+    if (roleIndex < 0) {
+      roleIndex = data[0].length;
+      if (sheet.getMaxColumns() <= roleIndex) {
+        sheet.insertColumnsAfter(sheet.getMaxColumns(), roleIndex + 1 - sheet.getMaxColumns());
+      }
+      sheet.getRange(1, roleIndex + 1).setValue("Role");
+    }
+    if (!String(data[rowIndex][roleIndex] || "").trim()) {
+      sheet.getRange(rowIndex + 1, roleIndex + 1).setValue(role);
+    }
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function recordUserLogin_(username, clientId, authType) {
+  var lock = LockService.getDocumentLock();
+  lock.waitLock(30000);
+  try {
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var sheet = ss.getSheetByName("User_Logins");
+    if (!sheet) {
+      sheet = ss.insertSheet("User_Logins");
+      sheet.appendRow(["Timestamp", "Username", "ClientID", "AuthType"]);
+    } else if (sheet.getLastRow() === 0) {
+      sheet.appendRow(["Timestamp", "Username", "ClientID", "AuthType"]);
+    }
+    sheet.appendRow([new Date().toISOString(), username, clientId, authType]);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
 function validateLogin(username, password) {
   try {
     var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("User_Credentials");
@@ -610,13 +778,19 @@ function validateLogin(username, password) {
     for (var i = 1; i < data.length; i++) {
       var rowUser = data[i][1] ? data[i][1].toString().trim() : "";
       var rowPass = data[i][2] ? data[i][2].toString().trim() : "";
+      var role = getCredentialRole(data[0], data[i]);
+      if (!role) continue;
       if (rowUser === username.trim() && rowPass === password.trim()) {
         var clientId = data[i][0].toString().trim();
         var clientProfile = getClientProfile(clientId);
+        persistCredentialRole_(sheet, i, role);
+        recordUserLogin_(rowUser, clientId, "Credentials");
         return {
           success:    true,
           clientId:   clientId,
           clientName: data[i][3].toString().trim(),
+          role:       role,
+          enableShippedTab: clientProfile.enableShippedTab,
           editPin:    data[i][5] ? data[i][5].toString().trim() : "",
           profile:    clientProfile
         };
@@ -640,29 +814,58 @@ function getClientProfile(clientId) {
     accentColor: "#F5C518",
     allowChat: true,
     allowLogs: true,
-    allowUpdate: true
+    allowUpdate: true,
+    enableShippedTab: true,
+    packagingNotes: "",
+    websiteUrl: "",
+    logoUrl: ""
   };
 
   try {
     var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("User_Credentials");
     if (!sheet) return defaults;
     var data = sheet.getDataRange().getValues();
+    var headers = data[0].map(function(header) { return String(header).trim().toLowerCase(); });
+    var getSetting = function(row, header, legacyIndex) {
+      var index = headers.indexOf(header.toLowerCase());
+      if (index < 0 && headers.indexOf("role") < 0) index = legacyIndex;
+      return index >= 0 ? row[index] : "";
+    };
     for (var i = 1; i < data.length; i++) {
       var cid = data[i][0] ? data[i][0].toString().trim() : "";
       if (cid !== (clientId || "")) continue;
 
       defaults.clientId = cid;
+      var websiteIndex = headers.indexOf("website_url");
+      var logoIndex = headers.indexOf("logo_url");
+      defaults.websiteUrl = websiteIndex >= 0 ? String(data[i][websiteIndex] || "").trim() : "";
+      defaults.logoUrl = logoIndex >= 0 ? String(data[i][logoIndex] || "").trim() : "";
+      var packagingIndex = headers.indexOf("packaging_notes");
+      defaults.packagingNotes = packagingIndex >= 0 ? String(data[i][packagingIndex] || "").trim() : "";
       defaults.clientName = data[i][3] ? data[i][3].toString().trim() : cid;
-      defaults.portalTitle = (data[i][6] && data[i][6].toString().trim()) || defaults.portalTitle;
-      defaults.portalSubtitle = (data[i][7] && data[i][7].toString().trim()) || defaults.portalSubtitle;
-      defaults.inventoryMode = (data[i][8] && data[i][8].toString().trim()) || defaults.inventoryMode;
-      defaults.enableAddItem = (data[i][9] !== undefined && data[i][9] !== "")
-        ? String(data[i][9]).toLowerCase() === "true" || String(data[i][9]).toLowerCase() === "yes" || String(data[i][9]).toLowerCase() === "1"
+      var settingsIndex = headers.indexOf("client_settings_json");
+      var settings = {};
+      if (settingsIndex >= 0 && data[i][settingsIndex]) {
+        try {
+          settings = JSON.parse(String(data[i][settingsIndex])) || {};
+        } catch (settingsError) {
+          Logger.log("Invalid client settings for " + cid + ": " + settingsError.toString());
+        }
+      }
+      defaults.enableShippedTab = [false, "false", 0, "0"].indexOf(settings.enableShippedTab) < 0;
+      defaults.portalTitle = String(getSetting(data[i], "Portal_Title", 6) || "").trim() || defaults.portalTitle;
+      defaults.portalSubtitle = String(getSetting(data[i], "Portal_Subtitle", 7) || "").trim() || defaults.portalSubtitle;
+      defaults.inventoryMode = String(getSetting(data[i], "Inventory_Mode", 8) || "").trim() || defaults.inventoryMode;
+      var enableAddItem = getSetting(data[i], "Enable_Add_Item", 9);
+      defaults.enableAddItem = (enableAddItem !== undefined && enableAddItem !== "")
+        ? /^(true|yes|1)$/i.test(String(enableAddItem))
         : defaults.enableAddItem;
-      defaults.accentColor = (data[i][10] && data[i][10].toString().trim()) || defaults.accentColor;
-      defaults.allowChat = (data[i][11] === undefined || data[i][11] === "") ? defaults.allowChat : String(data[i][11]).toLowerCase() !== "false";
-      defaults.allowLogs = (data[i][12] === undefined || data[i][12] === "") ? defaults.allowLogs : String(data[i][12]).toLowerCase() !== "false";
-      defaults.allowUpdate = (data[i][13] === undefined || data[i][13] === "") ? defaults.allowUpdate : String(data[i][13]).toLowerCase() !== "false";
+      defaults.accentColor = String(getSetting(data[i], "Accent_Color", 10) || "").trim() || defaults.accentColor;
+      ["allowChat", "allowLogs", "allowUpdate"].forEach(function(key, index) {
+        var header = ["Allow_Chat", "Allow_Logs", "Allow_Update"][index];
+        var value = getSetting(data[i], header, 11 + index);
+        if (value !== undefined && value !== "") defaults[key] = String(value).toLowerCase() !== "false";
+      });
       break;
     }
     return defaults;
@@ -681,12 +884,14 @@ function getClientRoster() {
     var seen = {};
     for (var i = 1; i < data.length; i++) {
       var cid = data[i][0] ? data[i][0].toString().trim() : "";
-      if (!cid || cid === "CL-000" || seen[cid]) continue;
+      if (!cid || cid === "CL-000" || !getCredentialRole(data[0], data[i]) || seen[cid]) continue;
       seen[cid] = true;
+      var profile = getClientProfile(cid);
       roster.push({
         clientId:   cid,
         clientName: data[i][3] ? data[i][3].toString().trim() : cid,
-        profile:    getClientProfile(cid)
+        enableShippedTab: profile.enableShippedTab,
+        profile:    profile
       });
     }
     return roster;
@@ -725,14 +930,20 @@ function tryAutoLogin() {
     var data = sheet.getDataRange().getValues();
     for (var i = 1; i < data.length; i++) {
       var rowEmail = data[i][4] ? data[i][4].toString().trim().toLowerCase() : "";
+      var role = getCredentialRole(data[0], data[i]);
+      if (!role) continue;
       if (rowEmail && rowEmail === email.toLowerCase()) {
         var clientId = data[i][0].toString().trim();
         var clientProfile = getClientProfile(clientId);
+        persistCredentialRole_(sheet, i, role);
+        recordUserLogin_(String(data[i][1] || "").trim(), clientId, "Auto-Login");
         return {
           success:    true,
           attempted:  true,
+          enableShippedTab: clientProfile.enableShippedTab,
           clientId:   clientId,
           clientName: data[i][3].toString().trim(),
+          role:       role,
           editPin:    data[i][5] ? data[i][5].toString().trim() : "",
           profile:    clientProfile
         };

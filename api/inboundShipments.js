@@ -1,0 +1,53 @@
+const INBOUND_SHEET = 'Inbound_Shipments';
+const INBOUND_HEADERS = [
+  'Shipment_ID', 'Client_ID', 'Carrier', 'Tracking_Number', 'Expected_Delivery_Date',
+  'Contents_JSON', 'Status', 'Created_At', 'Created_By', 'Arrived_At', 'Arrived_By'
+];
+const INBOUND_CARRIERS = ['UPS', 'FedEx', 'USPS', 'DHL', 'Other'];
+
+function normalizeInboundTracking(value) {
+  return String(value || '').trim().toUpperCase().replace(/[\s-]+/g, '');
+}
+
+function validateInboundShipment(input) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('Shipment details are required.');
+  if (!INBOUND_CARRIERS.includes(input.carrier)) throw new Error('Choose a carrier.');
+  if (typeof input.trackingNumber !== 'string' || input.trackingNumber.length > 200) throw new Error('Enter a tracking number (maximum 200 characters).');
+  const trackingNumber = normalizeInboundTracking(input.trackingNumber);
+  if (!/^[A-Z0-9]{4,100}$/.test(trackingNumber)) throw new Error('Enter a tracking number with 4-100 letters or digits.');
+  const date = input.expectedDeliveryDate;
+  if (typeof date !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(date)
+    || !Number.isFinite(Date.parse(`${date}T00:00:00Z`))
+    || new Date(`${date}T00:00:00Z`).toISOString().slice(0, 10) !== date) {
+    throw new Error('Enter a valid expected delivery date.');
+  }
+  if (!Array.isArray(input.contents) || !input.contents.length || input.contents.length > 50) throw new Error('Add between 1 and 50 SKU lines.');
+  const seen = new Set();
+  const contents = input.contents.map((line) => {
+    const sku = typeof line?.sku === 'string' ? line.sku.trim() : '';
+    if (!sku || sku.length > 100 || /[\u0000-\u001f]/.test(sku)) throw new Error('Every contents line needs a SKU of 1-100 characters.');
+    if (seen.has(sku.toUpperCase())) throw new Error('Combine duplicate SKUs into one contents line.');
+    seen.add(sku.toUpperCase());
+    const quantity = line.quantity;
+    if (!Number.isSafeInteger(quantity) || quantity < 1 || quantity > 1000000) throw new Error('Expected quantities must be whole numbers from 1 to 1,000,000.');
+    return { sku, quantity };
+  });
+  return { carrier: input.carrier, trackingNumber, expectedDeliveryDate: date, contents };
+}
+
+function inboundFromRow(row) {
+  const contents = JSON.parse(String(row.get('Contents_JSON') || '[]'));
+  const valid = validateInboundShipment({
+    carrier: row.get('Carrier'), trackingNumber: row.get('Tracking_Number'),
+    expectedDeliveryDate: row.get('Expected_Delivery_Date'), contents
+  });
+  const arrivedAt = String(row.get('Arrived_At') || '');
+  return {
+    id: String(row.get('Shipment_ID') || ''), clientId: String(row.get('Client_ID') || ''),
+    ...valid, status: arrivedAt ? 'Arrived at Warehouse' : 'In Transit to Warehouse',
+    createdAt: String(row.get('Created_At') || ''), createdBy: String(row.get('Created_By') || ''),
+    arrivedAt, arrivedBy: String(row.get('Arrived_By') || '')
+  };
+}
+
+module.exports = { INBOUND_SHEET, INBOUND_HEADERS, normalizeInboundTracking, validateInboundShipment, inboundFromRow };
