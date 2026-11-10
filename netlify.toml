@@ -11,5 +11,8 @@
   to = "/.netlify/functions/api/:splat"
   status = 200
 
+[functions]
+  node_bundler = "esbuild"
+
 [functions."archive-chat"]
   schedule = "@daily"
