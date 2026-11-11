@@ -695,6 +695,15 @@ tbody tr:hover {
   touch-action: pan-x pan-y;
 }
 .table-shell table { background: var(--surface); }
+#inventoryTableWrap table { font-size: 16px; line-height: 1.5; }
+#inventoryTableWrap th { font-size: 13px; padding: 12px 14px; }
+#inventoryTableWrap td { padding: 14px; }
+#inventoryTableWrap :is(.title-cell, .sku-cell) { font-size: 16px; }
+#inventoryTableWrap .title-cell { font-weight: 600; }
+#inventoryTableWrap .inventory-meta { font-size: 14px; font-weight: 400; line-height: 1.5; }
+#inventoryTableWrap .qty-cell { font-size: 18px; font-variant-numeric: tabular-nums; }
+#inventoryTableWrap .badge { font-size: 13px; }
+#inventoryTableWrap .qe-btn { width: 44px; height: 44px; }
 /* Opaque cells keep scrolled content from showing through the sticky column. */
 .table-shell tbody tr {
   --inventory-row-background: var(--surface);
@@ -1170,12 +1179,12 @@ html[data-theme="dark"] .tour-card .tour-skip { color: var(--muted-text); }
 .inbound-scan input { width: 100%; min-height: 44px; padding: 10px; border: 1px solid var(--surface-border-strong); border-radius: 8px; background: var(--surface); color: inherit; }
 .inbound-fields { padding: 0; border: 0; min-width: 0; }
 .inbound-contents-title { font-size: 15px; margin: 20px 0 12px; }
-.inbound-line { display: grid; grid-template-columns: minmax(0, 1fr) minmax(100px, .6fr) auto; align-items: end; gap: 10px; margin-bottom: 12px; }
+.inbound-line { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: end; gap: 10px; margin-bottom: 12px; }
 .inbound-line label { display: block; min-width: 0; }
 .inbound-line button { min-height: 44px; }
 @media (max-width: 599px) {
   .inbound-section { padding: 14px; }
-  .inbound-line { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+  .inbound-line { grid-template-columns: minmax(0, 1fr); }
   .inbound-line button { grid-column: 1 / -1; justify-self: end; }
 }
 .integration-notice { background: var(--blue-bg); color: var(--blue-fg); padding: 14px; border-radius: 8px; line-height: 1.6; margin-bottom: 16px; }
@@ -1270,6 +1279,16 @@ html[data-theme="dark"] .tour-card .tour-skip { color: var(--muted-text); }
 #barcodeCameraReader { width: 100%; max-width: 480px; overflow: hidden; border-radius: 10px; background: var(--surface-head); }
 #barcodeCameraReader video { width: 100%; }
 .barcode-viewfinder { position: relative; width: 100%; max-width: 480px; overflow: hidden; border-radius: 10px; background: #101820; }
+.receiving-line { margin: 18px 0; padding: 16px; border: 1px solid var(--surface-border-strong); border-radius: 12px; background: var(--surface); color: var(--text, var(--navy)); }
+.receiving-line fieldset { border: 0; margin: 16px 0; min-width: 0; }
+.receiving-line label { display: block; min-width: 0; margin-bottom: 12px; }
+.receiving-line button { white-space: normal; max-width: 100%; min-height: 44px; }
+.receiving-product-image { display: block; width: 120px; height: 120px; max-width: 100%; object-fit: contain; margin: 12px 0; border-radius: 8px; background: var(--surface-head); }
+.receiving-line :is(input, select) { display: block; width: 100%; min-height: 44px; padding: 10px; margin-top: 6px; background: var(--surface); color: var(--text, var(--navy)); border: 1px solid var(--surface-border-strong); border-radius: 8px; }
+.product-search-links { display: flex; flex-wrap: wrap; gap: 12px; margin: 12px 0; overflow-wrap: anywhere; }
+.product-search-links a { color: var(--blue-fg); text-decoration: underline; }
+.product-search-links span { width: 100%; font-size: 12px; color: var(--muted-text); }
+.receiving-line :is(input, select):focus-visible { outline: 2px solid var(--client-accent, var(--mid)); outline-offset: 2px; }
 .barcode-target { position: absolute; z-index: 2; top: 30%; left: 10%; width: 80%; height: 40%; border: 2px solid #73f5ae; border-radius: 12px; box-shadow: 0 0 0 999px rgba(0, 0, 0, .3); pointer-events: none; }
 .barcode-target span { position: absolute; top: 50%; left: 4%; right: 4%; height: 2px; background: #73f5ae; box-shadow: 0 0 8px #73f5ae; }
 #barcodeCameraStop { min-height: 44px; margin-top: 10px; }

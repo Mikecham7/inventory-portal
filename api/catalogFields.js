@@ -2,7 +2,8 @@ const CATALOG_FIELDS = [
   { key: 'imageUrl', label: 'Product Image URL', aliases: ['imageurl', 'image url', 'product image url', 'image thumbnail', 'image'] },
   { key: 'bundled', label: 'Is Bundled', aliases: ['bundled', 'is bundled', 'isbundled', 'bundled? (y/n)'] },
   { key: 'bundleQty', label: 'Bundle Quantity', aliases: ['bundleqty', 'bundlequantity', 'bundle quantity'] },
-  { key: 'prepInstructions', label: 'Special Prep Instructions', aliases: ['prepinstructions', 'special prep instructions'] }
+  { key: 'prepInstructions', label: 'Special Prep Instructions', aliases: ['prepinstructions', 'special prep instructions'] },
+  { key: 'productUrl', label: 'Product Listing URL', aliases: ['producturl', 'product url', 'product listing url'] }
 ];
 
 function catalogFieldKeys(profile) {
@@ -42,10 +43,10 @@ function validateCatalogValues(values, keys) {
     if (field.key === 'prepInstructions' && (value.length > 5000 || /[\u0000-\u0008\u000b\u000c\u000e-\u001f]/.test(value))) {
       throw new Error('Special Prep Instructions must be 5000 characters or fewer without control characters.');
     }
-    if (field.key === 'imageUrl' && value) {
+    if (['imageUrl', 'productUrl'].includes(field.key) && value) {
       let url;
-      try { url = new URL(value); } catch { throw new Error('Product image must be an HTTP or HTTPS URL.'); }
-      if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || value.length > 2000) throw new Error('Product image must be an HTTP or HTTPS URL without credentials (maximum 2000 characters).');
+      try { url = new URL(value); } catch { throw new Error(`${field.label} must be an HTTP or HTTPS URL.`); }
+      if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || value.length > 2000) throw new Error(`${field.label} must be an HTTP or HTTPS URL without credentials (maximum 2000 characters).`);
     }
     if (field.key === 'bundled' && value && !/^(y|n|yes|no|true|false|1|0)$/i.test(value)) throw new Error('Is Bundled must be Y or N.');
     if (field.key === 'bundleQty' && value && (!Number.isSafeInteger(Number(value)) || Number(value) < 0)) throw new Error('Bundle Quantity must be a non-negative whole number.');

@@ -9,7 +9,7 @@
     <link rel="icon" type="image/png" sizes="192x192" href="icons/icon-192.png?v=1" />
     <link rel="apple-touch-icon" sizes="180x180" href="icons/icon-180.png?v=1" />
     <meta name="theme-color" content="#0D1B2A" />
-    <link rel="stylesheet" href="styles.css?v=20261111c" />
+    <link rel="stylesheet" href="styles.css?v=20261111e" />
   </head>
   <body>
     <div class="portal-login-overlay" id="portalLoginWindow">
@@ -924,9 +924,10 @@
           <details class="faq-item" data-keywords="inbound restock shipment notify expected contents sku boxes dock scan tracking arrival">
             <summary>How do I notify ECL about incoming restock boxes?</summary>
             <div class="faq-answer">
-              <p>All client accounts can use inbound restocks when enabled, even when inventory editing is restricted. Administrators can turn <strong>Enable Inbound Restock Shipments</strong> on or off when creating or editing an account; it is enabled by default. Select <strong>Notify Restock / Add Inbound Shipment</strong> on Dashboard or ECL Tracking. Enter the carrier, tracking number, expected delivery date and one SKU/expected-quantity line per item. Log one tracking number per shipment, then select Notify warehouse. Disabling the feature hides the section and blocks inbound actions without deleting existing shipment records.</p>
+              <p>All client accounts can use inbound restocks when enabled, even when inventory editing is restricted. Administrators can turn <strong>Enable Inbound Restock Shipments</strong> on or off when creating or editing an account; it is enabled by default. Select <strong>Notify Restock / Add Inbound Shipment</strong> on Dashboard or ECL Tracking. Enter the carrier, tracking number, expected delivery date and one product name/expected-quantity line per item. SKU and exact retailer product URLs are optional. Log one tracking number per shipment, then select Notify warehouse. Disabling the feature hides the section and blocks inbound actions without deleting existing shipment records.</p>
               <p>The inbound section shows en-route and arrived shipments with their expected contents. ECL staff select the client account, focus the <strong>Dock scan</strong> field, scan the tracking barcode with a USB scanner and press Enter. Staff can also use a shipment's arrival button. If a number matches more than one record, use the button on the correct shipment.</p>
-              <p>Arrival records include the time and staff member. Notifications and arrival scans <strong>never change stock quantities</strong>; physical contents must still be verified through the normal inventory workflow. This log reflects ECL check-ins, not live carrier delivery events.</p>
+              <p>Arrival records include the time and staff member. After arrival, a staff-only receiving popup shows each product, suggested inventory matches and an option to create a new inventory line. Staff confirm usable received, lost and damaged quantities totaling the expected amount. Only usable received units are added to stock (or Quantity Received for fulfillment accounts); lost and damaged units remain logged on the shipment. Arrival alone does not change quantities. Use Review received products to reopen the popup or retry a pending decision; do not manually add units after an uncertain save.</p>
+              <p>Amazon and eBay search links appear automatically in receiving reviews and inventory item details. Search results are not verified listings. An optional exact retailer URL can fetch product name, SKU and image for review; choose the correct result before applying it. Saving receiving or item details preserves the confirmed product listing URL. Public website restrictions still apply; manual entry remains supported. This log reflects ECL check-ins, not live carrier delivery events.</p>
             </div>
           </details>
           <details class="faq-item" data-keywords="packaging prep special instructions sop standard operating procedure bubble wrap thank you card">
@@ -1072,12 +1073,19 @@
           </div>
           <h3 class="inbound-contents-title">Expected contents</h3>
           <div id="inboundContents"></div>
-          <datalist id="inboundSkuOptions"></datalist>
-          <button type="button" class="filter-clear" id="inboundAddLine">Add SKU line</button>
+          <datalist id="inboundProductOptions"></datalist>
+          <button type="button" class="filter-clear" id="inboundAddLine">Add product line</button>
         </fieldset>
         <p id="inboundError" class="inventory-dialog-error" role="alert"></p>
         <footer class="inventory-dialog-footer"><button type="submit" class="btn-set" id="inboundSave">Notify warehouse</button></footer>
       </form>
+    </dialog>
+
+    <dialog class="inventory-item-dialog" id="receivingDialog" aria-labelledby="receivingTitle">
+      <header class="inventory-dialog-header"><h2 id="receivingTitle">Review received products</h2><button type="button" class="inventory-dialog-close" id="receivingClose" aria-label="Close receiving review">&times;</button></header>
+      <p class="inventory-dialog-hint">Verify each product before changing inventory. Choose a matching inventory item or create a new product line. Account for every expected unit as usable received, lost or damaged; only usable units are added to stock. Similar names and marketplace searches are not proof of an exact match.</p>
+      <p id="receivingMessage" class="inventory-dialog-error" role="status" aria-live="polite"></p>
+      <div id="receivingLines"></div>
     </dialog>
 
     <dialog class="inventory-item-dialog" id="inventoryItemDialog" aria-labelledby="inventoryItemTitle" aria-describedby="inventoryItemHint">
@@ -1087,6 +1095,7 @@
           <button type="button" class="inventory-dialog-close" id="inventoryItemClose" aria-label="Close item details">&times;</button>
         </header>
         <p id="inventoryItemHint" class="inventory-dialog-hint"></p>
+        <div id="inventoryProductLinks"></div>
         <div id="itemPackagingBanner"></div>
         <div class="inventory-dialog-fields" id="inventoryItemFields"></div>
         <div class="inventory-dialog-pin" id="inventoryItemPinWrap" hidden>
@@ -1114,6 +1123,6 @@
     <div class="toast" id="toast"></div>
 
     <script src="vendor/html5-qrcode.min.js"></script>
-    <script src="app.js?v=20261111d"></script>
+    <script src="app.js?v=20261111f"></script>
   </body>
 </html>

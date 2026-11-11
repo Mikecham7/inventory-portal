@@ -142,6 +142,7 @@ function parseCatalog(body, base) {
       title,
       sku: String(entry.sku || variant.sku || entry.gtin13 || entry.gtin12 || fallback.sku || '').trim().slice(0, 200),
       imageUrl: imageUrl(src, base),
+      productUrl: imageUrl(entry.url || entry.link || base, base),
       bundled: bundled === undefined ? '' : /^(true|yes|y|1)$/i.test(String(bundled)) ? 'Y' : 'N',
       bundleQty: Number.isSafeInteger(Number(bundleQty)) && Number(bundleQty) > 0 ? String(bundleQty) : ''
     };

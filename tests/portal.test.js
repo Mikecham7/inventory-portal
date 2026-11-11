@@ -162,7 +162,7 @@ test('public catalog parser reads JSON-LD, Open Graph, JSON feeds and RSS withou
     {"@type":"Organization","name":"Not a product","image":"https://example.com/logo.png"},
     {"@type":"Product","name":"Widget & Kit","sku":"KIT-1","image":[{"url":"/widget.png"}],"isBundled":true,"bundleQuantity":3}
     ]}</script><script>throw new Error('never run');</script>`,base);
-  assert.deepEqual(ld.products,[{title:'Widget & Kit',sku:'KIT-1',imageUrl:'https://store.example/widget.png',bundled:'Y',bundleQty:'3'}]);
+  assert.deepEqual(ld.products,[{title:'Widget & Kit',sku:'KIT-1',imageUrl:'https://store.example/widget.png',productUrl:base,bundled:'Y',bundleQty:'3'}]);
   const og = parseCatalog('<meta property="og:title" content="Copper &amp; Steel"><meta property="og:image" content="//images.example/item.png"><meta property="product:retailer_item_id" content="00123">',base);
   assert.equal(og.products[0].title,'Copper & Steel');
   assert.equal(og.products[0].imageUrl,'https://images.example/item.png');
@@ -323,10 +323,10 @@ test('catalog metadata survives schema migrations and reuses configured field ma
   assert.equal(removed.rows[0][removed.headers.indexOf('Product Image URL')],'https://images.example/a.png','removing custom image configuration preserves universal catalog metadata');
   assert.equal(removed.rows[0][removed.headers.indexOf('Is Bundled')],'Y');
   const profile={clientId:'CL-004',fields:[{key:'photo',label:'Product Image URL'},{key:'isBundled',label:'Is Bundled'},{key:'packSize',label:'Bundle Quantity'}]};
-  assert.deepEqual(catalogFieldKeys(profile),{imageUrl:'photo',bundled:'isBundled',bundleQty:'packSize',prepInstructions:'prepInstructions'});
+  assert.deepEqual(catalogFieldKeys(profile),{imageUrl:'photo',bundled:'isBundled',bundleQty:'packSize',prepInstructions:'prepInstructions',productUrl:'productUrl'});
   assert.equal(catalogFieldKeys({fields:[{key:'packFlag',label:'Multi pack'}],attributeMap:{bundled:'packFlag'}}).bundled,'packFlag');
   const mapping=catalogColumns([['SKU','Title','Product Image URL','Is Bundled','Bundle Quantity','Qty','Status','Notes']],profile);
-  assert.deepEqual(mapping.columns,{imageUrl:2,bundled:3,bundleQty:4,prepInstructions:8});
+  assert.deepEqual(mapping.columns,{imageUrl:2,bundled:3,bundleQty:4,prepInstructions:8,productUrl:9});
   const legacy=toGenericRows({
     rows:[['Product Description/Name','Quantity Ordered','Quantity Received','Quantity Shipped','Merchant','Carrier','Tracking #','Notes','Product Image URL','Is Bundled','Bundle Quantity'],
       ['Card',2,1,0,'Shop','UPS','TRACK','','https://images.example/card.png','Y',2]],
@@ -3329,6 +3329,212 @@ test('packaging notes are edited in Settings and displayed read-only on Dashboar
   assert.doesNotMatch(html,/id="dashboardBranding"/,'branding controls live only in Settings');
 });
 
+test('product-name inbound contents preserve legacy SKU notices and validate receiving quantities and links', () => {
+  const { validateInboundShipment, validateReceiving } = require('../api/inboundShipments');
+  const input = { carrier: 'UPS', trackingNumber: '1Z0123456', expectedDeliveryDate: '2026-11-20', contents: [{ productName: 'Copper Garden Marker', quantity: 10, productUrl: 'https://retailer.example/marker' }] };
+  const line = validateInboundShipment(input).contents[0];
+  assert.equal(line.productName, 'Copper Garden Marker');
+  assert.equal(line.sku, '');
+  assert.equal(validateInboundShipment({ ...input, contents: [{ sku: 'OLD-1', quantity: 1 }] }).contents[0].sku, 'OLD-1');
+  assert.throws(() => validateInboundShipment({ ...input, contents: [{ productName: '', quantity: 1 }] }), /product name/);
+  assert.throws(() => validateInboundShipment({ ...input, contents: [{ ...line, productUrl: 'javascript:alert(1)' }] }), /HTTP/);
+  const decision = { productName: line.productName, target: 'new', received: 7, lost: 2, damaged: 1 };
+  assert.equal(validateReceiving(decision, line).received, 7);
+  assert.throws(() => validateReceiving({ ...decision, damaged: 2 }, line), /totaling/);
+  assert.throws(() => validateReceiving({ ...decision, lost: -2 }, line), /whole numbers/);
+  assert.throws(() => validateReceiving({ ...decision, target: '' }, line), /Select/);
+  assert.equal(validateReceiving({ ...decision, received: 0, lost: 9, damaged: 1, target: '' }, line).target, '');
+});
+
+test('warehouse receiving updates stock once, excludes lost/damaged units, recovers uncertain saves and creates products', async () => {
+  invalidateReadCache('');
+  const inventory = [
+    ['SKU', 'Product Title', 'Qty', 'Status', 'Notes'],
+    ['MARKER', 'Copper Garden Marker', 4, 'Low Stock', '']
+  ];
+  let pendingCells = new Map();
+  let stockSaveFailure = false;
+  let appendFailure = false;
+  const inventorySheet = {
+    title: 'CL-004', rowCount: 25, columnCount: 5,
+    loadCells: async () => { pendingCells = new Map(); },
+    getCell: (r, c) => {
+      const key = `${r}:${c}`;
+      if (!pendingCells.has(key)) pendingCells.set(key, { value: inventory[r]?.[c] ?? '' });
+      return pendingCells.get(key);
+    },
+    resize: async ({ columnCount }) => { inventorySheet.columnCount = columnCount; },
+    saveUpdatedCells: async () => {
+      if (stockSaveFailure) throw new Error('stock unavailable');
+      for (const [key, cell] of pendingCells) {
+        const [r, c] = key.split(':').map(Number);
+        if (cell.value === (inventory[r]?.[c] ?? '')) continue;
+        inventory[r] ||= [];
+        inventory[r][c] = cell.value;
+      }
+    },
+    loadHeaderRow: async () => {},
+    addRow: async (row, options) => {
+      assert.equal(options.raw, true);
+      inventory.push([...row]);
+      if (appendFailure) { appendFailure = false; throw new Error('append response lost'); }
+    }
+  };
+  let receiptSaveFailure = false;
+  const contents = [{ productName: 'Copper Garden Marker', sku: 'MARKER', quantity: 10 }, { productName: 'New Marker', quantity: 5 }, { productName: 'Missing Marker', quantity: 3 }];
+  const shipmentValues = {
+    Shipment_ID: '00000000-0000-4000-8000-000000000010', Client_ID: 'CL-004', Carrier: 'UPS',
+    Tracking_Number: '1Z0123456', Expected_Delivery_Date: '2026-11-20', Contents_JSON: JSON.stringify(contents),
+    Arrived_At: '2026-11-20T12:00:00Z', Arrived_By: 'Staff', Receiving_JSON: ''
+  };
+  const row = () => {
+    const values = { ...shipmentValues };
+    return {
+      get: key => values[key] ?? '', set: (key, value) => { values[key] = value; },
+      save: async options => {
+        assert.equal(options.raw, true);
+        if (receiptSaveFailure && Object.values(JSON.parse(values.Receiving_JSON)).some(receipt => receipt.state === 'complete')) {
+          receiptSaveFailure = false; throw new Error('receipt response lost');
+        }
+        Object.assign(shipmentValues, values);
+      }
+    };
+  };
+  const { INBOUND_HEADERS } = require('../api/inboundShipments');
+  const creds = { Client_ID: 'CL-004', Username: 'Owner', Inventory_Mode: 'inventory', Fields_JSON: '[]' };
+  const sheets = {
+    User_Credentials: { getRows: async () => [{ get: key => creds[key] ?? '' }] },
+    'CL-004': inventorySheet,
+    Inbound_Shipments: { headerValues: INBOUND_HEADERS, loadHeaderRow: async () => {}, getRows: async () => [row()] }
+  };
+  const titles = Object.getOwnPropertyDescriptor(GoogleSpreadsheet.prototype, 'sheetsByTitle');
+  const indexes = Object.getOwnPropertyDescriptor(GoogleSpreadsheet.prototype, 'sheetsByIndex');
+  const oldLoad = GoogleSpreadsheet.prototype.loadInfo;
+  GoogleSpreadsheet.prototype.loadInfo = async () => {};
+  Object.defineProperty(GoogleSpreadsheet.prototype, 'sheetsByTitle', { configurable: true, get: () => sheets });
+  Object.defineProperty(GoogleSpreadsheet.prototype, 'sheetsByIndex', { configurable: true, get: () => Object.values(sheets) });
+  const server = require('../api/server').app.listen(0);
+  const staff = signNotificationSession('Staff', 'CL-000', 'staff');
+  const client = signNotificationSession('Owner', 'CL-004', 'client');
+  const body = {
+    clientId: 'CL-004', shipmentId: shipmentValues.Shipment_ID, lineIndex: 0,
+    target: 'CL-004-1', targetTitle: 'Copper Garden Marker', targetSku: 'MARKER',
+    productName: 'Copper Garden Marker', sku: 'MARKER', received: 7, lost: 2, damaged: 1,
+    productUrl: 'https://retailer.example/marker'
+  };
+  const post = (input = body, token = staff) => fetch(`http://127.0.0.1:${server.address().port}/api/inbound-shipments/receive`, {
+    method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: JSON.stringify(input)
+  });
+  try {
+    assert.equal((await post(body, client)).status, 403);
+    assert.equal((await post({ ...body, clientId: 'CL-999' })).status, 404);
+    assert.equal((await post({ ...body, damaged: 3 })).status, 400);
+    assert.equal((await post({ ...body, targetTitle: 'Wrong product' })).status, 409);
+    receiptSaveFailure = true;
+    assert.equal((await post()).status, 500);
+    assert.equal(inventory[1][2], 11, 'only seven usable units added');
+    assert.equal(JSON.parse(shipmentValues.Receiving_JSON)[0].state, 'pending');
+    assert.equal((await post()).status, 200);
+    assert.equal(inventory[1][2], 11, 'retry never adds seven again');
+    assert.equal((await post()).status, 200);
+    assert.equal((await post({ ...body, received: 8, lost: 1 })).status, 409);
+    const missing = { ...body, lineIndex: 2, productName: 'Missing Marker', target: '', received: 0, lost: 2, damaged: 1 };
+    assert.equal((await post(missing)).status, 200);
+    assert.equal(inventory.length, 2, 'all lost/damaged does not create usable inventory');
+    const newProduct = { ...body, lineIndex: 1, productName: 'New Marker', sku: '', target: 'new', received: 3, lost: 1, damaged: 1 };
+    appendFailure = true;
+    assert.equal((await post(newProduct)).status, 500);
+    assert.equal(inventory.length, 3);
+    assert.equal((await post(newProduct)).status, 200);
+    assert.equal(inventory.length, 3, 'uncertain new-row append is recovered by receipt marker');
+    assert.equal(inventory[2][1], 'New Marker');
+    assert.equal(inventory[2][2], 3);
+    assert.match(inventory[2][0], /^INBOUND-/);
+    assert.equal(inventory[2][inventory[0].indexOf('Product Listing URL')], body.productUrl);
+    const received = JSON.parse(shipmentValues.Receiving_JSON);
+    assert.equal(received[2].decision.lost, 2);
+    assert.equal(received[2].decision.damaged, 1);
+    assert.equal(received[0].by, 'Staff');
+    // A stock failure leaves a pending decision and no marker; identical retry completes it.
+    contents.push({ productName: 'Extra Copper Garden Marker', quantity: 1 });
+    shipmentValues.Contents_JSON = JSON.stringify(contents);
+    const retry = { ...body, lineIndex: 3, received: 1, lost: 0, damaged: 0 };
+    stockSaveFailure = true;
+    assert.equal((await post(retry)).status, 500);
+    assert.equal(inventory[1][2], 11);
+    stockSaveFailure = false;
+    assert.equal((await post(retry)).status, 200);
+    assert.equal(inventory[1][2], 12);
+    creds.Inventory_Mode = 'custom';
+    creds.Fields_JSON = JSON.stringify([
+      { key: 'quantityReceived', label: 'Quantity Received', type: 'number' },
+      { key: 'quantityShipped', label: 'Quantity Shipped', type: 'number' }
+    ]);
+    inventory.splice(0, inventory.length,
+      ['SKU', 'Product Title', 'Quantity Received', 'Quantity Shipped', 'Qty', 'Status', 'Notes'],
+      ['MARKER', 'Copper Garden Marker', 4, 2, 2, 'Partially Shipped', '']);
+    contents.push({ productName: 'More Copper Markers', quantity: 10 });
+    shipmentValues.Contents_JSON = JSON.stringify(contents);
+    invalidateReadCache('');
+    assert.equal((await post({ ...body, lineIndex: 4 })).status, 200);
+    assert.equal(inventory[1][2], 11, 'fulfillment receiving increments Quantity Received');
+    assert.equal(inventory[1][3], 2, 'fulfillment shipped quantities are unchanged');
+    creds.Client_ID = 'CL-002';
+    delete creds.Fields_JSON;
+    shipmentValues.Client_ID = 'CL-002';
+    sheets['CL-002'] = inventorySheet;
+    inventorySheet.title = 'CL-002';
+    inventory.splice(0, inventory.length,
+      ['UPC', 'Product Description', 'Quantity Ordered', 'Quantity Received', 'Quantity Shipped', 'Exp Date', 'Merchant', 'ASIN', 'FBM/FBA', 'Transparency', 'Bundled', 'Bundle Quantity', 'Notes'],
+      ['00123', 'Legacy Marker', 5, 1, 0]);
+    contents.push({ productName: 'Legacy Marker Restock', quantity: 2 });
+    shipmentValues.Contents_JSON = JSON.stringify(contents);
+    invalidateReadCache('');
+    const legacy = { ...body, clientId: 'CL-002', lineIndex: 5, target: 'CL-002-1', targetTitle: 'Legacy Marker', targetSku: '00123', productName: 'Legacy Marker', received: 2, lost: 0, damaged: 0 };
+    assert.equal((await post(legacy)).status, 200);
+    assert.equal(inventory[1][2], 5, 'legacy ordered quantity is preserved');
+    assert.equal(inventory[1][3], 3, 'legacy received column increments without shifting sheet columns');
+    creds.Client_ID = 'CL-001';
+    shipmentValues.Client_ID = 'CL-001';
+    sheets['CL-001'] = inventorySheet;
+    inventorySheet.title = 'CL-001';
+    inventory.splice(0, inventory.length, ['Client ID', 'SKU CODE', 'Product Title', 'Qty', 'Status', 'Notes']);
+    contents.push({ productName: 'Numeric UPC Product', sku: '012345678905', quantity: 1 });
+    shipmentValues.Contents_JSON = JSON.stringify(contents);
+    invalidateReadCache('');
+    assert.equal((await post({ ...body, clientId: 'CL-001', lineIndex: 6, target: 'new', productName: 'Numeric UPC Product', sku: '012345678905', received: 1, lost: 0, damaged: 0 })).status, 200);
+    const response = await fetch(`http://127.0.0.1:${server.address().port}/api/inventory?clientId=CL-001`, { headers: { Authorization: `Bearer ${staff}` } });
+    const products = await response.json();
+    assert.ok(products.some(item => item.title === 'Numeric UPC Product' && item.sku === '012345678905'), 'numeric product codes created by receiving remain visible in legacy inventory');
+  } finally {
+    await new Promise(resolve => server.close(resolve));
+    GoogleSpreadsheet.prototype.loadInfo = oldLoad;
+    Object.defineProperty(GoogleSpreadsheet.prototype, 'sheetsByTitle', titles);
+    Object.defineProperty(GoogleSpreadsheet.prototype, 'sheetsByIndex', indexes);
+    invalidateReadCache('');
+  }
+});
+
+test('receiving suggestions and product links are safe and preserve receipt markers through layout changes', () => {
+  const context = vm.createContext({
+    document: { getElementById: () => null, querySelectorAll: () => [], addEventListener() {} },
+    window: { location: { hostname: 'localhost' }, addEventListener() {} },
+    URL, AbortController, setTimeout, clearTimeout
+  });
+  vm.runInContext(fs.readFileSync(require.resolve('../frontend/app.js'), 'utf8'), context);
+  const items = [{ id: 'a', sku: '00123', title: 'Copper Garden Marker' }, { id: 'b', sku: 'B', title: 'Copper Garden Tags' }, { id: 'c', sku: 'C', title: 'Coffee Mug' }];
+  const matches = context.receivingMatches({ productName: 'Copper Garden Marker' }, items);
+  assert.deepEqual(Array.from(matches, item => item.id), ['a', 'b']);
+  assert.match(context.productSearchLinks('Garden & Marker', 'https://retailer.example/product'), /Product listing/);
+  assert.match(context.productSearchLinks('Garden & Marker'), /s\?k=Garden%20%26%20Marker/);
+  assert.doesNotMatch(context.productSearchLinks('Name', 'javascript:alert(1)'), /javascript:/);
+  const { toGenericRows } = require('../api/inventoryLayout');
+  const marker = '{"shipment:0":{"received":2}}';
+  const modern = toGenericRows({ rows: [['SKU', 'Product Title', 'Qty', 'Status', 'Notes', 'Inbound_Receiving_Log', 'Product Listing URL'], ['A', 'Marker', 2, 'In Stock', '', marker, 'https://retailer.example/item']], oldFields: [], newFields: [{ key: 'size', label: 'Size', type: 'text' }] });
+  assert.equal(modern.rows[0][modern.headers.indexOf('Inbound_Receiving_Log')], marker);
+  assert.equal(modern.rows[0][modern.headers.indexOf('Product Listing URL')], 'https://retailer.example/item');
+});
+
 test('inbound UI supports read-only notifications, staff scans, safe rendering and stale-response cleanup', async () => {
   const ids=['inboundDashboard','inboundTracking','inboundForm','inboundDialog','inboundFields','inboundSave','inboundError','inboundContents','inboundCarrier','inboundTrackingNumber','inboundExpectedDate'];
   const elements=Object.fromEntries(ids.map(id=>[id,{
@@ -3336,19 +3542,21 @@ test('inbound UI supports read-only notifications, staff scans, safe rendering a
     classList:{contains:()=>false},addEventListener(){},reset(){},close(){this.open=false;}
   }]));
   const skuInput={value:'<SKU>'},qtyInput={value:'12'};
-  const line={querySelector:selector=>selector==='[data-inbound-sku]'?skuInput:qtyInput};
+  const line={querySelector:selector=>selector==='[data-inbound-sku]'?skuInput:selector==='[data-inbound-name]'?{value:'Garden Tool'}:selector==='[data-inbound-url]'?{value:''}:qtyInput};
   const context=vm.createContext({
     document:{getElementById:id=>elements[id]||null,querySelectorAll:selector=>selector==='#inboundContents .inbound-line'?[line]:[],addEventListener(){}},
     window:{location:{hostname:'localhost'},addEventListener(){}},URL,AbortController,setTimeout,clearTimeout
   });
   vm.runInContext(fs.readFileSync(require.resolve('../frontend/app.js'),'utf8'),context);
   vm.runInContext(`state.auth=true;state.activeClientId='CL-001';state.session={clientId:'CL-001',role:'client',notificationToken:'signed'};
-    state.clientProfile={clientId:'CL-001',inventoryMode:'inventory',readOnly:true,enableAddItem:false};`,context);
+    state.clientProfile={clientId:'CL-001',clientName:'Garden <Markers>',inventoryMode:'inventory',readOnly:true,enableAddItem:false};`,context);
   const shipment={id:'00000000-0000-4000-8000-000000000001',clientId:'CL-001',carrier:'UPS',trackingNumber:'1Z001234',expectedDeliveryDate:'2026-11-20',contents:[{sku:'<SKU>',quantity:12}],createdAt:'2026-11-10T12:00:00Z',createdBy:'<Owner>',status:'In Transit to Warehouse',arrivedAt:'',arrivedBy:''};
   context.fetch=async()=>({ok:true,json:async()=>({success:true,clientId:'CL-001',shipments:[shipment]})});
   await context.loadInboundShipments();
   assert.equal(elements.inboundDashboard.hidden,false);
   assert.match(elements.inboundDashboard.innerHTML,/Notify Restock/);
+  assert.match(elements.inboundDashboard.innerHTML,/Expected boxes and product contents for Garden &lt;Markers&gt;\./);
+  assert.doesNotMatch(elements.inboundDashboard.innerHTML,/Expected boxes and product contents for CL-001/);
   assert.match(elements.inboundDashboard.innerHTML,/&lt;SKU&gt;/);
   assert.match(elements.inboundDashboard.innerHTML,/&lt;Owner&gt;/);
   assert.doesNotMatch(elements.inboundDashboard.innerHTML,/Dock scan/);
@@ -3374,7 +3582,7 @@ test('inbound UI supports read-only notifications, staff scans, safe rendering a
     return {ok:true,json:async()=>({success:true,clientId:'CL-001',shipment})};
   };
   await context.submitInboundShipment({preventDefault(){}});
-  assert.deepEqual(submitted.contents,[{sku:'<SKU>',quantity:12}]);
+  assert.deepEqual(submitted.contents,[{sku:'<SKU>',productName:'Garden Tool',productUrl:'',quantity:12}]);
   assert.equal(submitted.shipmentId,shipment.id);
   assert.equal(vm.runInContext('inboundDraftId',context),null);
   assert.equal(vm.runInContext('inboundState.shipments.length',context),1);
@@ -4184,6 +4392,16 @@ test('dark notification panels, popup messages and alert states use light text o
     const contrast = (Math.max(text, background) + .05) / (Math.min(text, background) + .05);
     assert.ok(contrast >= 4.5, `${name} text contrast ${contrast.toFixed(2)} meets WCAG AA`);
   }
+});
+
+test('dashboard inventory text stays comfortably sized even under compact mobile table rules', () => {
+  const css = fs.readFileSync(require.resolve('../frontend/styles.css'), 'utf8');
+  assert.match(css, /#inventoryTableWrap table \{ font-size: 16px; line-height: 1\.5;/);
+  assert.match(css, /#inventoryTableWrap :is\(\.title-cell, \.sku-cell\) \{ font-size: 16px;/);
+  assert.match(css, /#inventoryTableWrap \.qty-cell \{ font-size: 18px;/);
+  assert.match(css, /#inventoryTableWrap \.inventory-meta \{ font-size: 14px;/);
+  assert.match(css, /#inventoryTableWrap \.badge \{ font-size: 13px;/);
+  assert.match(css, /#inventoryTableWrap \.qe-btn \{ width: 44px; height: 44px;/);
 });
 
 test('dashboard summary counts and labels use readable dark colors while preserving severity colors', () => {

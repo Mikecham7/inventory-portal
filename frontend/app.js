@@ -1580,7 +1580,7 @@ function renderBrandingForms() {
       <label class="ac-label" for="${prefix}WebsiteUrl">Client Website URL</label>
       <input class="ac-input" id="${prefix}WebsiteUrl" name="websiteUrl" type="text" maxlength="2000" placeholder="https://your-company.com" value="${escapeHtml(profile.websiteUrl || '')}" />
       <button type="button" class="btn-set" data-fetch-branding>Fetch website branding</button>
-      <p class="integration-description">Optional public website lookup, no API connection needed. Review the suggested logo and CSS/theme color, or enter your own. Save to apply branding.</p>
+      <p class="integration-description">Make the portal feel like your business: enter your public website address and choose Fetch website branding to suggest your company logo and brand color. Your saved logo appears in the dashboard header, and your brand color highlights active tabs and buttons. This optional lookup does not connect your store, import products or require API credentials. Review or adjust the suggestions, then choose Save branding to apply them; fetching alone does not change your portal.</p>
       <label class="ac-label" for="${prefix}LogoUrl">Logo image URL (manual override)</label>
       <input class="ac-input" id="${prefix}LogoUrl" name="logoUrl" type="url" maxlength="2000" placeholder="https://your-company.com/logo.png" value="${escapeHtml(profile.logoUrl || '')}" />
       <label class="ac-label" for="${prefix}AccentColor">Accent hex color (manual override)</label>
@@ -1716,7 +1716,8 @@ const CATALOG_FIELDS = [
   { key: 'imageUrl', label: 'Product Image URL', type: 'text', aliases: ['imageurl', 'image url', 'product image url', 'image thumbnail', 'image'] },
   { key: 'bundled', label: 'Is Bundled', type: 'select', options: ['', 'Y', 'N'], aliases: ['bundled', 'is bundled', 'isbundled', 'bundled? (y/n)'] },
   { key: 'bundleQty', label: 'Bundle Quantity', type: 'number', aliases: ['bundleqty', 'bundlequantity', 'bundle quantity'] },
-  { key: 'prepInstructions', label: 'Special Prep Instructions', type: 'textarea', aliases: ['prepinstructions', 'special prep instructions'] }
+  { key: 'prepInstructions', label: 'Special Prep Instructions', type: 'textarea', aliases: ['prepinstructions', 'special prep instructions'] },
+  { key: 'productUrl', label: 'Product Listing URL', type: 'text', aliases: ['producturl', 'product url', 'product listing url'] }
 ];
 
 function catalogFieldMatches(catalog, field) {
@@ -1864,6 +1865,7 @@ function applyCatalogProduct() {
   const upcField = document.getElementById('customField_upc');
   if (/^\d{8,14}$/.test(product.sku || '')) fill(upcField, product.sku);
   fill(catalogInput('imageUrl'), product.imageUrl);
+  fill(catalogInput('productUrl'), product.productUrl);
   fill(catalogInput('bundled'), product.bundled);
   fill(catalogInput('bundleQty'), product.bundleQty);
   previewCatalogImage();
@@ -2481,7 +2483,7 @@ const ONBOARDING_STEPS = [
     target: '#inboundDashboard',
     available: inboundAvailable,
     title: 'Tell ECL about incoming restocks',
-    body: 'Select Notify Restock / Add Inbound Shipment to enter a carrier, tracking number, expected delivery date and SKU quantities. Your inbound boxes appear here and in ECL Tracking. Staff scan tracking numbers to record arrival; notices and scans never change stock quantities.'
+    body: 'Select Notify Restock / Add Inbound Shipment to enter a carrier, tracking number, expected delivery date, product names and quantities. Optionally include SKUs and exact product listing URLs. Staff record arrival, then review inventory matches and received, lost or damaged quantities. Only confirmed usable units are added to inventory.'
   },
   {
     page: 'page-dashboard',
@@ -3004,6 +3006,7 @@ function inboundAvailable() {
 function closeInboundDialog() {
   document.getElementById('inboundDialog')?.close?.();
   inboundDraftId = null;
+  closeReceivingDialog();
 }
 
 function resetInboundShipments() {
@@ -3028,7 +3031,7 @@ function renderInboundShipments() {
     const markup = `<div class="inbound-heading"><h3>Inbound restock shipments</h3><div class="inbound-actions">
       <button type="button" class="btn-set" data-inbound-action="add"${busy ? ' disabled' : ''}>Notify Restock / Add Inbound Shipment</button>
       <button type="button" class="filter-clear" data-inbound-action="refresh"${busy || (current && inboundState.loading) ? ' disabled' : ''}>Refresh inbound</button></div></div>
-      <p class="inbound-hint">Expected boxes and SKU contents for ${escapeHtml(state.activeClientId)}. Arrival records do not change stock quantities.</p>
+      <p class="inbound-hint">Expected boxes and product contents for ${escapeHtml(state.clientProfile?.clientName || getCurrentClientLabel())}. Recording arrival alone does not change stock; warehouse staff confirm usable quantities in the receiving review.</p>
       ${packagingBanner(null)}
       ${state.isAdmin ? `<form class="inbound-scan"><label>Dock scan: tracking number<input name="code" aria-label="Inbound tracking barcode" maxlength="200" autocomplete="off" required${busy ? ' disabled' : ''} placeholder="Scan with USB scanner, then press Enter" /></label><button type="submit" class="btn-set"${busy ? ' disabled' : ''}>Record arrival</button></form>` : ''}
       <p class="inbound-error" role="alert">${current ? escapeHtml(inboundState.error) : ''}</p>
@@ -3039,12 +3042,14 @@ function renderInboundShipments() {
           <div class="inbound-heading"><strong>${escapeHtml(shipment.carrier)}</strong><span>${escapeHtml(shipment.status)}</span></div>
           <div class="tracking-number-row">${trackingCarrierMarkup(shipment.trackingNumber)}</div>
           <p>Expected delivery: ${escapeHtml(shipment.expectedDeliveryDate)}</p>
-          <ul>${shipment.contents.map((line) => `<li>${escapeHtml(line.sku)} &mdash; ${escapeHtml(String(line.quantity))} expected</li>`).join('')}</ul>
-          ${shipment.contents.map((line) => state.items.find((item) => String(item.sku || '').trim().toUpperCase() === line.sku.toUpperCase()))
+          <ul>${shipment.contents.map((line, index) => `<li>${escapeHtml(inboundProductName(line))} &mdash; ${escapeHtml(String(line.quantity))} expected
+            ${shipment.receiving?.[index] ? `<span> &middot; ${escapeHtml(shipment.receiving[index].state)}: ${shipment.receiving[index].decision.received} received, ${shipment.receiving[index].decision.lost} lost, ${shipment.receiving[index].decision.damaged} damaged</span>` : ''}</li>`).join('')}</ul>
+          ${shipment.contents.map((line) => state.items.find((item) => line.sku && String(item.sku || '').trim().toUpperCase() === line.sku.toUpperCase()))
             .filter(Boolean).map((item) => packagingBanner(item, false)).join('')}
           <p class="inbound-hint">Notified ${escapeHtml(formatActivityTimestamp(shipment.createdAt))} by ${escapeHtml(shipment.createdBy)}</p>
           ${shipment.arrivedAt ? `<p>Arrived ${escapeHtml(formatActivityTimestamp(shipment.arrivedAt))} &middot; ${escapeHtml(shipment.arrivedBy)}</p>` : state.isAdmin
             ? `<button type="button" class="filter-clear" data-inbound-action="arrive" data-shipment-id="${escapeHtml(shipment.id)}"${busy ? ' disabled' : ''}>Record arrival for this shipment</button>` : ''}
+          ${shipment.arrivedAt && state.isAdmin ? `<button type="button" class="filter-clear" data-inbound-action="review" data-shipment-id="${escapeHtml(shipment.id)}"${busy ? ' disabled' : ''}>Review received products</button>` : ''}
         </article>`).join('')}</div>`;
     if (host.innerHTML !== markup) host.innerHTML = markup;
   });
@@ -3077,7 +3082,9 @@ function addInboundLine() {
   if (!host || host.children.length >= 50) return;
   const id = ++inboundLineId;
   host.insertAdjacentHTML('beforeend', `<div class="inbound-line">
-    <label for="inboundSku${id}">SKU<input id="inboundSku${id}" data-inbound-sku list="inboundSkuOptions" maxlength="100" required /></label>
+    <label for="inboundName${id}">Product name<input id="inboundName${id}" data-inbound-name list="inboundProductOptions" maxlength="500" required /></label>
+    <label for="inboundSku${id}">SKU (optional)<input id="inboundSku${id}" data-inbound-sku maxlength="100" /></label>
+    <label for="inboundUrl${id}">Product listing URL (optional)<input id="inboundUrl${id}" data-inbound-url type="url" maxlength="2000" placeholder="https://retailer.com/product" /></label>
     <label for="inboundQty${id}">Expected quantity<input id="inboundQty${id}" data-inbound-quantity type="number" min="1" max="1000000" step="1" required /></label>
     <button type="button" class="filter-clear" data-inbound-remove aria-label="Remove contents line">Remove</button></div>`);
   document.getElementById('inboundAddLine').disabled = host.children.length >= 50;
@@ -3097,8 +3104,8 @@ function openInboundDialog() {
   document.getElementById('inboundSave').disabled = false;
   document.getElementById('inboundError').textContent = '';
   document.getElementById('inboundContents').innerHTML = '';
-  document.getElementById('inboundSkuOptions').innerHTML = state.items.filter((item) => item.sku)
-    .map((item) => `<option value="${escapeHtml(item.sku)}">${escapeHtml(item.title)}</option>`).join('');
+  document.getElementById('inboundProductOptions').innerHTML = state.items.filter((item) => item.title)
+    .map((item) => `<option value="${escapeHtml(item.title)}">${escapeHtml(item.sku)}</option>`).join('');
   addInboundLine();
   dialog.showModal();
   document.getElementById('inboundCarrier').focus();
@@ -3108,9 +3115,12 @@ async function submitInboundShipment(event) {
   event.preventDefault();
   if (!inboundAvailable() || inboundState.busy || !inboundDraftId) return;
   const contents = [...document.querySelectorAll('#inboundContents .inbound-line')].map((line) => ({
-    sku: line.querySelector('[data-inbound-sku]').value.trim(), quantity: Number(line.querySelector('[data-inbound-quantity]').value)
+    productName: line.querySelector('[data-inbound-name]').value.trim(),
+    sku: line.querySelector('[data-inbound-sku]').value.trim(),
+    productUrl: line.querySelector('[data-inbound-url]').value.trim(),
+    quantity: Number(line.querySelector('[data-inbound-quantity]').value)
   }));
-  if (!contents.length) { document.getElementById('inboundError').textContent = 'Add at least one SKU line.'; return; }
+  if (!contents.length) { document.getElementById('inboundError').textContent = 'Add at least one product line.'; return; }
   await mutateInboundShipment('', {
     shipmentId: inboundDraftId, carrier: document.getElementById('inboundCarrier').value,
     trackingNumber: document.getElementById('inboundTrackingNumber').value.trim(),
@@ -3151,6 +3161,7 @@ async function mutateInboundShipment(path, body) {
     }
     inboundState.message = path ? `${result.alreadyCheckedIn ? 'Already arrived' : 'Arrival recorded'}: ${result.shipment.trackingNumber}. Stock quantities unchanged.` : 'Warehouse notified. Stock quantities unchanged.';
     if (!path) closeInboundDialog();
+    else openReceivingDialog(result.shipment);
   } catch (error) {
     if (request === inboundRequest && error.name !== 'AbortError') {
       inboundState.error = error.message || 'Shipment changes were not confirmed. Refresh before retrying.';
@@ -3166,6 +3177,186 @@ async function mutateInboundShipment(path, body) {
       renderInboundShipments();
       if (!inboundState.shipments && !inboundState.error) loadInboundShipments();
     }
+  }
+}
+
+let receivingEditor = null;
+
+function inboundProductName(line) {
+  return line.productName || state.items.find(item => line.sku && String(item.sku || '').toUpperCase() === line.sku.toUpperCase())?.title || line.sku || 'Product';
+}
+
+function safeHttpUrl(value) {
+  if (!value) return '';
+  try {
+    const url = new URL(value);
+    return ['http:', 'https:'].includes(url.protocol) && !url.username && !url.password ? url.href : '';
+  } catch {
+    return '';
+  }
+}
+
+function productSearchLinks(name, productUrl = '') {
+  const query = encodeURIComponent(String(name || '').trim());
+  const url = safeHttpUrl(productUrl);
+  return `<div class="product-search-links">
+    ${url ? `<a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">Product listing</a>` : ''}
+    <a href="https://www.amazon.com/s?k=${query}" target="_blank" rel="noopener noreferrer">Amazon search</a>
+    <a href="https://www.ebay.com/sch/i.html?_nkw=${query}" target="_blank" rel="noopener noreferrer">eBay search</a>
+    <span>Search results are suggestions, not verified product matches.</span></div>`;
+}
+
+function receivingMatches(line, items = state.items) {
+  const name = inboundProductName(line).toLowerCase();
+  const words = new Set(name.split(/[^a-z0-9]+/).filter(word => word.length > 2));
+  return items.map(item => {
+    const title = String(item.title || '').toLowerCase();
+    const tokens = new Set(title.split(/[^a-z0-9]+/).filter(word => word.length > 2));
+    const score = line.sku && String(item.sku || '').toLowerCase() === line.sku.toLowerCase() ? 3
+      : title === name ? 2 : [...words].filter(word => tokens.has(word)).length / Math.max(words.size, tokens.size, 1);
+    return { item, score };
+  }).filter(match => match.score >= .3).sort((a, b) => b.score - a.score).slice(0, 10).map(match => match.item);
+}
+
+function closeReceivingDialog() {
+  document.getElementById('receivingDialog')?.close?.();
+  receivingEditor = null;
+}
+
+async function openReceivingDialog(shipment) {
+  const dialog = document.getElementById('receivingDialog');
+  if (!dialog || !state.isAdmin || !inboundAvailable() || !shipment.arrivedAt) return;
+  const clientId = state.activeClientId;
+  const session = state.session;
+  const editor = { shipment, clientId, session, busy: false, products: new Map() };
+  receivingEditor = editor;
+  document.getElementById('receivingLines').textContent = 'Loading inventory matches...';
+  document.getElementById('receivingMessage').textContent = '';
+  dialog.showModal();
+  try {
+    const status = await fetchInventory(clientId);
+    if (receivingEditor !== editor || clientId !== state.activeClientId || session !== state.session) return;
+    if (status !== 200) throw new Error('Inventory matches could not load. Close and reopen this review before saving.');
+    renderReceivingLines();
+  } catch (error) {
+    if (receivingEditor === editor) document.getElementById('receivingMessage').textContent = error.message || 'Unable to load inventory matches.';
+  }
+}
+
+function renderReceivingLines() {
+  const editor = receivingEditor;
+  if (!editor) return;
+  document.getElementById('receivingLines').innerHTML = editor.shipment.contents.map((line, index) => {
+    const receipt = editor.shipment.receiving?.[index];
+    const decision = receipt?.decision;
+    const name = decision?.productName || inboundProductName(line);
+    const suggested = receivingMatches(line);
+    const matches = [...suggested, ...state.items.filter(item => !suggested.some(match => match.id === item.id))];
+    return `<form class="receiving-line" data-receiving-line="${index}">
+      <h3>${escapeHtml(name)}</h3>
+      <p class="inbound-hint">${line.quantity} expected. Only usable received units will be added to stock. Lost and damaged units stay out of usable inventory.</p>
+      <div data-receiving-prep>${packagingBanner(state.items.find(item => item.id === decision?.target), true)}</div>
+      <div data-receiving-match></div>
+      ${productSearchLinks(name, decision?.productUrl || line.productUrl)}
+      ${receipt ? `<p class="inbound-hint">Review ${escapeHtml(receipt.state)} by ${escapeHtml(receipt.by)}: ${decision.received} received, ${decision.lost} lost, ${decision.damaged} damaged.</p>` : ''}
+      <fieldset${receipt ? ' disabled' : ''}>
+        <label>Inventory action<select name="target"><option value="">Choose an existing product, create a new line, or leave blank if all units are lost/damaged</option><option value="new"${decision?.target === 'new' ? ' selected' : ''}>Create new inventory product</option>
+          ${matches.map(item => `<option value="${escapeHtml(item.id)}"${decision?.target === item.id ? ' selected' : ''}>${suggested.some(match => match.id === item.id) ? 'Suggested: ' : ''}${escapeHtml(item.title)} (${escapeHtml(item.sku)})</option>`).join('')}</select></label>
+        <div class="inventory-dialog-fields">
+          <label>Product name<input name="productName" value="${escapeHtml(name)}" maxlength="500" required /></label>
+          <label>SKU (optional for new product)<input name="sku" value="${escapeHtml(decision?.sku || line.sku || '')}" maxlength="100" /></label>
+          <label>Usable received<input name="received" type="number" min="0" max="${line.quantity}" value="${decision?.received ?? line.quantity}" required /></label>
+          <label>Lost / missing<input name="lost" type="number" min="0" max="${line.quantity}" value="${decision?.lost ?? 0}" required /></label>
+          <label>Damaged<input name="damaged" type="number" min="0" max="${line.quantity}" value="${decision?.damaged ?? 0}" required /></label>
+          <label>Exact product listing URL<input name="productUrl" type="url" maxlength="2000" value="${escapeHtml(decision?.productUrl || line.productUrl || '')}" /></label>
+          <label>Product image URL<input name="imageUrl" type="url" maxlength="2000" value="${escapeHtml(decision?.imageUrl || '')}" /></label>
+        </div>
+        <button type="button" class="filter-clear" data-receiving-fetch>Fetch product details from listing URL</button>
+        <div data-receiving-preview></div>
+      </fieldset>
+      <p class="inventory-dialog-error" data-receiving-error role="alert"></p>
+      ${receipt?.state !== 'complete' ? `<button type="submit" class="btn-set">${receipt ? 'Retry same receiving decision' : 'Confirm received / lost / damaged quantities'}</button>` : ''}
+    </form>`;
+  }).join('');
+}
+
+async function fetchReceivingProduct(form) {
+  const editor = receivingEditor;
+  if (!editor || editor.busy) return;
+  const field = name => form.elements.namedItem(name);
+  const error = form.querySelector('[data-receiving-error]');
+  const url = safeHttpUrl(field('productUrl').value);
+  if (!url) { error.textContent = 'Enter an exact public product listing URL first.'; return; }
+  editor.busy = true;
+  const button = form.querySelector('[data-receiving-fetch]');
+  button.disabled = true;
+  error.textContent = '';
+  try {
+    const response = await fetch(CATALOG_SYNC_URL, {
+      method: 'POST', headers: adminHeaders({ 'Content-Type': 'application/json' }), signal: viewSignal(),
+      body: JSON.stringify({ clientId: editor.clientId, url })
+    });
+    const result = await response.json();
+    if (receivingEditor !== editor || state.session !== editor.session || state.activeClientId !== editor.clientId) return;
+    if (!response.ok || !result.success || !result.products?.length) throw new Error(result.error || 'No product details found. Manual entry remains available.');
+    editor.products.set(form.dataset.receivingLine, result.products);
+    form.querySelector('[data-receiving-preview]').innerHTML = `<label>Review a product from this URL<select data-receiving-product>${result.products.map((product, index) => `<option value="${index}">${escapeHtml(product.title)} (${escapeHtml(product.sku || 'no SKU')})</option>`).join('')}</select></label><button type="button" class="filter-clear" data-receiving-apply>Use selected product details</button>`;
+  } catch (failure) {
+    if (receivingEditor === editor) error.textContent = failure.message || 'Unable to fetch product details.';
+  } finally {
+    editor.busy = false;
+    button.disabled = false;
+  }
+}
+
+async function saveReceivingLine(form) {
+  const editor = receivingEditor;
+  if (!editor || editor.busy || !state.isAdmin || editor.clientId !== state.activeClientId || editor.session !== state.session || !inboundAvailable()) return;
+  const index = Number(form.dataset.receivingLine);
+  const decision = editor.shipment.receiving?.[index]?.decision;
+  const value = name => form.elements.namedItem(name).value;
+  const target = state.items.find(item => item.id === value('target'));
+  const body = {
+    ...(decision || {
+      target: value('target'), productName: value('productName'), sku: value('sku'),
+      received: Number(value('received')), lost: Number(value('lost')), damaged: Number(value('damaged')),
+      productUrl: value('productUrl'), imageUrl: value('imageUrl')
+    }),
+    clientId: editor.clientId, shipmentId: editor.shipment.id, lineIndex: index,
+    targetTitle: target?.title, targetSku: target?.sku
+  };
+  const error = form.querySelector('[data-receiving-error]');
+  if ([body.received, body.lost, body.damaged].some(qty => !Number.isSafeInteger(qty) || qty < 0)
+    || body.received + body.lost + body.damaged !== editor.shipment.contents[index].quantity) {
+    error.textContent = 'Received, lost and damaged must total the expected quantity.'; return;
+  }
+  editor.busy = true;
+  const button = form.querySelector('[type="submit"]');
+  button.disabled = true;
+  error.textContent = '';
+  try {
+    const response = await fetch(`${INBOUND_URL}/receive`, {
+      method: 'POST', headers: adminHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify(body), signal: viewSignal()
+    });
+    const result = await response.json();
+    if (receivingEditor !== editor || state.session !== editor.session || state.activeClientId !== editor.clientId) return;
+    if (!response.ok || !result.success || result.clientId !== editor.clientId) throw new Error(result.error || 'Receiving was not confirmed. Refresh before retrying.');
+    editor.shipment = result.shipment;
+    if (inboundState.shipments) inboundState.shipments = inboundState.shipments.map(shipment => shipment.id === result.shipment.id ? result.shipment : shipment);
+    renderReceivingLines();
+    const status = await fetchInventory(editor.clientId);
+    if (receivingEditor !== editor || state.session !== editor.session || state.activeClientId !== editor.clientId) return;
+    if (status !== 200) throw new Error('Receiving saved, but inventory could not refresh. Close and reopen this review.');
+    renderTable();
+    renderInboundShipments();
+    renderReceivingLines();
+    document.getElementById('receivingMessage').textContent = 'Receiving saved. Only usable received units were added to inventory.';
+  } catch (failure) {
+    if (receivingEditor === editor) error.textContent = failure.message || 'Receiving save failed. Refresh and retry the same decision.';
+  } finally {
+    editor.busy = false;
+    button.disabled = false;
   }
 }
 
@@ -3193,6 +3384,7 @@ function renderPackagingInstructions() {
     const visible = current && (settings ? canManageStoreConnection() : Boolean(currentPackagingNotes()));
     host.hidden = !visible;
     host.innerHTML = visible ? `<h3>Standard Operating Procedure / Packaging Notes</h3>
+      ${settings ? '<p class="integration-description">Tell the ECL warehouse team how to handle and package orders for your business. These client-wide instructions apply to every item, such as including a thank-you card in each box, using branded packaging or following a standard packing checklist. Saved notes appear on your Dashboard and on warehouse receiving, inspection and packing screens. For instructions that apply to just one SKU, use that item\'s Special Prep Instructions instead.</p>' : ''}
       ${packagingBanner(null) || '<p class="inbound-hint">No client-wide packaging notes saved.</p>'}
       ${settings && canManageStoreConnection() ? '<button type="button" class="filter-clear" data-edit-packaging>Edit client packaging notes</button>' : ''}` : '';
   }
@@ -4082,6 +4274,8 @@ function openInventoryItemDialog(itemId) {
       ? 'Edit product details here. Received and shipped quantities are managed in Updates.'
       : 'Update product details, stock levels, and notes for this item.';
   document.getElementById('inventoryItemFields').innerHTML = renderItemDetailFields(snapshot, uniqueFields, 'modalItem_', viewOnly);
+  const productLinks = document.getElementById('inventoryProductLinks');
+  if (productLinks) productLinks.innerHTML = productSearchLinks(item.title, item.productUrl);
   document.getElementById('inventoryItemFields').inert = false;
   document.getElementById('inventoryItemError').textContent = '';
   document.getElementById('inventoryItemPinWrap').hidden = true;
@@ -4430,6 +4624,10 @@ document.getElementById('inboundContents')?.addEventListener('click', (event) =>
       const shipment = inboundState.shipments?.find((entry) => entry.id === button.dataset.shipmentId);
       if (shipment) checkInInboundShipment(shipment.trackingNumber, shipment.id);
     }
+    else if (button.dataset.inboundAction === 'review') {
+      const shipment = inboundState.shipments?.find(entry => entry.id === button.dataset.shipmentId);
+      if (shipment) openReceivingDialog(shipment);
+    }
   });
   document.getElementById(id)?.addEventListener('submit', (event) => {
     if (!event.target.matches('.inbound-scan')) return;
@@ -4437,7 +4635,44 @@ document.getElementById('inboundContents')?.addEventListener('click', (event) =>
     checkInInboundShipment(new FormData(event.target).get('code'));
   });
 });
-document.getElementById('storeConnectionForm')?.addEventListener('submit', saveStoreConnection);
+document.getElementById('receivingClose')?.addEventListener('click', closeReceivingDialog);
+  document.getElementById('receivingDialog')?.addEventListener('cancel', closeReceivingDialog);
+  document.getElementById('receivingLines')?.addEventListener('submit', event => {
+    event.preventDefault();
+    const form = event.target.closest('[data-receiving-line]');
+    if (form) saveReceivingLine(form);
+  });
+  document.getElementById('receivingLines')?.addEventListener('click', event => {
+    const form = event.target.closest('[data-receiving-line]');
+    if (!form) return;
+    if (event.target.closest('[data-receiving-fetch]')) fetchReceivingProduct(form);
+    if (event.target.closest('[data-receiving-apply]')) {
+      const product = receivingEditor?.products.get(form.dataset.receivingLine)?.[Number(form.querySelector('[data-receiving-product]')?.value)];
+      if (!product || receivingEditor.busy) return;
+      for (const [key, value] of Object.entries({ productName: product.title, sku: product.sku, imageUrl: product.imageUrl, productUrl: product.productUrl })) {
+        if (value) form.elements.namedItem(key).value = value;
+      }
+    }
+  });
+  document.getElementById('receivingLines')?.addEventListener('change', event => {
+    if (event.target.name !== 'target') return;
+    const form = event.target.closest('[data-receiving-line]');
+    if (!form || !receivingEditor || receivingEditor.busy) return;
+    const item = state.items.find(item => item.id === event.target.value);
+    form.querySelector('[data-receiving-prep]').innerHTML = packagingBanner(item, true);
+    const image = safeHttpUrl(item?.imageUrl);
+    form.querySelector('[data-receiving-match]').innerHTML = item
+      ? `<p class="inbound-hint">Selected inventory product: ${escapeHtml(item.title)} (${escapeHtml(item.sku)}). Current displayed quantity: ${escapeHtml(String(item.qty))}.</p>
+        ${image ? `<img class="receiving-product-image" src="${escapeHtml(image)}" alt="${escapeHtml(item.title)}" referrerpolicy="no-referrer" />` : ''}
+        ${productSearchLinks(item.title, item.productUrl)}` : '';
+  });
+  document.getElementById('receivingLines')?.addEventListener('error', event => {
+    if (!event.target.matches('.receiving-product-image')) return;
+    event.target.hidden = true;
+    const form = event.target.closest('[data-receiving-line]');
+    if (form) form.querySelector('[data-receiving-error]').textContent = 'Product image could not load. Verify the product name and listing URL instead.';
+  }, true);
+  document.getElementById('storeConnectionForm')?.addEventListener('submit', saveStoreConnection);
 document.getElementById('storeConnectionReload')?.addEventListener('click', loadStoreConnection);
 document.getElementById('storePlatform')?.addEventListener('change', () => { clearStoreSecrets(); syncStorePlatform(); });
 document.getElementById('storeRemoveCredentials')?.addEventListener('change', clearStoreSecrets);

@@ -12,7 +12,7 @@ const { FULFILLMENT_STATUSES, STOCK_STATUSES, fulfillmentStatus, shipmentStatus 
 const { fetchPublicPage, parseCatalog, catalogFeedUrl } = require('./catalogSync');
 const { CATALOG_FIELDS, catalogFieldKeys, catalogColumns, validateCatalogValues } = require('./catalogFields');
 const { integrationStorageReady, validateStoreConnection, parseStoreConnection, encryptStoreCredentials, readSubmittedCredentials } = require('./storeIntegration');
-const { INBOUND_SHEET, INBOUND_HEADERS, normalizeInboundTracking, validateInboundShipment, inboundFromRow } = require('./inboundShipments');
+const { INBOUND_SHEET, INBOUND_HEADERS, normalizeInboundTracking, validateInboundShipment, inboundFromRow, validateReceiving } = require('./inboundShipments');
 const { credentialRole, validSessionRole, warehouseAccess } = require('./permissions');
 const { validateBranding, scrapeBranding } = require('./branding');
 const { RATE_SHEET, ENTRY_SHEET, HISTORY_SHEET, BILLING_RATE_HEADERS, BILLING_ENTRY_HEADERS, BILLING_HISTORY_HEADERS, MONTH_PATTERN, sanitizeRateCard, rateCardFromRow, entryFromRow, sanitizeEntry, historyFromRow, sanitizeHistory, currentMonth, summarizeBilling } = require('./billing');
@@ -840,7 +840,7 @@ async function loadInventoryForClient(targetClientId, strict = false) {
 
         if (!skuValue && !titleValue && !statusValue) continue;
         if (!skuValue && !titleValue) continue;
-        if (!skuValue || /^\d+$/.test(skuValue)) {
+        if (!skuValue || (/^\d+$/.test(skuValue) && !/^CL-\d{3,}$/i.test(clientIdValue))) {
           const titleLower = titleValue.toLowerCase();
           if (!titleValue || (!titleLower.includes('inventory') && !titleLower.includes('client'))) {
             continue;
@@ -2310,7 +2310,7 @@ app.put('/api/inventory/item', async (req, res) => {
       if (!(key in layout.columns)) return res.status(400).json({ success: false, error: `"${key}" can't be edited here.` });
       const text = String(raw ?? '').trim();
       const maxLength = key === 'prepInstructions' || key === layout.catalog.keys.prepInstructions ? 5000
-        : key === 'imageUrl' || key === layout.catalog.keys.imageUrl ? 2000 : 500;
+        : ['imageUrl', 'productUrl', layout.catalog.keys.imageUrl, layout.catalog.keys.productUrl].includes(key) ? 2000 : 500;
       if (text.length > maxLength) return res.status(400).json({ success: false, error: `This product field must be ${maxLength} characters or fewer.` });
       if ((key === layout.titleKey || key === 'title') && !text) return res.status(400).json({ success: false, error: 'The product name cannot be blank.' });
       if (key === 'qty' && (!text || !Number.isSafeInteger(Number(text)) || Number(text) < 0)) {
@@ -2744,6 +2744,129 @@ app.post('/api/inbound-shipments/check-in', async (req, res) => {
   } catch (error) {
     console.error('Inbound shipment arrival failed:', error.message);
     return res.status(500).json({ success: false, error: 'Arrival was not confirmed. Refresh the inbound list before retrying. Stock quantities have not been changed.' });
+  }
+});
+
+const inboundReceivingLocks = new Set();
+
+app.post('/api/inbound-shipments/receive', async (req, res) => {
+  if (!isStaffSession(readNotificationSession(req))) return res.status(403).json({ success: false, error: 'Only ECL staff can review received products.' });
+  let lockedClient;
+  try {
+    const access = await inboundAccess(req, res);
+    if (!access) return;
+    if (inboundReceivingLocks.has(access.clientId)) return res.status(409).json({ success: false, error: 'Another receiving review is saving for this account. Refresh before retrying.' });
+    lockedClient = access.clientId;
+    inboundReceivingLocks.add(lockedClient);
+    const inboundSheet = await getOrCreateSheet(INBOUND_SHEET, INBOUND_HEADERS);
+    const inboundRows = await withRetry(() => inboundSheet.getRows());
+    const inboundRow = inboundRows.find(row => row.get('Shipment_ID') === req.body?.shipmentId && normalizeClientId(row.get('Client_ID')) === access.clientId);
+    if (!inboundRow) return res.status(404).json({ success: false, error: 'Shipment not found in this account.' });
+    const shipment = inboundFromRow(inboundRow);
+    const index = req.body?.lineIndex;
+    if (!shipment.arrivedAt || !Number.isSafeInteger(index) || !shipment.contents[index]) return res.status(400).json({ success: false, error: 'Record arrival and select a valid product line first.' });
+    let decision;
+    try { decision = validateReceiving(req.body, shipment.contents[index]); }
+    catch (error) { return res.status(400).json({ success: false, error: error.message }); }
+    let receipt = shipment.receiving[index];
+    if (receipt && JSON.stringify(receipt.decision) !== JSON.stringify(decision)) return res.status(409).json({ success: false, error: 'This product already has a receiving decision. Refresh; do not change an unconfirmed save.' });
+    if (receipt?.state === 'complete') return res.json({ success: true, clientId: access.clientId, shipment, alreadyReceived: true });
+    const profile = await getClientProfile(access.clientId);
+    const sheet = await findSheetByTitle(access.clientId);
+    if (!sheet) return res.status(404).json({ success: false, error: 'Inventory sheet not found.' });
+    const rows = await loadSheetRows(access.clientId);
+    const layout = await getItemEditColumns(access.clientId, rows);
+    const shipmentColumns = await getShipmentColumns(access.clientId, rows);
+    const quantityColumn = shipmentColumns?.received ?? layout.columns.qty;
+    if (decision.received && quantityColumn === undefined) return res.status(400).json({ success: false, error: 'This account needs a stock or Quantity Received column before products can be received.' });
+    const markerName = 'Inbound_Receiving_Log';
+    let markerColumn = layout.catalog.headers.findIndex(value => String(value).trim() === markerName);
+    if (markerColumn < 0) {
+      markerColumn = layout.catalog.headers.length;
+      layout.catalog.headers[markerColumn] = markerName;
+    }
+    const key = `${shipment.id}:${index}`;
+    const logs = rows.map((row, i) => {
+      if (i <= layout.catalog.headerRowIndex) return {};
+      const log = JSON.parse(String(row[markerColumn] || '{}'));
+      if (!log || typeof log !== 'object' || Array.isArray(log)) throw new Error('Invalid inventory receiving log. Contact an administrator.');
+      return log;
+    });
+    // The receipt marker and stock change share one Sheets batch. A retry reads the marker
+    // before applying stock again, including when the separate shipment-log save failed.
+    const appliedRow = logs.findIndex(log => Object.prototype.hasOwnProperty.call(log, key));
+    if (decision.received && appliedRow < 0) {
+      let rowIndex = -1;
+      if (decision.target !== 'new') {
+        const items = await loadInventoryForClient(access.clientId, true);
+        const item = items.find(item => item.id === decision.target);
+        if (!item || item.title !== req.body?.targetTitle || item.sku !== req.body?.targetSku) return res.status(409).json({ success: false, error: 'The selected product changed. Refresh inventory and review again.' });
+        if (layout.locate === 'sku') {
+          const matches = rows.map((row, i) => ({ row, i })).filter(({ row, i }) => i > layout.catalog.headerRowIndex && String(row[layout.columns.sku] || '').trim() === item.sku && String(row[layout.columns.title] || '').trim() === item.title);
+          if (matches.length === 1) rowIndex = matches[0].i;
+        } else rowIndex = Number(item.id.slice(access.clientId.length + 1));
+        if (rowIndex <= layout.catalog.headerRowIndex || !rows[rowIndex]) return res.status(409).json({ success: false, error: 'This product moved or has duplicate identifiers. Refresh and verify it.' });
+      }
+      const current = rowIndex < 0 ? 0 : Number(rows[rowIndex][quantityColumn] || 0);
+      if (!Number.isSafeInteger(current) || current < 0 || !Number.isSafeInteger(current + decision.received)) return res.status(409).json({ success: false, error: 'Current quantity is invalid. Correct the sheet before receiving.' });
+      if (!receipt) {
+        receipt = { state: 'pending', decision, rowIndex, before: current, after: current + decision.received, by: access.session.username, at: new Date().toISOString() };
+        shipment.receiving[index] = receipt;
+        if (JSON.stringify(shipment.receiving).length > 44000) return res.status(400).json({ success: false, error: 'This shipment receiving log is too large. Shorten product URLs before saving.' });
+        inboundRow.set('Receiving_JSON', JSON.stringify(shipment.receiving));
+        await inboundRow.save({ raw: true });
+      }
+      if (receipt.rowIndex !== rowIndex || receipt.before !== current) return res.status(409).json({ success: false, error: 'Inventory changed during this receiving review. Contact an administrator to reconcile the pending receipt.' });
+      const log = rowIndex < 0 ? {} : logs[rowIndex];
+      log[key] = { ...decision, by: receipt.by, at: receipt.at };
+      if (JSON.stringify(log).length > 45000) return res.status(409).json({ success: false, error: 'This product receiving log is full. Contact an administrator to archive it.' });
+      await prepareCatalogHeaders(sheet, rows, layout.catalog, Math.max(0, rowIndex));
+      if (rowIndex < 0) {
+        const row = Array(layout.catalog.headers.length).fill('');
+        const sku = decision.sku || `INBOUND-${shipment.id.slice(0, 8)}-${index + 1}`;
+        if (profile.legacy && access.clientId === 'CL-001') row[0] = access.clientId;
+        if (layout.columns.sku !== undefined) row[layout.columns.sku] = sku;
+        if (layout.columns.upc !== undefined) row[layout.columns.upc] = sku;
+        row[layout.columns[layout.titleKey]] = decision.productName;
+        if (layout.columns.quantityOrdered !== undefined) row[layout.columns.quantityOrdered] = shipment.contents[index].quantity;
+        row[quantityColumn] = receipt.after;
+        if (!profile.legacy && profile.inventoryMode === 'custom') row[2 + profile.fields.length] = decision.received;
+        if (shipmentColumns) row[shipmentColumns.shipped] = 0;
+        row[layout.columns.status] = shipmentColumns ? 'Arrived / Check-In' : receipt.after <= 5 ? 'Low Stock' : 'In Stock';
+        row[layout.columns.productUrl] = decision.productUrl;
+        row[layout.columns.imageUrl] = decision.imageUrl;
+        row[markerColumn] = JSON.stringify(log);
+        await sheet.saveUpdatedCells();
+        await sheet.loadHeaderRow(layout.catalog.headerRowIndex + 1);
+        // No blind retry: an uncertain append is recovered by its receipt marker.
+        await sheet.addRow(row, { raw: true });
+      } else {
+        sheet.getCell(rowIndex, quantityColumn).value = receipt.after;
+        if (layout.columns.status !== undefined) {
+          const shipped = shipmentColumns ? Number(rows[rowIndex][shipmentColumns.shipped] || 0) : 0;
+          sheet.getCell(rowIndex, layout.columns.status).value = shipmentColumns
+            ? shipmentStatus(rows[rowIndex][layout.columns.status], current, receipt.after, shipped)
+            : receipt.after <= 5 ? 'Low Stock' : 'In Stock';
+        }
+        sheet.getCell(rowIndex, markerColumn).value = JSON.stringify(log);
+        if (decision.productUrl) sheet.getCell(rowIndex, layout.columns.productUrl).value = decision.productUrl;
+        if (decision.imageUrl) sheet.getCell(rowIndex, layout.columns.imageUrl).value = decision.imageUrl;
+        await sheet.saveUpdatedCells();
+      }
+      invalidateReadCache('inventory:');
+    }
+    receipt = receipt || { decision, by: access.session.username, at: new Date().toISOString() };
+    receipt.state = 'complete';
+    shipment.receiving[index] = receipt;
+    if (JSON.stringify(shipment.receiving).length > 45000) return res.status(400).json({ success: false, error: 'This shipment receiving log is too large. Shorten product URLs before saving.' });
+    inboundRow.set('Receiving_JSON', JSON.stringify(shipment.receiving));
+    await inboundRow.save({ raw: true });
+    return res.json({ success: true, clientId: access.clientId, shipment: inboundFromRow(inboundRow) });
+  } catch (error) {
+    console.error('Inbound receiving failed:', error.message);
+    return res.status(500).json({ success: false, error: 'Receiving save was not confirmed. Refresh and retry the same decision; do not add this quantity manually. Contact an administrator if a pending receipt conflicts.' });
+  } finally {
+    if (lockedClient) inboundReceivingLocks.delete(lockedClient);
   }
 });
 

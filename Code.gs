@@ -56,7 +56,9 @@
  *   Client_Settings_JSON.enableInboundShipments defaults to true; admins can disable it per account.
  *   Headers: Shipment_ID, Client_ID, Carrier, Tracking_Number, Expected_Delivery_Date, Contents_JSON,
  *   Status, Created_At, Created_By, Arrived_At, Arrived_By. Contents_JSON holds [{sku, quantity}].
- *   Only ECL staff record arrivals by tracking barcode; inbound notices never change inventory quantities.
+ *   Only ECL staff record arrivals by tracking barcode; notices and arrival alone never change inventory quantities.
+ *   Express receiving reviews add confirmed usable quantities and log lost/damaged units in Receiving_JSON.
+ *   Inventory Inbound_Receiving_Log markers prevent same-receipt stock increments on retry.
  *   Packaging_Notes in User_Credentials holds client-wide SOP text (up to 5000 characters).
  *   Special Prep Instructions is per-SKU metadata, appended without moving legacy inventory columns.
  *   The portal shows both instructions at receiving/check-in, item inspection and fulfillment updates.

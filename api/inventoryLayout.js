@@ -115,7 +115,7 @@ function toGenericRows({ rows, oldFields, newFields, titleLabel = 'Product Title
       const label = String(rows[0][index] || '').trim();
       const catalog = CATALOG_FIELDS.find((field) => field.aliases.includes(label.toLowerCase()));
       if (catalog && newFields.some((field) => isCatalogField(field, catalog))) continue;
-      if (label === 'Check_In_Timestamp' || CATALOG_FIELDS.some((field) => field.aliases.includes(label.toLowerCase())) || /^Archived:/i.test(label)) {
+      if (['Check_In_Timestamp', 'Inbound_Receiving_Log'].includes(label) || CATALOG_FIELDS.some((field) => field.aliases.includes(label.toLowerCase())) || /^Archived:/i.test(label)) {
         existingArchiveColumns.push({ index, label });
         archiveLabels.add(label.toLowerCase());
       } else if (label) {
@@ -126,6 +126,8 @@ function toGenericRows({ rows, oldFields, newFields, titleLabel = 'Product Title
   if (hasLegacyLayout) {
     const index = sourceHeaders.indexOf('check_in_timestamp');
     if (index >= 0) existingArchiveColumns.push({ index, label: 'Check_In_Timestamp' });
+    const receivingIndex = sourceHeaders.indexOf('inbound_receiving_log');
+    if (receivingIndex >= 0) existingArchiveColumns.push({ index: receivingIndex, label: 'Inbound_Receiving_Log' });
   }
   CATALOG_FIELDS.forEach((catalog) => {
     const oldField = oldFields.find((field) => isCatalogField(field, catalog));
