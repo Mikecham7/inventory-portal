@@ -51,6 +51,7 @@ function mapClientSettings(raw, { fields = [], clientId = '' } = {}) {
   return {
     fieldVisibility,
     enableShippedTab: ![false, 'false', 0, '0'].includes(stored.enableShippedTab),
+    enableInboundShipments: ![false, 'false', 0, '0'].includes(stored.enableInboundShipments),
     quickEditMode: QUICK_EDIT_MODES.includes(stored.quickEditMode) ? stored.quickEditMode : legacyQuickEditDefault(clientId),
     attributeMap,
     overstockLevel: Number.isFinite(overstockLevel) && overstockLevel > 0 ? Math.floor(overstockLevel) : DEFAULT_OVERSTOCK_LEVEL

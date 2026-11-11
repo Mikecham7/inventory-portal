@@ -2660,8 +2660,8 @@ async function inboundAccess(req, res) {
     return null;
   }
   const profile = await getClientProfile(clientId);
-  if (profile.inventoryMode !== 'inventory') {
-    res.status(400).json({ success: false, error: 'Inbound restock notifications are for stock-level accounts.' });
+  if (!profile.enableInboundShipments) {
+    res.status(403).json({ success: false, error: 'Inbound restock shipments are disabled for this account. Contact an administrator to enable them.' });
     return null;
   }
   return { session, clientId };

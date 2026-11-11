@@ -2997,7 +2997,8 @@ let inboundState = { clientId: null, shipments: null, loading: false, busy: fals
 
 function inboundAvailable() {
   return state.auth && state.clientProfile?.clientId === state.activeClientId
-    && state.clientProfile.inventoryMode === 'inventory';
+    && state.activeClientId !== 'CL-000'
+    && ![false, 'false', 0, '0'].includes(state.clientProfile.enableInboundShipments);
 }
 
 function closeInboundDialog() {
@@ -3015,6 +3016,7 @@ function resetInboundShipments() {
 
 function renderInboundShipments() {
   const visible = inboundAvailable();
+  if (!visible) closeInboundDialog();
   const current = inboundState.clientId === state.activeClientId;
   const shipments = current ? inboundState.shipments : null;
   const busy = current && inboundState.busy;
@@ -4646,6 +4648,7 @@ function readClientSettingsForm(prefix) {
     quickEditMode: mode,
     inventoryMode: document.getElementById(`${prefix}InventoryMode`)?.value || undefined,
     enableShippedTab: Boolean(document.getElementById(`${prefix}EnableShippedTab`)?.checked),
+    enableInboundShipments: document.getElementById(`${prefix}EnableInboundShipments`)?.checked !== false,
     quickEditPin: mode === 'password' ? String(document.getElementById(`${prefix}QuickEditPin`)?.value || '').trim() : '',
     overstockLevel: overstock > 0 ? overstock : null
   };
@@ -4997,6 +5000,8 @@ async function loadClientForEdit(clientId) {
   if (overstockInput) overstockInput.value = profile.overstockLevel || '';
   const shippedTab = document.getElementById('ecEnableShippedTab');
   if (shippedTab) shippedTab.checked = ![false, 'false', 0, '0'].includes(profile.enableShippedTab);
+  const inboundToggle = document.getElementById('ecEnableInboundShipments');
+  if (inboundToggle) inboundToggle.checked = ![false, 'false', 0, '0'].includes(profile.enableInboundShipments);
 
   const attributeMap = profile.attributeMap || {};
   [['ecAttrBundled', 'bundled'], ['ecAttrFragile', 'fragile'], ['ecAttrOversized', 'oversized']].forEach(([id, attribute]) => {

@@ -1630,10 +1630,11 @@ test('shipped dashboard views partition inventory, compose filters and reset for
 test('saving the shipped-view toggle updates the active dashboard immediately without another profile read', async () => {
   const host = { hidden: true, querySelectorAll: () => [] };
   const checkbox = { checked: true };
+  const inboundCheckbox = { checked: true };
   const requests = [];
   const context = vm.createContext({
     document: {
-      getElementById: (id) => id === 'inventoryViews' ? host : id === 'ecEnableShippedTab' ? checkbox : null,
+      getElementById: (id) => id === 'inventoryViews' ? host : id === 'ecEnableShippedTab' ? checkbox : id === 'ecEnableInboundShipments' ? inboundCheckbox : null,
       querySelectorAll: () => [], addEventListener() {}
     },
     window: { location: { hostname: 'localhost' }, addEventListener() {} },
@@ -1654,11 +1655,14 @@ test('saving the shipped-view toggle updates the active dashboard immediately wi
     fetchClientProfile=async()=>{throw Error('Unexpected extra profile fetch');};`, context);
   await vm.runInContext('submitClientEdit()', context);
   assert.equal(requests[0].enableShippedTab, true);
+  assert.equal(requests[0].enableInboundShipments, true);
   assert.equal(host.hidden, false);
   vm.runInContext("state.inventoryView='shipped'", context);
   checkbox.checked = false;
+  inboundCheckbox.checked = false;
   await vm.runInContext('submitClientEdit()', context);
   assert.equal(requests[1].enableShippedTab, false);
+  assert.equal(requests[1].enableInboundShipments, false);
   assert.equal(host.hidden, true);
   assert.equal(vm.runInContext('state.inventoryView', context), 'active');
 });
@@ -1670,6 +1674,7 @@ test('legacy client settings map onto the new schema with safe defaults', () => 
     fieldVisibility: { bundled: { inventory: true, order: true }, notes: { inventory: true, order: true } },
     quickEditMode: 'disabled',
     enableShippedTab: true,
+    enableInboundShipments: true,
     attributeMap: { bundled: 'bundled', fragile: null, oversized: null },
     overstockLevel: 100
   });
@@ -1689,6 +1694,10 @@ test('legacy client settings map onto the new schema with safe defaults', () => 
   assert.equal(mapClientSettings('{"enableShippedTab":"false"}').enableShippedTab, false);
   assert.equal(mapClientSettings('{"enableShippedTab":false}').enableShippedTab, false);
   assert.equal(mapClientSettings('{}').enableShippedTab, true);
+  for (const disabled of [false, 'false', 0, '0']) {
+    assert.equal(mapClientSettings({ enableInboundShipments: disabled }).enableInboundShipments, false);
+  }
+  assert.equal(mapClientSettings('{}').enableInboundShipments, true);
 
   const fresh = planClientSettingsMigration({ clientId: 'CL-003', settingsCell: '', pinHashCell: '', editPinCell: '2468', fields: [] });
   assert.equal(JSON.parse(fresh.settingsJson).quickEditMode, 'enabled');
@@ -1886,14 +1895,18 @@ test('field toggles, quick-edit PIN protection, and legacy settings edits are en
     const cl002 = await (await call('PUT', '/admin/clients/CL-002', {
       quickEditMode: 'enabled',
       enableShippedTab: true,
+      enableInboundShipments: false,
       attributeMap: { bundled: null },
       fields: [{ key: 'bundled', showInInventory: true, showInOrder: false }]
     }, adminToken)).json();
     assert.ok(cl002.success);
+    assert.equal(cl002.profile.enableInboundShipments, false);
+    assert.equal(JSON.parse(credentialRows[0].values.Client_Settings_JSON).enableInboundShipments, false);
     assert.equal(cl002.profile.enableShippedTab, true);
     assert.equal(JSON.parse(credentialRows[0].values.Client_Settings_JSON).enableShippedTab, true);
     const refreshedProfile = await (await call('GET', '/client-profile?clientId=CL-002', null, ecomToken)).json();
     assert.equal(refreshedProfile.enableShippedTab, true);
+    assert.equal(refreshedProfile.enableInboundShipments, false);
     assert.equal(cl002.profile.fieldVisibility.bundled.order, false);
     assert.equal(cl002.profile.attributeMap.bundled, null);
     assert.equal(cl002.profile.quickEditMode, 'disabled');
@@ -2419,7 +2432,7 @@ test('inbound shipments validate tracking, calendar dates and expected SKU quant
   assert.equal(inboundFromRow({get:key=>values[key]}).status,'Arrived at Warehouse');
 });
 
-test('inbound restock API permits read-only stock clients, isolates accounts and records staff arrivals without inventory writes', async () => {
+test('inbound restock API supports all enabled client modes, enforces account toggles and records staff arrivals without inventory writes', async () => {
   invalidateReadCache('');
   const {INBOUND_HEADERS}=require('../api/inboundShipments');
   const creds=[
@@ -2462,7 +2475,16 @@ test('inbound restock API permits read-only stock clients, isolates accounts and
     assert.equal((await get('')).status,401);
     assert.equal((await get(client,'CL-004')).status,403);
     assert.equal((await post({...shipment,clientId:'CL-004'})).status,403);
-    assert.equal((await get(fulfillment,'CL-002')).status,400);
+    assert.equal((await get(fulfillment,'CL-002')).status,200);
+    creds[1].Client_Settings_JSON = '{"enableInboundShipments":false}';
+    invalidateReadCache('');
+    assert.equal((await get(fulfillment,'CL-002')).status,403);
+    assert.equal((await get(staff,'CL-002')).status,403);
+    assert.equal((await post({...shipment,clientId:'CL-002'},fulfillment)).status,403);
+    assert.equal((await post({clientId:'CL-002',code:'123'},staff,'/check-in')).status,403);
+    creds[1].Client_Settings_JSON = '{"enableInboundShipments":true}';
+    invalidateReadCache('');
+    assert.equal((await get(fulfillment,'CL-002')).status,200);
     assert.equal((await get(staff,'CL-999')).status,404);
     let response=await get();
     assert.equal(response.headers.get('cache-control'),'no-store');
@@ -2503,6 +2525,10 @@ test('inbound restock API permits read-only stock clients, isolates accounts and
     assert.equal((await post({...scan,shipmentId:shipment.shipmentId},staff,'/check-in')).status,200);
     saveError=true;
     assert.equal((await post({...scan,shipmentId:'legacy-duplicate'},staff,'/check-in')).status,500);
+    saveError=false;
+    const fulfillmentShipment={...shipment,clientId:'CL-002',shipmentId:'00000000-0000-4000-8000-000000000004'};
+    assert.equal((await post(fulfillmentShipment,fulfillment)).status,201,'fulfillment clients can create inbound shipments');
+    assert.equal((await post({clientId:'CL-002',code:shipment.trackingNumber},staff,'/check-in')).status,200,'staff can receive fulfillment-client inbound boxes');
     readsFail=true;
     assert.equal((await get()).status,500);
     assert.equal((await post({...shipment,trackingNumber:'123456789012'})).status,500);
@@ -3370,9 +3396,20 @@ test('inbound UI supports read-only notifications, staff scans, safe rendering a
   vm.runInContext("state.activeClientId='CL-002';state.clientProfile={clientId:'CL-002',inventoryMode:'custom'};resetInboundShipments()",context);
   finish({ok:true,json:async()=>({success:true,clientId:'CL-001',shipments:[shipment]})});
   await pending;
-  assert.equal(elements.inboundDashboard.hidden,true);
-  assert.equal(elements.inboundDashboard.innerHTML,'');
+  assert.equal(elements.inboundDashboard.hidden,false,'fulfillment accounts also support inbound restocks');
+  assert.match(elements.inboundDashboard.innerHTML,/Notify Restock/);
+  assert.doesNotMatch(elements.inboundDashboard.innerHTML,/1Z001234/,'previous account shipments are not retained');
   assert.equal(vm.runInContext('inboundState.shipments',context),null);
+  vm.runInContext("state.clientProfile.enableInboundShipments=false;renderInboundShipments()",context);
+  assert.equal(elements.inboundDashboard.hidden,true);
+  assert.equal(elements.inboundTracking.hidden,true);
+  assert.equal(elements.inboundDashboard.innerHTML,'');
+  assert.equal(elements.inboundDialog.open,false);
+  context.fetch=async()=>{throw new Error('Disabled inbound must not fetch');};
+  await context.loadInboundShipments();
+  vm.runInContext("state.clientProfile.enableInboundShipments=true;renderInboundShipments()",context);
+  assert.equal(elements.inboundDashboard.hidden,false);
+  assert.equal(elements.inboundTracking.hidden,false);
 });
 
 test('optional store settings keep secrets out of state, clear inputs and discard stale account responses', async () => {
@@ -4923,7 +4960,8 @@ test('first-time tour launches once for clients, navigates with back/next, and s
   assert.ok(!clientSteps.includes('#tabUpdate'), 'the requested receiving overview is removed from Getting Started');
   assert.ok(!clientSteps.includes('.barcode-checkin'), 'clients never enter staff check-in controls');
   assert.match(vm.runInContext("tourState.steps.find(step=>step.target==='#catalogSyncPanel').body", context), /continue manually without API keys/);
-  assert.equal(vm.runInContext('tourState.steps.length', context), total + 3);
+  assert.ok(clientSteps.includes('#inboundDashboard'), 'enabled fulfillment clients also get the inbound walkthrough');
+  assert.equal(vm.runInContext('tourState.steps.length', context), total + 4);
   vm.runInContext(`closeOnboardingTour({markSeen:false,restorePage:false});state.isAdmin=true;startHelpTour();`, context);
   assert.ok(vm.runInContext("tourState.steps.some(step=>step.target==='.barcode-checkin')", context));
   assert.match(vm.runInContext("tourState.steps.find(step=>step.target==='.barcode-checkin').body", context), /no quantity changes/);

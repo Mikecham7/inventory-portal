@@ -52,7 +52,8 @@
  *   Branding lookup and account-scoped saves run through the authenticated Express API.
  *   Never place plaintext API tokens or STORE_INTEGRATION_KEY in the sheet or return ciphertext in profiles.
  *   Saving configuration does not enable automatic order sync or provision a webhook receiver.
- *   Stock-client restock notices use the dedicated Inbound_Shipments sheet via /api/inbound-shipments.
+ *   All clients can use the dedicated Inbound_Shipments sheet via /api/inbound-shipments.
+ *   Client_Settings_JSON.enableInboundShipments defaults to true; admins can disable it per account.
  *   Headers: Shipment_ID, Client_ID, Carrier, Tracking_Number, Expected_Delivery_Date, Contents_JSON,
  *   Status, Created_At, Created_By, Arrived_At, Arrived_By. Contents_JSON holds [{sku, quantity}].
  *   Only ECL staff record arrivals by tracking barcode; inbound notices never change inventory quantities.
@@ -816,6 +817,7 @@ function getClientProfile(clientId) {
     allowLogs: true,
     allowUpdate: true,
     enableShippedTab: true,
+    enableInboundShipments: true,
     packagingNotes: "",
     websiteUrl: "",
     logoUrl: ""
@@ -853,6 +855,7 @@ function getClientProfile(clientId) {
         }
       }
       defaults.enableShippedTab = [false, "false", 0, "0"].indexOf(settings.enableShippedTab) < 0;
+      defaults.enableInboundShipments = [false, "false", 0, "0"].indexOf(settings.enableInboundShipments) < 0;
       defaults.portalTitle = String(getSetting(data[i], "Portal_Title", 6) || "").trim() || defaults.portalTitle;
       defaults.portalSubtitle = String(getSetting(data[i], "Portal_Subtitle", 7) || "").trim() || defaults.portalSubtitle;
       defaults.inventoryMode = String(getSetting(data[i], "Inventory_Mode", 8) || "").trim() || defaults.inventoryMode;

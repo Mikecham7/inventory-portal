@@ -603,6 +603,7 @@
           <label class="ac-check"><input type="checkbox" id="acAllowLogs" checked /> Allow logs</label>
           <label class="ac-check"><input type="checkbox" id="acAllowUpdate" checked /> Allow update</label>
           <label class="ac-check"><input type="checkbox" id="acEnableShippedTab" checked /> Enable Shipped/Orders View</label>
+          <label class="ac-check"><input type="checkbox" id="acEnableInboundShipments" checked /> Enable Inbound Restock Shipments</label>
           <label class="ac-check"><input type="checkbox" id="acReadOnly" /> Read-only dashboard</label>
         </div>
 
@@ -695,6 +696,7 @@
             <label class="ac-check"><input type="checkbox" id="ecAllowLogs" /> Allow logs</label>
             <label class="ac-check"><input type="checkbox" id="ecAllowUpdate" /> Allow update</label>
             <label class="ac-check"><input type="checkbox" id="ecEnableShippedTab" /> Enable Shipped/Orders View</label>
+            <label class="ac-check"><input type="checkbox" id="ecEnableInboundShipments" /> Enable Inbound Restock Shipments</label>
             <label class="ac-check"><input type="checkbox" id="ecReadOnly" /> Read-only dashboard</label>
           </div>
           </div>
@@ -922,7 +924,7 @@
           <details class="faq-item" data-keywords="inbound restock shipment notify expected contents sku boxes dock scan tracking arrival">
             <summary>How do I notify ECL about incoming restock boxes?</summary>
             <div class="faq-answer">
-              <p>Stock-level accounts can select <strong>Notify Restock / Add Inbound Shipment</strong> on Dashboard or ECL Tracking, even when inventory editing is restricted. Enter the carrier, tracking number, expected delivery date and one SKU/expected-quantity line per item. Log one tracking number per shipment, then select Notify warehouse.</p>
+              <p>All client accounts can use inbound restocks when enabled, even when inventory editing is restricted. Administrators can turn <strong>Enable Inbound Restock Shipments</strong> on or off when creating or editing an account; it is enabled by default. Select <strong>Notify Restock / Add Inbound Shipment</strong> on Dashboard or ECL Tracking. Enter the carrier, tracking number, expected delivery date and one SKU/expected-quantity line per item. Log one tracking number per shipment, then select Notify warehouse. Disabling the feature hides the section and blocks inbound actions without deleting existing shipment records.</p>
               <p>The inbound section shows en-route and arrived shipments with their expected contents. ECL staff select the client account, focus the <strong>Dock scan</strong> field, scan the tracking barcode with a USB scanner and press Enter. Staff can also use a shipment's arrival button. If a number matches more than one record, use the button on the correct shipment.</p>
               <p>Arrival records include the time and staff member. Notifications and arrival scans <strong>never change stock quantities</strong>; physical contents must still be verified through the normal inventory workflow. This log reflects ECL check-ins, not live carrier delivery events.</p>
             </div>
@@ -1112,6 +1114,6 @@
     <div class="toast" id="toast"></div>
 
     <script src="vendor/html5-qrcode.min.js"></script>
-    <script src="app.js?v=20261111b"></script>
+    <script src="app.js?v=20261111d"></script>
   </body>
 </html>
