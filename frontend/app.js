@@ -3584,24 +3584,57 @@ let barcodeCamera = null;
 let barcodeCameraStarting = false;
 let barcodeCameraGeneration = 0;
 let barcodeDecodeBusy = false;
+let barcodeCameraStopping = null;
+let barcodeAudio = null;
 
-async function stopBarcodeCamera() {
-  barcodeCameraGeneration += 1;
-  const camera = barcodeCamera;
-  if (!camera || barcodeCameraStarting) return;
-  barcodeCamera = null;
+function isBarcodeCameraRunning(camera) {
+  const status = camera.getState();
+  return status === Html5QrcodeScannerState.SCANNING || status === Html5QrcodeScannerState.PAUSED;
+}
+
+function stopBarcodeTracks() {
+  const reader = document.getElementById('barcodeCameraReader');
+  reader?.querySelectorAll('video').forEach((video) => {
+    video.srcObject?.getTracks().forEach((track) => track.stop());
+    video.srcObject = null;
+  });
+}
+
+async function releaseBarcodeCamera(camera) {
   try {
-    if (camera.isScanning) await camera.stop();
-    camera.clear();
-    const panel = document.getElementById('barcodeCameraPanel');
-    if (panel) panel.hidden = true;
+    if (isBarcodeCameraRunning(camera)) await camera.stop();
   } catch (error) {
-    setBarcodeScanMessage(`Unable to stop camera: ${error.message || error}. Close this page to release the camera.`, true);
+    setBarcodeScanMessage(`Camera cleanup error: ${error.message || error}. Camera tracks have been stopped.`, true);
+  } finally {
+    stopBarcodeTracks();
+    try {
+      camera.clear();
+    } catch (error) {
+      setBarcodeScanMessage(`Unable to clear scanner: ${error.message || error}. Camera tracks have been stopped.`, true);
+    }
+    document.getElementById('barcodeCameraReader')?.replaceChildren();
+    if (barcodeCamera === camera) barcodeCamera = null;
   }
 }
 
+function stopBarcodeCamera() {
+  barcodeCameraGeneration += 1;
+  const panel = document.getElementById('barcodeCameraPanel');
+  if (panel) panel.hidden = true;
+  stopBarcodeTracks();
+  if (barcodeAudio) {
+    barcodeAudio.close().catch((error) => console.warn('Scanner audio cleanup failed:', error));
+    barcodeAudio = null;
+  }
+  if (!barcodeCamera || barcodeCameraStarting) return Promise.resolve();
+  if (!barcodeCameraStopping) {
+    barcodeCameraStopping = releaseBarcodeCamera(barcodeCamera).finally(() => { barcodeCameraStopping = null; });
+  }
+  return barcodeCameraStopping;
+}
+
 async function startBarcodeCamera() {
-  if (!barcodeCheckInAllowed() || barcodeCamera || barcodeCameraStarting) return;
+  if (!barcodeCheckInAllowed() || barcodeCamera || barcodeCameraStarting || barcodeCameraStopping) return;
   resetBarcodeCheckIn();
   if (!window.isSecureContext || !navigator.mediaDevices?.getUserMedia) {
     setBarcodeScanMessage('Camera scanning requires HTTPS (or localhost) and camera permission. You can still use the USB scan field.', true);
@@ -3617,31 +3650,81 @@ async function startBarcodeCamera() {
   const panel = document.getElementById('barcodeCameraPanel');
   panel.hidden = false;
   barcodeCameraStarting = true;
-  const camera = new Html5Qrcode('barcodeCameraReader');
-  barcodeCamera = camera;
+  let camera;
   try {
+    const Audio = window.AudioContext || window.webkitAudioContext;
+    if (Audio) {
+      try {
+        barcodeAudio = new Audio();
+        barcodeAudio.resume().catch((error) => console.warn('Scanner audio unavailable:', error));
+      } catch (error) {
+        console.warn('Scanner audio unavailable:', error);
+      }
+    }
+    camera = new Html5Qrcode('barcodeCameraReader');
+    barcodeCamera = camera;
+    const startedAt = Date.now();
+    let decodingHintShown = false;
     await camera.start({ facingMode: 'environment' }, { fps: 10 }, async (code) => {
       if (barcodeDecodeBusy || barcodeScanBusy || barcodeCheckIn || barcodeCameraGeneration !== generation
         || state.session !== session || state.activeClientId !== clientId || !barcodeCheckInAllowed()) return;
+      if (typeof code !== 'string' || !code.trim()) {
+        setBarcodeScanMessage('Barcode could not be read. Center one barcode in the target and try again.', true);
+        return;
+      }
       barcodeDecodeBusy = true;
-      await stopBarcodeCamera();
       document.getElementById('barcodeScanInput').value = code;
+      barcodeScanFeedback(true);
+      setBarcodeScanMessage('Barcode captured. Looking up item...');
+      const stopping = stopBarcodeCamera();
+      const stoppedGeneration = barcodeCameraGeneration;
       try {
+        await stopping;
+        if (barcodeCameraGeneration !== stoppedGeneration || state.session !== session
+          || state.activeClientId !== clientId || !barcodeCheckInAllowed()) return;
         await scanBarcode({ preventDefault() {} });
+      } catch (error) {
+        setBarcodeScanMessage(`Barcode lookup failed: ${error.message || error}. Try again or use the USB scan field.`, true);
       } finally {
         barcodeDecodeBusy = false;
       }
-    }, () => {});
-    setBarcodeScanMessage('Camera ready. Hold one barcode in view.');
+    }, () => {
+      // A missed frame is normal while the user is positioning a barcode.
+      if (!decodingHintShown && Date.now() - startedAt > 5000 && generation === barcodeCameraGeneration && !barcodeDecodeBusy) {
+        decodingHintShown = true;
+        setBarcodeScanMessage('No barcode decoded yet. Center one barcode in the target, improve lighting and hold steady.');
+      }
+    });
+    if (generation === barcodeCameraGeneration) setBarcodeScanMessage('Camera ready. Center one barcode in the target.');
   } catch (error) {
-    setBarcodeScanMessage(`Camera unavailable: ${error.message || error}. Allow camera access or use the USB scan field.`, true);
+    if (generation === barcodeCameraGeneration) {
+      setBarcodeScanMessage(`Camera unavailable: ${error.message || error}. Allow camera access or use the USB scan field.`, true);
+    }
   } finally {
     barcodeCameraStarting = false;
-    if (generation !== barcodeCameraGeneration || !camera.isScanning) await stopBarcodeCamera();
+    if (!camera || generation !== barcodeCameraGeneration || !isBarcodeCameraRunning(camera)) await stopBarcodeCamera();
   }
 }
 
-function barcodeScanFeedback() {
+function barcodeScanFeedback(withAudio = false) {
+  if (withAudio && barcodeAudio) {
+    const audio = barcodeAudio;
+    barcodeAudio = null;
+    try {
+      const tone = audio.createOscillator();
+      const gain = audio.createGain();
+      tone.frequency.value = 880;
+      gain.gain.value = 0.08;
+      tone.connect(gain);
+      gain.connect(audio.destination);
+      tone.onended = () => audio.close().catch((error) => console.warn('Scanner audio cleanup failed:', error));
+      tone.start();
+      tone.stop(audio.currentTime + 0.12);
+    } catch (error) {
+      console.warn('Scanner audio feedback failed:', error);
+      audio.close().catch((closeError) => console.warn('Scanner audio cleanup failed:', closeError));
+    }
+  }
   const host = document.getElementById('barcodeScanMessage');
   if (host) {
     host.classList.add('scan-success');
@@ -3667,6 +3750,7 @@ function syncBarcodeCheckIn() {
     if (input) input.disabled = !allowed || barcodeScanBusy;
   });
   if (!allowed) {
+    stopBarcodeCamera();
     const form = document.getElementById('barcodeConfirmForm');
     if (form) form.hidden = true;
     setBarcodeScanMessage(state.isAdmin
@@ -3723,8 +3807,10 @@ async function scanBarcode(event) {
     return;
   }
   const input = document.getElementById('barcodeScanInput');
+  const scannedValue = input.value;
   const code = normalizeBarcode(input.value);
   resetBarcodeCheckIn();
+  input.value = scannedValue;
   if (!code) {
     setBarcodeScanMessage('Scan or enter a UPC, SKU or tracking number first.', true);
     input.focus();
@@ -4382,6 +4468,12 @@ document.getElementById('barcodeScanMatch')?.addEventListener('change', previewB
 document.getElementById('barcodeCameraStart')?.addEventListener('click', startBarcodeCamera);
 document.getElementById('barcodeCameraStop')?.addEventListener('click', stopBarcodeCamera);
 window.addEventListener('pagehide', stopBarcodeCamera);
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape' && document.getElementById('barcodeCameraPanel')?.hidden === false) {
+    stopBarcodeCamera();
+    document.getElementById('barcodeCameraStart')?.focus();
+  }
+});
 document.getElementById('staffAccountForm')?.addEventListener('submit', saveStaffAccount);
 document.getElementById('staffAccountsRefresh')?.addEventListener('click', loadStaffAccounts);
 document.getElementById('loginHistoryRefresh')?.addEventListener('click', loadLoginHistory);
@@ -4583,8 +4675,8 @@ function showAddClientMessage(text, type) {
   if (!el) return;
   revealContainingSections(el);
   el.style.display = 'block';
-  el.style.background = type === 'error' ? '#fef2f2' : '#f0fdf4';
-  el.style.color = type === 'error' ? '#b91c1c' : '#166534';
+  el.style.background = type === 'error' ? 'var(--feedback-error-bg, #fef2f2)' : 'var(--feedback-success-bg, #f0fdf4)';
+  el.style.color = type === 'error' ? 'var(--feedback-error-text, #b91c1c)' : 'var(--feedback-success-text, #166534)';
   el.textContent = text;
 }
 
@@ -4976,8 +5068,8 @@ function showEditClientMessage(text, type) {
   if (!el) return;
   revealContainingSections(el);
   el.style.display = 'block';
-  el.style.background = type === 'error' ? '#fef2f2' : '#f0fdf4';
-  el.style.color = type === 'error' ? '#b91c1c' : '#166534';
+  el.style.background = type === 'error' ? 'var(--feedback-error-bg, #fef2f2)' : 'var(--feedback-success-bg, #f0fdf4)';
+  el.style.color = type === 'error' ? 'var(--feedback-error-text, #b91c1c)' : 'var(--feedback-success-text, #166534)';
   el.textContent = text;
 }
 
@@ -5095,8 +5187,8 @@ function showResetPasswordMessage(text, type) {
   if (!el) return;
   revealContainingSections(el);
   el.style.display = 'block';
-  el.style.background = type === 'error' ? '#fef2f2' : '#f0fdf4';
-  el.style.color = type === 'error' ? '#b91c1c' : '#166534';
+  el.style.background = type === 'error' ? 'var(--feedback-error-bg, #fef2f2)' : 'var(--feedback-success-bg, #f0fdf4)';
+  el.style.color = type === 'error' ? 'var(--feedback-error-text, #b91c1c)' : 'var(--feedback-success-text, #166534)';
   el.textContent = text;
 }
 

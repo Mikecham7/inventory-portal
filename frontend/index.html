@@ -9,7 +9,7 @@
     <link rel="icon" type="image/png" sizes="192x192" href="icons/icon-192.png?v=1" />
     <link rel="apple-touch-icon" sizes="180x180" href="icons/icon-180.png?v=1" />
     <meta name="theme-color" content="#0D1B2A" />
-    <link rel="stylesheet" href="styles.css?v=20261110g" />
+    <link rel="stylesheet" href="styles.css?v=20261111c" />
   </head>
   <body>
     <div class="portal-login-overlay" id="portalLoginWindow">
@@ -254,8 +254,12 @@
           <button type="button" class="btn-set" id="barcodeCameraStart">Scan Barcode</button>
         </form>
         <div id="barcodeCameraPanel" hidden>
-          <div id="barcodeCameraReader"></div>
-          <button type="button" class="filter-clear" id="barcodeCameraStop">Stop camera</button>
+          <div class="barcode-viewfinder">
+            <div id="barcodeCameraReader"></div>
+            <div class="barcode-target" aria-hidden="true"><span></span></div>
+          </div>
+          <p class="billing-hint">Center one barcode inside the target and hold steady. A beep and highlighted message confirm a read.</p>
+          <button type="button" class="filter-clear" id="barcodeCameraStop">Close camera</button>
         </div>
         <p id="barcodeScanMessage" class="barcode-scan-message" role="status" aria-live="polite"></p>
         <div id="scanPackagingBanner"></div>
@@ -847,7 +851,7 @@
             <summary>What can each portal role access?</summary>
             <div class="faq-answer">
               <p><strong>Administrators</strong> can switch client accounts, manage client configuration and staff, and access billing and system settings.</p>
-              <p><strong>Warehouse staff</strong> can switch accounts for receiving, barcode check-in, inspection, fulfillment updates and activity logs. Administrators and warehouse staff can add inventory even when an account is view-only for its client. Staff Settings contains client branding only; warehouse staff cannot access billing, master settings, staff management or store credentials.</p>
+              <p><strong>Warehouse staff</strong> can switch accounts for receiving, barcode check-in, inspection, fulfillment updates and activity logs. In Updates, choose Scan Barcode, center one barcode in the green target and hold steady. A highlighted message and a beep (when audio is available) confirm capture. Close camera or press Escape to release the camera; leaving Updates or hiding the page also stops it. Administrators and warehouse staff can add inventory even when an account is view-only for its client. Staff Settings contains client branding only; warehouse staff cannot access billing, master settings, staff management or store credentials.</p>
               <p><strong>Clients</strong> can access only their own inventory, inbound shipments, tracking, chat and activity. Item editing still follows their account's inventory permissions. Clients can maintain their own packaging notes and optional store configuration; billing is available only when shared by an administrator. The API enforces account boundaries as well as hiding restricted controls.</p>
             </div>
           </details>
@@ -1108,6 +1112,6 @@
     <div class="toast" id="toast"></div>
 
     <script src="vendor/html5-qrcode.min.js"></script>
-    <script src="app.js?v=20261110p"></script>
+    <script src="app.js?v=20261111b"></script>
   </body>
 </html>

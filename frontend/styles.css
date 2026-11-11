@@ -975,6 +975,10 @@ html[data-theme="dark"] {
 }
 
 html[data-theme="dark"] body { background: var(--canvas); color: var(--text); }
+html[data-theme="dark"] .summary-card .num,
+html[data-theme="dark"] .summary-card .lbl { color: var(--text); }
+html[data-theme="dark"] .summary-card.warn .num { color: var(--yellow-fg); }
+html[data-theme="dark"] .summary-card.danger .num { color: var(--red-fg); }
 html[data-theme="dark"] .pin-box { background: var(--surface); color: var(--text); }
 html[data-theme="dark"] .pin-box h3 { color: var(--text); }
 html[data-theme="dark"] .pin-box p { color: var(--muted-text); }
@@ -1265,6 +1269,9 @@ html[data-theme="dark"] .tour-card .tour-skip { color: var(--muted-text); }
 #barcodeCameraPanel[hidden] { display: none; }
 #barcodeCameraReader { width: 100%; max-width: 480px; overflow: hidden; border-radius: 10px; background: var(--surface-head); }
 #barcodeCameraReader video { width: 100%; }
+.barcode-viewfinder { position: relative; width: 100%; max-width: 480px; overflow: hidden; border-radius: 10px; background: #101820; }
+.barcode-target { position: absolute; z-index: 2; top: 30%; left: 10%; width: 80%; height: 40%; border: 2px solid #73f5ae; border-radius: 12px; box-shadow: 0 0 0 999px rgba(0, 0, 0, .3); pointer-events: none; }
+.barcode-target span { position: absolute; top: 50%; left: 4%; right: 4%; height: 2px; background: #73f5ae; box-shadow: 0 0 8px #73f5ae; }
 #barcodeCameraStop { min-height: 44px; margin-top: 10px; }
 .barcode-checkin :disabled { opacity: .6; cursor: not-allowed; }
 .staff-accounts-toolbar, .staff-account-row, .staff-account-actions { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
@@ -1355,3 +1362,62 @@ html[data-theme="dark"] #page-order { --entry-accent: #8fc5ff; --entry-focus: rg
   color: var(--client-accent-text, white);
 }
 .inventory-view[aria-pressed="true"] { border-color: var(--client-accent, var(--mid)); }
+
+html[data-theme="dark"] {
+  --feedback-error-bg: var(--red-bg);
+  --feedback-success-bg: var(--green-bg);
+  --feedback-error-text: var(--text);
+  --feedback-success-text: var(--text);
+}
+
+html[data-theme="dark"] .toast {
+  background: var(--surface-head);
+  color: var(--text);
+  border-top: 1px solid var(--surface-border-strong);
+  border-right: 1px solid var(--surface-border-strong);
+  border-bottom: 1px solid var(--surface-border-strong);
+}
+html[data-theme="dark"] .notification-panel { background: var(--surface); color: var(--text); }
+html[data-theme="dark"] .notification-row,
+html[data-theme="dark"] .notification-heading button { color: var(--text); }
+html[data-theme="dark"] .notification-row:hover { background: var(--surface-head); }
+html[data-theme="dark"] .notification-badge { background: #9c2534; color: white; }
+
+html[data-theme="dark"] :is(.content, .inventory-item-dialog) :is(
+  .integration-notice, .item-entry-notice, .prep-banner, .ac-note, .activity-notice,
+  .tracking-error, .inventory-dialog-error, .barcode-scan-message, .inbound-error,
+  .branding-status, .staff-account-message, #storeConnectionStatus,
+  #catalogSyncMessage, #catalogImageMessage, #loginHistoryMessage
+) {
+  color: var(--text);
+}
+html[data-theme="dark"] :is(
+  .inventory-dialog-error, .barcode-scan-message, .inbound-error, .branding-status,
+  .staff-account-message, #storeConnectionStatus, #catalogSyncMessage,
+  #catalogImageMessage, #loginHistoryMessage
+):not(:empty) {
+  background: var(--surface-head);
+  border: 1px solid var(--surface-border-strong);
+  border-radius: 8px;
+  padding: 12px;
+}
+html[data-theme="dark"] :is(.content, .inventory-item-dialog) :is(
+  .activity-notice, .tracking-error, .inventory-dialog-error, .inbound-error,
+  .barcode-scan-message.is-error, #staffAccountMessage.is-error,
+  #storeConnectionStatus.is-error, #catalogSyncMessage.is-error
+):not(:empty) {
+  background: var(--red-bg);
+  border-color: var(--red-fg);
+}
+html[data-theme="dark"] .content .barcode-scan-message.scan-success {
+  background: var(--green-bg);
+  border-color: var(--green-fg);
+}
+html[data-theme="dark"] .content :is(.prep-banner, .selected-banner) :is(h3, p, .sl, .ss, .st) { color: var(--text); }
+html[data-theme="dark"] .content :is(.integration-notice, .ac-note) a { color: var(--text); text-decoration: underline; }
+html[data-theme="dark"] .msg-status.failed { background: var(--red-bg); color: var(--text); padding: 4px 6px; border-radius: 4px; }
+
+html[data-theme="dark"] .login-error { background: var(--red-bg); color: var(--text); padding: 10px; border: 1px solid var(--red-fg); border-radius: 6px; }
+html[data-theme="dark"] .recovery-code-box { background: var(--green-bg); color: var(--text); border-color: var(--green-fg); }
+html[data-theme="dark"] .recovery-code-box p { color: var(--text); }
+html[data-theme="dark"] .recovery-code-value { background: var(--surface); color: var(--text); border-color: var(--green-fg); }

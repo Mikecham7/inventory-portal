@@ -3645,14 +3645,37 @@ test('tracking renders sheet progression, filters independently and clears stale
 
 test('camera scanning reports errors, suppresses duplicate decodes, and releases cancelled camera starts', async () => {
   const elements = Object.fromEntries(['barcodeCameraPanel', 'barcodeScanInput', 'barcodeScanMessage'].map((id) => [id, {
-    hidden: true, value: '', textContent: '', classList: { toggle() {} }
+    hidden: true, value: '', textContent: '', classList: { toggle() {}, add() {}, remove() {} }
   }]));
+  let trackStopCount = 0;
+  const video = { srcObject: null };
+  elements.barcodeCameraReader = {
+    querySelectorAll: () => [video],
+    replaceChildren() { this.cleared = true; }
+  };
+  const attachStream = () => {
+    video.srcObject = { getTracks: () => [{ stop() { trackStopCount += 1; } }] };
+  };
+  const listeners = {};
   let decode;
   let finishStart;
   let stopCount = 0;
   let clearCount = 0;
+  let beepCount = 0;
+  let audioCloseCount = 0;
+  class Audio {
+    currentTime = 0;
+    destination = {};
+    async resume() {}
+    async close() { audioCloseCount += 1; }
+    createGain() { return { gain: {}, connect() {} }; }
+    createOscillator() {
+      return { frequency: {}, connect() {}, start() { beepCount += 1; }, stop() { this.onended(); } };
+    }
+  }
   class Camera {
     isScanning = false;
+    getState() { return this.reportedState ?? (this.isScanning ? 2 : 1); }
     start(_device, _options, callback) {
       decode = callback;
       return new Promise((resolve) => { finishStart = () => { this.isScanning = true; resolve(); }; });
@@ -3661,29 +3684,107 @@ test('camera scanning reports errors, suppresses duplicate decodes, and releases
     clear() { clearCount += 1; }
   }
   const context = vm.createContext({
-    document: { getElementById: (id) => elements[id] || null, querySelectorAll: () => [], addEventListener() {} },
-    window: { location: { hostname: 'localhost' }, isSecureContext: true, addEventListener() {} },
+    document: { getElementById: (id) => elements[id] || null, querySelectorAll: () => [], addEventListener(name, callback) { (listeners[name] ||= []).push(callback); } },
+    window: { AudioContext: Audio, location: { hostname: 'localhost' }, isSecureContext: true, addEventListener(name, callback) { (listeners[name] ||= []).push(callback); } },
     navigator: { mediaDevices: { getUserMedia() {} } },
-    Html5Qrcode: Camera, AbortController, setTimeout, clearTimeout
+    Html5Qrcode: Camera, Html5QrcodeScannerState: { SCANNING: 2, PAUSED: 3 }, AbortController, setTimeout, clearTimeout
   });
   vm.runInContext(fs.readFileSync(require.resolve('../frontend/app.js'), 'utf8'), context);
-  vm.runInContext("state.auth=true;state.isAdmin=true;state.activeClientId='CL-002';state.session={};scanBarcode=async()=>{scanCount+=1;};", context);
+  vm.runInContext("state.auth=true;state.isAdmin=true;state.activeClientId='CL-002';state.session={role:'admin'};scanBarcode=async()=>{scanCount+=1;};", context);
   context.scanCount = 0;
   const cancelled = context.startBarcodeCamera();
+  attachStream();
   await context.stopBarcodeCamera();
+  assert.equal(trackStopCount, 1, 'tracks stop immediately even while camera start is pending');
+  assert.equal(video.srcObject, null);
+  assert.equal(elements.barcodeCameraPanel.hidden, true, 'cancel hides pending camera immediately');
+  attachStream();
   finishStart();
   await cancelled;
   assert.equal(stopCount, 1);
   assert.equal(clearCount, 1);
+  assert.equal(trackStopCount, 2, 'late startup streams are stopped as well');
+  assert.equal(elements.barcodeCameraReader.cleared, true);
   assert.equal(elements.barcodeCameraPanel.hidden, true);
   const started = context.startBarcodeCamera();
   finishStart();
   await started;
+  attachStream();
+  await decode('');
+  assert.equal(context.scanCount, 0);
+  assert.match(elements.barcodeScanMessage.textContent, /could not be read/);
   await Promise.all([decode('012345678901'), decode('012345678901')]);
   assert.equal(context.scanCount, 1);
+  assert.equal(beepCount, 1, 'a successful decode gives one immediate audio confirmation');
+  assert.equal(audioCloseCount, 2, 'cancelled and successful audio contexts are released');
   assert.equal(elements.barcodeScanInput.value, '012345678901');
   assert.equal(stopCount, 2);
+  assert.equal(trackStopCount, 3);
   assert.equal(elements.barcodeCameraPanel.hidden, true);
+  for (const reason of ['escape', 'pagehide', 'visibilitychange', 'navigation', 'account-change']) {
+    const opening = context.startBarcodeCamera();
+    finishStart();
+    await opening;
+    attachStream();
+    const previous = trackStopCount;
+    if (reason === 'escape') listeners.keydown.forEach(callback => callback({ key: 'Escape' }));
+    if (reason === 'pagehide') listeners.pagehide.forEach(callback => callback());
+    if (reason === 'visibilitychange') {
+      context.document.hidden = true;
+      listeners.visibilitychange.forEach(callback => callback());
+      context.document.hidden = false;
+    }
+    if (reason === 'navigation') context.setPage('page-dashboard');
+    if (reason === 'account-change') context.resetBarcodeCheckIn();
+    assert.equal(trackStopCount, previous + 1, `${reason} immediately stops camera tracks`);
+    await context.stopBarcodeCamera();
+    assert.equal(elements.barcodeCameraPanel.hidden, true);
+    assert.equal(vm.runInContext('barcodeCamera', context), null);
+  }
+  const failingLookup = context.startBarcodeCamera();
+  finishStart();
+  await failingLookup;
+  vm.runInContext("scanBarcode=async()=>{throw new Error('lookup unavailable');};", context);
+  await decode('00mixed-Case');
+  assert.equal(elements.barcodeScanInput.value, '00mixed-Case', 'decoded text and leading zeros are preserved exactly');
+  assert.match(elements.barcodeScanMessage.textContent, /lookup unavailable/);
+  assert.equal(vm.runInContext('barcodeDecodeBusy', context), false, 'failed lookup allows another scan');
+  let finishStop;
+  context.Html5Qrcode = class extends Camera {
+    stop() {
+      return new Promise(resolve => { finishStop = () => { this.isScanning = false; resolve(); }; });
+    }
+  };
+  const leavingDuringDecode = context.startBarcodeCamera();
+  finishStart();
+  await leavingDuringDecode;
+  vm.runInContext('scanBarcode=async()=>{scanCount+=1;};', context);
+  const staleDecode = decode('stale-code');
+  const previousScans = context.scanCount;
+  context.resetBarcodeCheckIn();
+  finishStop();
+  await staleDecode;
+  assert.equal(context.scanCount, previousScans, 'navigation during shutdown cannot submit a stale decode');
+  context.Html5Qrcode = class extends Camera {
+    async start() { this.reportedState = 2; }
+  };
+  await context.startBarcodeCamera();
+  assert.equal(elements.barcodeCameraPanel.hidden, false, 'running state remains active before the first video frame');
+  const stopsBeforeFirstFrame = stopCount;
+  await context.stopBarcodeCamera();
+  assert.equal(stopCount, stopsBeforeFirstFrame + 1, 'running state is stopped even before isScanning becomes true');
+  context.Html5Qrcode = class extends Camera {
+    async stop() { throw new Error('device disconnected'); }
+    clear() { throw new Error('reader disconnected'); }
+  };
+  const failingCleanup = context.startBarcodeCamera();
+  finishStart();
+  await failingCleanup;
+  attachStream();
+  await context.stopBarcodeCamera();
+  assert.equal(video.srcObject, null);
+  assert.equal(vm.runInContext('barcodeCamera', context), null);
+  assert.match(elements.barcodeScanMessage.textContent, /Unable to clear scanner/);
   context.Html5Qrcode = class extends Camera {
     async start() { throw new Error('Permission denied'); }
   };
@@ -3693,6 +3794,15 @@ test('camera scanning reports errors, suppresses duplicate decodes, and releases
   context.window.isSecureContext = false;
   await context.startBarcodeCamera();
   assert.match(elements.barcodeScanMessage.textContent, /HTTPS/);
+});
+
+test('camera viewfinder has a responsive non-interactive targeting overlay and close instructions', () => {
+  const html = fs.readFileSync(require.resolve('../frontend/index.html'), 'utf8');
+  const css = fs.readFileSync(require.resolve('../frontend/styles.css'), 'utf8');
+  assert.match(html, /class="barcode-viewfinder"[\s\S]*?id="barcodeCameraReader"[\s\S]*?class="barcode-target" aria-hidden="true"/);
+  assert.match(html, /id="barcodeCameraStop">Close camera/);
+  assert.match(css, /\.barcode-target \{[^}]*width: 80%;[^}]*pointer-events: none;/);
+  assert.match(css, /\.barcode-target span \{[^}]*height: 2px;[^}]*box-shadow:/);
 });
 
 test('barcode check-in matches active UPC/SKU/tracking, verifies ambiguous items and records arrival without quantities', async () => {
@@ -4004,6 +4114,46 @@ test('branding form keeps manual values after partial or failed fetches and disc
   await pending;
   assert.equal(inputs.logoUrl.value,'https://brand.example/manual.png');
   assert.equal(vm.runInContext('state.clientProfile.logoUrl',context),'https://other.example/logo.png');
+});
+
+test('dark notification panels, popup messages and alert states use light text on opaque contrasting surfaces', () => {
+  const css = fs.readFileSync(require.resolve('../frontend/styles.css'), 'utf8');
+  assert.match(css, /html\[data-theme="dark"\] \.notification-panel \{ background: var\(--surface\); color: var\(--text\); \}/);
+  assert.match(css, /html\[data-theme="dark"\] \.notification-row,[\s\S]*?\.notification-heading button \{ color: var\(--text\); \}/);
+  assert.match(css, /html\[data-theme="dark"\] \.toast \{[^}]*background: var\(--surface-head\);[^}]*color: var\(--text\)/);
+  assert.match(css, /--feedback-error-bg: var\(--red-bg\)/);
+  assert.match(css, /--feedback-success-bg: var\(--green-bg\)/);
+  assert.match(css, /--feedback-error-text: var\(--text\)/);
+  assert.match(css, /--feedback-success-text: var\(--text\)/);
+  assert.match(css, /\.recovery-code-box p \{ color: var\(--text\); \}/);
+  assert.match(css, /\.login-error \{ background: var\(--red-bg\); color: var\(--text\)/);
+  const alertRule = css.slice(css.indexOf('html[data-theme="dark"] :is(.content, .inventory-item-dialog) :is('));
+  for (const selector of [
+    '.integration-notice', '.item-entry-notice', '.prep-banner', '.ac-note', '.activity-notice',
+    '.tracking-error', '.inventory-dialog-error', '.barcode-scan-message', '.inbound-error',
+    '.branding-status', '.staff-account-message', '#storeConnectionStatus',
+    '#catalogSyncMessage', '#catalogImageMessage', '#loginHistoryMessage'
+  ]) assert.ok(alertRule.split(') {')[0].includes(selector), `${selector} has an explicit dark text override`);
+  assert.match(alertRule, /\):not\(:empty\) \{\s*background: var\(--surface-head\);/);
+  const darkVariables = css.split('html[data-theme="dark"] {')[1].split('}')[0];
+  const color = name => darkVariables.match(new RegExp(`--${name}: (#[a-f0-9]{6})`, 'i'))[1];
+  const luminance = hex => hex.slice(1).match(/../g).map(value => {
+    const channel = parseInt(value, 16) / 255;
+    return channel <= .04045 ? channel / 12.92 : ((channel + .055) / 1.055) ** 2.4;
+  }).reduce((sum, channel, index) => sum + channel * [.2126, .7152, .0722][index], 0);
+  const text = luminance(color('text'));
+  for (const name of ['surface', 'surface-head', 'red-bg', 'green-bg', 'blue-bg', 'yellow-bg']) {
+    const background = luminance(color(name));
+    const contrast = (Math.max(text, background) + .05) / (Math.min(text, background) + .05);
+    assert.ok(contrast >= 4.5, `${name} text contrast ${contrast.toFixed(2)} meets WCAG AA`);
+  }
+});
+
+test('dashboard summary counts and labels use readable dark colors while preserving severity colors', () => {
+  const css = fs.readFileSync(require.resolve('../frontend/styles.css'), 'utf8');
+  assert.match(css, /html\[data-theme="dark"\] \.summary-card \.num,\s*html\[data-theme="dark"\] \.summary-card \.lbl \{ color: var\(--text\); \}/);
+  assert.match(css, /html\[data-theme="dark"\] \.summary-card\.warn \.num \{ color: var\(--yellow-fg\); \}/);
+  assert.match(css, /html\[data-theme="dark"\] \.summary-card\.danger \.num \{ color: var\(--red-fg\); \}/);
 });
 
 test('settings headings and protected-action controls use readable theme colors', () => {
@@ -4546,6 +4696,11 @@ test('portal navigation identifies the current page and client responses expand 
     assert.equal(outer.open, true);
     assert.equal(messages[id].textContent, 'Operation complete');
     assert.equal(messages[id].style.display, 'block');
+    assert.equal(messages[id].style.background, 'var(--feedback-success-bg, #f0fdf4)');
+    assert.equal(messages[id].style.color, 'var(--feedback-success-text, #166534)');
+    context[functionName]('Operation failed', 'error');
+    assert.equal(messages[id].style.background, 'var(--feedback-error-bg, #fef2f2)');
+    assert.equal(messages[id].style.color, 'var(--feedback-error-text, #b91c1c)');
   }
 });
 
