@@ -1,7 +1,8 @@
 const INBOUND_SHEET = 'Inbound_Shipments';
 const INBOUND_HEADERS = [
   'Shipment_ID', 'Client_ID', 'Carrier', 'Tracking_Number', 'Expected_Delivery_Date',
-  'Contents_JSON', 'Status', 'Created_At', 'Created_By', 'Arrived_At', 'Arrived_By', 'Receiving_JSON'
+  'Contents_JSON', 'Status', 'Created_At', 'Created_By', 'Arrived_At', 'Arrived_By', 'Receiving_JSON',
+  'Deletion_State', 'Deleted_At'
 ];
 const INBOUND_CARRIERS = ['UPS', 'FedEx', 'USPS', 'DHL', 'Other'];
 
@@ -83,3 +84,58 @@ function validateReceiving(input, line) {
 }
 
 module.exports = { INBOUND_SHEET, INBOUND_HEADERS, normalizeInboundTracking, validateInboundShipment, inboundFromRow, validateProductUrl, validateReceiving };
+
+function planInboundDeletion(shipment, rows, quantityColumn, markerColumn, shippedColumn) {
+  const normalized = row => {
+    const values = [...row];
+    while (values.length && (values[values.length - 1] === '' || values[values.length - 1] == null)) values.pop();
+    return JSON.stringify(values);
+  };
+  const receipts = Object.entries(shipment.receiving || {});
+  if (receipts.some(([, receipt]) => receipt.state !== 'complete')) throw new Error('Receiving is pending. Complete or reconcile it before deleting this shipment.');
+  const plans = [];
+  const found = new Set();
+  rows.forEach((row, rowIndex) => {
+    if (rowIndex === 0 || !row[markerColumn]) return;
+    const log = JSON.parse(String(row[markerColumn]));
+    const keys = Object.keys(log).filter(key => key.startsWith(`${shipment.id}:`));
+    if (!keys.length) return;
+    const relevant = keys.map(key => {
+      const index = key.slice(shipment.id.length + 1);
+      const receipt = shipment.receiving[index];
+      if (!receipt || receipt.state !== 'complete' || JSON.stringify(log[key]) !== JSON.stringify({ ...receipt.decision, by: receipt.by, at: receipt.at })) throw new Error('Inventory receipt markers changed. Reconcile before deleting.');
+      found.add(index);
+      return receipt;
+    }).sort((a, b) => a.after - b.after);
+    const total = relevant.reduce((sum, receipt) => sum + receipt.decision.received, 0);
+    const latest = relevant[relevant.length - 1];
+    if (!latest.inventoryAfter || normalized(row) !== normalized(latest.inventoryAfter)) throw new Error('Product details changed or this older receipt has no safe reversal snapshot. Reconcile before deleting.');
+    const current = Number(row[quantityColumn] || 0);
+    if (!Number.isSafeInteger(current) || current !== latest.after || current < total
+      || (shippedColumn !== undefined && Number(row[shippedColumn] || 0) > 0)) throw new Error('Received stock has changed or shipped. Reconcile inventory before deleting this shipment.');
+    for (let i = 1; i < relevant.length; i += 1) {
+      if (relevant[i].before !== relevant[i - 1].after) throw new Error('Other stock changes occurred between receipts. Reconcile before deleting.');
+    }
+    const created = relevant.some(receipt => receipt.decision.target === 'new');
+    const before = [...row];
+    let after = [...row];
+    if (created) {
+      if (Object.keys(log).length !== keys.length || current !== total) throw new Error('This new product now includes other inventory. Reconcile before deleting.');
+      after = row.map(() => '');
+    } else {
+      keys.forEach(key => delete log[key]);
+      after[quantityColumn] = current - total;
+      after[markerColumn] = Object.keys(log).length ? JSON.stringify(log) : '';
+      if (!relevant[0].inventoryBefore) throw new Error('Original inventory details are missing. Reconcile before deleting.');
+      after = [...relevant[0].inventoryBefore];
+      after = Array.from({ length: before.length }, (_, i) => after[i] ?? '');
+    }
+    plans.push({ rowIndex, before, after });
+  });
+  receipts.forEach(([index, receipt]) => {
+    if (receipt.decision.received > 0 && !found.has(index)) throw new Error('A received product moved or its receipt is missing. Reconcile before deleting.');
+  });
+  return plans;
+}
+
+module.exports.planInboundDeletion = planInboundDeletion;

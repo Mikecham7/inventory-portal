@@ -59,6 +59,8 @@
  *   Only ECL staff record arrivals by tracking barcode; notices and arrival alone never change inventory quantities.
  *   Express receiving reviews add confirmed usable quantities and log lost/damaged units in Receiving_JSON.
  *   Inventory Inbound_Receiving_Log markers prevent same-receipt stock increments on retry.
+ *   Express admin-only deletion requires server ADMIN_DELETION_PIN and a reason, preserves
+ *   Inbound_Deletion_Audit, and reverses stock only when receiving snapshots still match.
  *   Packaging_Notes in User_Credentials holds client-wide SOP text (up to 5000 characters).
  *   Special Prep Instructions is per-SKU metadata, appended without moving legacy inventory columns.
  *   The portal shows both instructions at receiving/check-in, item inspection and fulfillment updates.

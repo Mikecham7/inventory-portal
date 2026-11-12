@@ -3007,6 +3007,7 @@ function closeInboundDialog() {
   document.getElementById('inboundDialog')?.close?.();
   inboundDraftId = null;
   closeReceivingDialog();
+  closeInboundDeleteDialog();
 }
 
 function resetInboundShipments() {
@@ -3050,6 +3051,7 @@ function renderInboundShipments() {
           ${shipment.arrivedAt ? `<p>Arrived ${escapeHtml(formatActivityTimestamp(shipment.arrivedAt))} &middot; ${escapeHtml(shipment.arrivedBy)}</p>` : state.isAdmin
             ? `<button type="button" class="filter-clear" data-inbound-action="arrive" data-shipment-id="${escapeHtml(shipment.id)}"${busy ? ' disabled' : ''}>Record arrival for this shipment</button>` : ''}
           ${shipment.arrivedAt && state.isAdmin ? `<button type="button" class="filter-clear" data-inbound-action="review" data-shipment-id="${escapeHtml(shipment.id)}"${busy ? ' disabled' : ''}>Review received products</button>` : ''}
+          ${canConfigureStaff() ? `<button type="button" class="filter-clear" data-inbound-action="delete" data-shipment-id="${escapeHtml(shipment.id)}"${busy ? ' disabled' : ''}>Delete shipment</button>` : ''}
         </article>`).join('')}</div>`;
     if (host.innerHTML !== markup) host.innerHTML = markup;
   });
@@ -3181,6 +3183,61 @@ async function mutateInboundShipment(path, body) {
 }
 
 let receivingEditor = null;
+let inboundDeleteEditor = null;
+
+function closeInboundDeleteDialog() {
+  document.getElementById('inboundDeleteDialog')?.close?.();
+  document.getElementById('inboundDeleteForm')?.reset?.();
+  inboundDeleteEditor = null;
+}
+
+function openInboundDeleteDialog(shipment) {
+  if (!canConfigureStaff()) return;
+  inboundDeleteEditor = { shipmentId: shipment.id, clientId: state.activeClientId, session: state.session, busy: false };
+  document.getElementById('inboundDeleteForm').reset();
+  document.getElementById('inboundDeleteTracking').textContent = shipment.trackingNumber;
+  document.getElementById('inboundDeleteError').textContent = '';
+  document.getElementById('inboundDeleteSave').disabled = false;
+  document.getElementById('inboundDeleteDialog').showModal();
+}
+
+async function deleteInboundShipment(event) {
+  event.preventDefault();
+  const editor = inboundDeleteEditor;
+  if (!editor || editor.busy || !canConfigureStaff() || editor.session !== state.session || editor.clientId !== state.activeClientId) return;
+  const pin = document.getElementById('inboundDeletePin');
+  const reason = document.getElementById('inboundDeleteReason').value.trim();
+  editor.busy = true;
+  document.getElementById('inboundDeleteSave').disabled = true;
+  try {
+    const response = await fetch(`${API_BASE}/api/admin/inbound-shipments/delete`, {
+      method: 'POST', headers: adminHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ clientId: editor.clientId, shipmentId: editor.shipmentId, reason, pin: pin.value }),
+      signal: viewSignal()
+    });
+    pin.value = '';
+    const result = await response.json();
+    if (inboundDeleteEditor !== editor || editor.session !== state.session || editor.clientId !== state.activeClientId) return;
+    if (!response.ok || !result.success || result.clientId !== editor.clientId) throw new Error(result.error || 'Deletion was not confirmed.');
+    closeInboundDeleteDialog();
+    closeReceivingDialog();
+    inboundState.shipments = inboundState.shipments?.filter(shipment => shipment.id !== editor.shipmentId) || null;
+    renderInboundShipments();
+    const status = await fetchInventory(editor.clientId);
+    if (editor.session !== state.session || editor.clientId !== state.activeClientId) return;
+    if (status !== 200) {
+      showToast('Shipment deleted, but inventory could not refresh. Refresh the dashboard before making further stock changes.', 'error');
+      return;
+    }
+    showToast('Shipment deleted. Safe inventory reversal recorded in the deletion audit.', 'success');
+  } catch (error) {
+    if (inboundDeleteEditor === editor) document.getElementById('inboundDeleteError').textContent = error.message || 'Deletion failed. Refresh before retrying.';
+  } finally {
+    pin.value = '';
+    editor.busy = false;
+    document.getElementById('inboundDeleteSave').disabled = false;
+  }
+}
 
 function inboundProductName(line) {
   return line.productName || state.items.find(item => line.sku && String(item.sku || '').toUpperCase() === line.sku.toUpperCase())?.title || line.sku || 'Product';
@@ -4628,6 +4685,10 @@ document.getElementById('inboundContents')?.addEventListener('click', (event) =>
       const shipment = inboundState.shipments?.find(entry => entry.id === button.dataset.shipmentId);
       if (shipment) openReceivingDialog(shipment);
     }
+    else if (button.dataset.inboundAction === 'delete') {
+      const shipment = inboundState.shipments?.find(entry => entry.id === button.dataset.shipmentId);
+      if (shipment) openInboundDeleteDialog(shipment);
+    }
   });
   document.getElementById(id)?.addEventListener('submit', (event) => {
     if (!event.target.matches('.inbound-scan')) return;
@@ -4636,6 +4697,10 @@ document.getElementById('inboundContents')?.addEventListener('click', (event) =>
   });
 });
 document.getElementById('receivingClose')?.addEventListener('click', closeReceivingDialog);
+document.getElementById('inboundDeleteForm')?.addEventListener('submit', deleteInboundShipment);
+document.getElementById('inboundDeleteClose')?.addEventListener('click', closeInboundDeleteDialog);
+document.getElementById('inboundDeleteDialog')?.addEventListener('cancel', closeInboundDeleteDialog);
+window.addEventListener('pagehide', closeInboundDeleteDialog);
   document.getElementById('receivingDialog')?.addEventListener('cancel', closeReceivingDialog);
   document.getElementById('receivingLines')?.addEventListener('submit', event => {
     event.preventDefault();

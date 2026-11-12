@@ -12,7 +12,7 @@ const { FULFILLMENT_STATUSES, STOCK_STATUSES, fulfillmentStatus, shipmentStatus 
 const { fetchPublicPage, parseCatalog, catalogFeedUrl } = require('./catalogSync');
 const { CATALOG_FIELDS, catalogFieldKeys, catalogColumns, validateCatalogValues } = require('./catalogFields');
 const { integrationStorageReady, validateStoreConnection, parseStoreConnection, encryptStoreCredentials, readSubmittedCredentials } = require('./storeIntegration');
-const { INBOUND_SHEET, INBOUND_HEADERS, normalizeInboundTracking, validateInboundShipment, inboundFromRow, validateReceiving } = require('./inboundShipments');
+const { INBOUND_SHEET, INBOUND_HEADERS, normalizeInboundTracking, validateInboundShipment, inboundFromRow, validateReceiving, planInboundDeletion } = require('./inboundShipments');
 const { credentialRole, validSessionRole, warehouseAccess } = require('./permissions');
 const { validateBranding, scrapeBranding } = require('./branding');
 const { RATE_SHEET, ENTRY_SHEET, HISTORY_SHEET, BILLING_RATE_HEADERS, BILLING_ENTRY_HEADERS, BILLING_HISTORY_HEADERS, MONTH_PATTERN, sanitizeRateCard, rateCardFromRow, entryFromRow, sanitizeEntry, historyFromRow, sanitizeHistory, currentMonth, summarizeBilling } = require('./billing');
@@ -2673,7 +2673,7 @@ app.get('/api/inbound-shipments', async (req, res) => {
     if (!access) return;
     const sheet = await findSheetByTitle(INBOUND_SHEET);
     const rows = sheet ? await withRetry(() => sheet.getRows()) : [];
-    const shipments = rows.filter((row) => normalizeClientId(row.get('Client_ID')) === access.clientId)
+    const shipments = rows.filter((row) => normalizeClientId(row.get('Client_ID')) === access.clientId && !row.get('Deleted_At'))
       .map(inboundFromRow).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
     return res.json({ success: true, clientId: access.clientId, shipments });
   } catch (error) {
@@ -2696,8 +2696,9 @@ app.post('/api/inbound-shipments', async (req, res) => {
     const sheet = await getOrCreateSheet(INBOUND_SHEET, INBOUND_HEADERS);
     const rows = await withRetry(() => sheet.getRows());
     const duplicate = rows.find((row) => normalizeClientId(row.get('Client_ID')) === access.clientId
-      && (row.get('Shipment_ID') === id || normalizeInboundTracking(row.get('Tracking_Number')) === shipment.trackingNumber));
+      && (row.get('Shipment_ID') === id || (!row.get('Deleted_At') && normalizeInboundTracking(row.get('Tracking_Number')) === shipment.trackingNumber)));
     if (duplicate) {
+      if (duplicate.get('Deleted_At')) return res.status(409).json({ success: false, error: 'This shipment reference was deleted. Reopen the form to create a new notification.' });
       const saved = inboundFromRow(duplicate);
       if (saved.id === id && saved.carrier === shipment.carrier && saved.trackingNumber === shipment.trackingNumber
         && saved.expectedDeliveryDate === shipment.expectedDeliveryDate && JSON.stringify(saved.contents) === JSON.stringify(shipment.contents)) {
@@ -2730,6 +2731,7 @@ app.post('/api/inbound-shipments/check-in', async (req, res) => {
     const sheet = await findSheetByTitle(INBOUND_SHEET);
     const rows = sheet ? await withRetry(() => sheet.getRows()) : [];
     const matches = rows.filter((row) => normalizeClientId(row.get('Client_ID')) === access.clientId
+      && !row.get('Deleted_At') && !row.get('Deletion_State')
       && normalizeInboundTracking(row.get('Tracking_Number')) === code);
     const selected = matches.filter((row) => !req.body?.shipmentId || row.get('Shipment_ID') === req.body.shipmentId);
     if (!selected.length) return res.status(404).json({ success: false, error: 'No matching inbound shipment in this account. Confirm the selected client and tracking number.' });
@@ -2762,6 +2764,7 @@ app.post('/api/inbound-shipments/receive', async (req, res) => {
     const inboundRows = await withRetry(() => inboundSheet.getRows());
     const inboundRow = inboundRows.find(row => row.get('Shipment_ID') === req.body?.shipmentId && normalizeClientId(row.get('Client_ID')) === access.clientId);
     if (!inboundRow) return res.status(404).json({ success: false, error: 'Shipment not found in this account.' });
+    if (inboundRow.get('Deletion_State') || inboundRow.get('Deleted_At')) return res.status(409).json({ success: false, error: 'This shipment is being deleted or has been deleted. Refresh the inbound list.' });
     const shipment = inboundFromRow(inboundRow);
     const index = req.body?.lineIndex;
     if (!shipment.arrivedAt || !Number.isSafeInteger(index) || !shipment.contents[index]) return res.status(400).json({ success: false, error: 'Record arrival and select a valid product line first.' });
@@ -2810,7 +2813,7 @@ app.post('/api/inbound-shipments/receive', async (req, res) => {
       const current = rowIndex < 0 ? 0 : Number(rows[rowIndex][quantityColumn] || 0);
       if (!Number.isSafeInteger(current) || current < 0 || !Number.isSafeInteger(current + decision.received)) return res.status(409).json({ success: false, error: 'Current quantity is invalid. Correct the sheet before receiving.' });
       if (!receipt) {
-        receipt = { state: 'pending', decision, rowIndex, before: current, after: current + decision.received, by: access.session.username, at: new Date().toISOString() };
+        receipt = { state: 'pending', decision, rowIndex, before: current, after: current + decision.received, inventoryBefore: rowIndex < 0 ? null : [...rows[rowIndex]], by: access.session.username, at: new Date().toISOString() };
         shipment.receiving[index] = receipt;
         if (JSON.stringify(shipment.receiving).length > 44000) return res.status(400).json({ success: false, error: 'This shipment receiving log is too large. Shorten product URLs before saving.' });
         inboundRow.set('Receiving_JSON', JSON.stringify(shipment.receiving));
@@ -2836,6 +2839,7 @@ app.post('/api/inbound-shipments/receive', async (req, res) => {
         row[layout.columns.productUrl] = decision.productUrl;
         row[layout.columns.imageUrl] = decision.imageUrl;
         row[markerColumn] = JSON.stringify(log);
+        receipt.inventoryAfter = [...row];
         await sheet.saveUpdatedCells();
         await sheet.loadHeaderRow(layout.catalog.headerRowIndex + 1);
         // No blind retry: an uncertain append is recovered by its receipt marker.
@@ -2851,11 +2855,13 @@ app.post('/api/inbound-shipments/receive', async (req, res) => {
         sheet.getCell(rowIndex, markerColumn).value = JSON.stringify(log);
         if (decision.productUrl) sheet.getCell(rowIndex, layout.columns.productUrl).value = decision.productUrl;
         if (decision.imageUrl) sheet.getCell(rowIndex, layout.columns.imageUrl).value = decision.imageUrl;
+        receipt.inventoryAfter = Array.from({ length: layout.catalog.headers.length }, (_, column) => sheet.getCell(rowIndex, column).value ?? '');
         await sheet.saveUpdatedCells();
       }
       invalidateReadCache('inventory:');
     }
     receipt = receipt || { decision, by: access.session.username, at: new Date().toISOString() };
+    if (appliedRow >= 0 && !receipt.inventoryAfter) receipt.inventoryAfter = [...rows[appliedRow]];
     receipt.state = 'complete';
     shipment.receiving[index] = receipt;
     if (JSON.stringify(shipment.receiving).length > 45000) return res.status(400).json({ success: false, error: 'This shipment receiving log is too large. Shorten product URLs before saving.' });
@@ -2865,6 +2871,87 @@ app.post('/api/inbound-shipments/receive', async (req, res) => {
   } catch (error) {
     console.error('Inbound receiving failed:', error.message);
     return res.status(500).json({ success: false, error: 'Receiving save was not confirmed. Refresh and retry the same decision; do not add this quantity manually. Contact an administrator if a pending receipt conflicts.' });
+  } finally {
+    if (lockedClient) inboundReceivingLocks.delete(lockedClient);
+  }
+});
+
+const INBOUND_DELETION_HEADERS = ['Shipment_ID', 'Client_ID', 'Tracking_Number', 'Reason', 'Deleted_By', 'Requested_At', 'Completed_At', 'State', 'Shipment_JSON', 'Plan_JSON'];
+app.post('/api/admin/inbound-shipments/delete', (req, res, next) => {
+  req.rateLimitUser = `inbound-delete:${req.adminSession.username}`;
+  next();
+}, authRateLimit, async (req, res) => {
+  let lockedClient;
+  try {
+    const configured = process.env.ADMIN_DELETION_PIN;
+    if (!configured) return res.status(503).json({ success: false, error: 'Administrator deletion PIN is not configured on the server. Deletion is disabled.' });
+    if (typeof req.body?.pin !== 'string' || !constantTimeEqual(req.body.pin, configured)) return res.status(403).json({ success: false, error: 'Incorrect administrator deletion PIN.' });
+    const reason = typeof req.body.reason === 'string' ? req.body.reason.trim() : '';
+    if (reason.length < 5 || reason.length > 1000 || /[\u0000-\u001f]/.test(reason)) return res.status(400).json({ success: false, error: 'Enter a deletion reason of 5-1000 characters.' });
+    const clientId = normalizeClientId(req.body.clientId);
+    if (!/^CL-\d{3,}$/.test(clientId) || clientId === 'CL-000') return res.status(400).json({ success: false, error: 'Select a client account.' });
+    if (inboundReceivingLocks.has(clientId)) return res.status(409).json({ success: false, error: 'A receiving operation is saving. Refresh before deleting.' });
+    inboundReceivingLocks.add(clientId);
+    lockedClient = clientId;
+    const inboundSheet = await getOrCreateSheet(INBOUND_SHEET, INBOUND_HEADERS);
+    const inboundRows = await inboundSheet.getRows();
+    const source = inboundRows.find(row => normalizeClientId(row.get('Client_ID')) === clientId && row.get('Shipment_ID') === req.body.shipmentId);
+    if (!source) return res.status(404).json({ success: false, error: 'Shipment not found.' });
+    const auditSheet = await getOrCreateSheet('Inbound_Deletion_Audit', INBOUND_DELETION_HEADERS);
+    const audits = await auditSheet.getRows();
+    let audit = audits.find(row => row.get('Client_ID') === clientId && row.get('Shipment_ID') === req.body.shipmentId);
+    const clearDeletedShipment = async completedAt => {
+      source.set('Deleted_At', completedAt);
+      source.set('Deletion_State', 'complete');
+      source.set('Contents_JSON', '[]');
+      source.set('Receiving_JSON', '');
+      await source.save({ raw: true });
+    };
+    if (audit?.get('State') === 'complete') {
+      if (!source.get('Deleted_At')) await clearDeletedShipment(audit.get('Completed_At'));
+      return res.json({ success: true, clientId, shipmentId: req.body.shipmentId, alreadyDeleted: true });
+    }
+    if (audit && audit.get('Reason') !== reason) return res.status(409).json({ success: false, error: 'Deletion is pending. Retry with the original reason or contact an administrator.' });
+    const inventorySheet = await findSheetByTitle(clientId);
+    if (!inventorySheet) return res.status(404).json({ success: false, error: 'Inventory sheet not found.' });
+    const rows = await loadSheetRows(clientId);
+    let plans;
+    if (audit) plans = JSON.parse(audit.get('Plan_JSON'));
+    else {
+      const shipment = inboundFromRow(source);
+      const layout = await getItemEditColumns(clientId, rows);
+      const shipmentColumns = await getShipmentColumns(clientId, rows);
+      const markerColumn = layout.catalog.headers.indexOf('Inbound_Receiving_Log');
+      try { plans = planInboundDeletion(shipment, rows, shipmentColumns?.received ?? layout.columns.qty, markerColumn, shipmentColumns?.shipped); }
+      catch (error) { return res.status(409).json({ success: false, error: error.message }); }
+      const snapshot = JSON.stringify(shipment);
+      const plan = JSON.stringify(plans);
+      if (snapshot.length > 45000 || plan.length > 45000) return res.status(409).json({ success: false, error: 'Shipment is too large for safe automated reversal. Reconcile manually before deletion.' });
+      // Never blindly retry the audit append: a retry looks up the shipment reference first.
+      audit = await auditSheet.addRow({
+        Shipment_ID: shipment.id, Client_ID: clientId, Tracking_Number: shipment.trackingNumber,
+        Reason: reason, Deleted_By: req.adminSession.username, Requested_At: new Date().toISOString(),
+        Completed_At: '', State: 'pending', Shipment_JSON: snapshot, Plan_JSON: plan
+      }, { raw: true });
+    }
+    for (const plan of plans) {
+      const current = rows[plan.rowIndex];
+      if (JSON.stringify(current) !== JSON.stringify(plan.before) && JSON.stringify(current) !== JSON.stringify(plan.after)) return res.status(409).json({ success: false, error: 'Inventory changed during deletion. Reconcile the pending deletion audit before retrying.' });
+    }
+    source.set('Deletion_State', 'pending');
+    await source.save({ raw: true });
+    plans.forEach(plan => plan.after.forEach((value, column) => { inventorySheet.getCell(plan.rowIndex, column).value = value; }));
+    if (plans.length) await inventorySheet.saveUpdatedCells();
+    invalidateReadCache('inventory:');
+    const completedAt = new Date().toISOString();
+    audit.set('State', 'complete');
+    audit.set('Completed_At', completedAt);
+    await audit.save({ raw: true });
+    await clearDeletedShipment(completedAt);
+    return res.json({ success: true, clientId, shipmentId: req.body.shipmentId });
+  } catch (error) {
+    console.error('Inbound deletion failed:', error.message);
+    return res.status(500).json({ success: false, error: 'Deletion was not confirmed. Refresh and retry with the same reason and PIN. Do not adjust inventory manually; a pending deletion audit preserves the reversal plan.' });
   } finally {
     if (lockedClient) inboundReceivingLocks.delete(lockedClient);
   }

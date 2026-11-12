@@ -3535,6 +3535,107 @@ test('receiving suggestions and product links are safe and preserve receipt mark
   assert.equal(modern.rows[0][modern.headers.indexOf('Product Listing URL')], 'https://retailer.example/item');
 });
 
+test('inbound deletion reverses only unchanged package stock and refuses unsafe or legacy receipts', () => {
+  const { planInboundDeletion } = require('../api/inboundShipments');
+  const before = ['SKU', 'Product', 4, 'Low Stock', 'old notes', ''];
+  const decision = { received: 3, lost: 1, damaged: 1, target: 'CL-004-1', productName: 'Product', sku: 'SKU', productUrl: '', imageUrl: '' };
+  const receipt = { state: 'complete', decision, by: 'Admin', at: '2026-11-20T12:00:00Z', before: 4, after: 7, inventoryBefore: before };
+  const log = JSON.stringify({ 'shipment:0': { ...decision, by: receipt.by, at: receipt.at } });
+  const after = ['SKU', 'Product', 7, 'In Stock', 'new notes', log];
+  receipt.inventoryAfter = after;
+  const shipment = { id: 'shipment', receiving: { 0: receipt } };
+  const rows = [['SKU', 'Product', 'Qty', 'Status', 'Notes', 'Inbound_Receiving_Log'], after];
+  const plans = planInboundDeletion(shipment, rows, 2, 5);
+  assert.deepEqual(plans[0].after, before, 'quantity, status and metadata return to original values');
+  assert.throws(() => planInboundDeletion(shipment, [rows[0], [...after.slice(0, 2), 6, ...after.slice(3)]], 2, 5), /changed|snapshot/);
+  assert.throws(() => planInboundDeletion(shipment, [rows[0], ['SKU', 'Renamed', ...after.slice(2)]], 2, 5), /changed/);
+  assert.throws(() => planInboundDeletion({ ...shipment, receiving: { 0: { ...receipt, state: 'pending' } } }, rows, 2, 5), /pending/);
+  assert.throws(() => planInboundDeletion({ ...shipment, receiving: { 0: { ...receipt, inventoryAfter: undefined } } }, rows, 2, 5), /older receipt/);
+  assert.throws(() => planInboundDeletion(shipment, [rows[0]], 2, 5), /missing/);
+  const created = { ...receipt, before: 0, after: 3, decision: { ...decision, target: 'new' } };
+  const newRow = ['SKU', 'Product', 3, 'Low Stock', '', JSON.stringify({ 'shipment:0': { ...created.decision, by: created.by, at: created.at } })];
+  created.inventoryAfter = newRow;
+  assert.ok(planInboundDeletion({ id: 'shipment', receiving: { 0: created } }, [rows[0], newRow], 2, 5)[0].after.every(value => value === ''), 'new product created only by this shipment is removed');
+});
+
+test('inbound deletion endpoint requires admin PIN and reason, audits reversals and recovers a failed completion', async () => {
+  invalidateReadCache('');
+  const oldPin = process.env.ADMIN_DELETION_PIN;
+  process.env.ADMIN_DELETION_PIN = 'test-only-pin';
+  const { INBOUND_HEADERS } = require('../api/inboundShipments');
+  const inventory = [['SKU', 'Product Title', 'Qty', 'Status', 'Notes', 'Inbound_Receiving_Log'], ['A', 'Marker', 7, 'In Stock', '', '']];
+  const original = ['A', 'Marker', 4, 'Low Stock', '', ''];
+  const decision = { received: 3, lost: 0, damaged: 0, target: 'CL-004-1', productName: 'Marker', sku: 'A', productUrl: '', imageUrl: '' };
+  const receipt = { state: 'complete', decision, before: 4, after: 7, by: 'Staff', at: '2026-11-20', inventoryBefore: original };
+  inventory[1][5] = JSON.stringify({ 'shipment:0': { ...decision, by: receipt.by, at: receipt.at } });
+  receipt.inventoryAfter = [...inventory[1]];
+  const sourceValues = { Shipment_ID: 'shipment', Client_ID: 'CL-004', Carrier: 'UPS', Tracking_Number: '1Z0123456', Expected_Delivery_Date: '2026-11-20', Contents_JSON: JSON.stringify([{ productName: 'Marker', quantity: 3 }]), Receiving_JSON: JSON.stringify({ 0: receipt }), Arrived_At: '2026-11-20' };
+  let completionFailure = true;
+  const audits = [];
+  const mockRow = (stored, audit = false) => {
+    const values = { ...stored };
+    return { get: key => values[key] ?? '', set: (key, value) => { values[key] = value; }, save: async options => {
+      assert.equal(options.raw, true);
+      if (audit && values.State === 'complete' && completionFailure) { completionFailure = false; throw new Error('audit completion unavailable'); }
+      Object.assign(stored, values);
+    } };
+  };
+  let cells = new Map();
+  const inventorySheet = { title: 'CL-004', rowCount: 25, columnCount: 6,
+    loadCells: async () => { cells = new Map(); },
+    getCell: (r, c) => { const key = `${r}:${c}`; if (!cells.has(key)) cells.set(key, { value: inventory[r]?.[c] ?? '' }); return cells.get(key); },
+    saveUpdatedCells: async () => { for (const [key, cell] of cells) { const [r, c] = key.split(':').map(Number); if (cell.value === (inventory[r]?.[c] ?? '')) continue; inventory[r] ||= []; inventory[r][c] = cell.value; } }
+  };
+  const sheets = {
+    User_Credentials: { getRows: async () => [{ get: key => ({ Client_ID: 'CL-004', Inventory_Mode: 'inventory', Fields_JSON: '[]' })[key] ?? '' }] },
+    'CL-004': inventorySheet,
+    Inbound_Shipments: { headerValues: INBOUND_HEADERS, loadHeaderRow: async () => {}, getRows: async () => [mockRow(sourceValues)] },
+    Inbound_Deletion_Audit: { headerValues: ['Shipment_ID', 'Client_ID', 'Tracking_Number', 'Reason', 'Deleted_By', 'Requested_At', 'Completed_At', 'State', 'Shipment_JSON', 'Plan_JSON'], loadHeaderRow: async () => {}, getRows: async () => audits.map(values => mockRow(values, true)), addRow: async values => { audits.push({ ...values }); return mockRow(audits[audits.length - 1], true); } }
+  };
+  const titles = Object.getOwnPropertyDescriptor(GoogleSpreadsheet.prototype, 'sheetsByTitle');
+  const indexes = Object.getOwnPropertyDescriptor(GoogleSpreadsheet.prototype, 'sheetsByIndex');
+  const oldLoad = GoogleSpreadsheet.prototype.loadInfo;
+  GoogleSpreadsheet.prototype.loadInfo = async () => {};
+  Object.defineProperty(GoogleSpreadsheet.prototype, 'sheetsByTitle', { configurable: true, get: () => sheets });
+  Object.defineProperty(GoogleSpreadsheet.prototype, 'sheetsByIndex', { configurable: true, get: () => Object.values(sheets) });
+  const server = require('../api/server').app.listen(0);
+  const admin = signNotificationSession('DeleteAdmin', 'CL-000', 'admin');
+  const staff = signNotificationSession('Staff', 'CL-000', 'staff');
+  const client = signNotificationSession('Owner', 'CL-004', 'client');
+  const body = { clientId: 'CL-004', shipmentId: 'shipment', reason: 'Removing test shipment', pin: 'test-only-pin' };
+  const post = (values = body, token = admin) => fetch(`http://127.0.0.1:${server.address().port}/api/admin/inbound-shipments/delete`, { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json', 'x-nf-client-connection-ip': '192.0.2.211' }, body: JSON.stringify(values) });
+  try {
+    assert.equal((await post(body, staff)).status, 403);
+    assert.equal((await post(body, client)).status, 403);
+    delete process.env.ADMIN_DELETION_PIN;
+    assert.equal((await post()).status, 503);
+    process.env.ADMIN_DELETION_PIN = 'test-only-pin';
+    assert.equal((await post({ ...body, pin: 'wrong' })).status, 403);
+    assert.equal((await post({ ...body, reason: '' })).status, 400);
+    assert.equal((await post()).status, 500, 'unconfirmed audit completion can be retried');
+    assert.equal(inventory[1][2], 4);
+    assert.equal(audits.length, 1);
+    assert.equal((await post()).status, 200);
+    assert.equal(inventory[1][2], 4, 'retry never subtracts stock twice');
+    assert.equal(audits[0].State, 'complete');
+    assert.equal(audits[0].Reason, body.reason);
+    assert.equal(audits[0].Deleted_By, 'DeleteAdmin');
+    assert.ok(audits[0].Completed_At);
+    assert.ok(JSON.parse(audits[0].Shipment_JSON).receiving[0]);
+    assert.doesNotMatch(JSON.stringify(audits), /test-only-pin/);
+    assert.ok(sourceValues.Deleted_At);
+    assert.equal(sourceValues.Contents_JSON, '[]');
+    assert.equal((await post()).status, 200);
+  } finally {
+    if (oldPin === undefined) delete process.env.ADMIN_DELETION_PIN; else process.env.ADMIN_DELETION_PIN = oldPin;
+    await new Promise(resolve => server.close(resolve));
+    GoogleSpreadsheet.prototype.loadInfo = oldLoad;
+    Object.defineProperty(GoogleSpreadsheet.prototype, 'sheetsByTitle', titles);
+    Object.defineProperty(GoogleSpreadsheet.prototype, 'sheetsByIndex', indexes);
+    invalidateReadCache('');
+  }
+});
+
 test('inbound UI supports read-only notifications, staff scans, safe rendering and stale-response cleanup', async () => {
   const ids=['inboundDashboard','inboundTracking','inboundForm','inboundDialog','inboundFields','inboundSave','inboundError','inboundContents','inboundCarrier','inboundTrackingNumber','inboundExpectedDate'];
   const elements=Object.fromEntries(ids.map(id=>[id,{
@@ -3560,6 +3661,7 @@ test('inbound UI supports read-only notifications, staff scans, safe rendering a
   assert.match(elements.inboundDashboard.innerHTML,/&lt;SKU&gt;/);
   assert.match(elements.inboundDashboard.innerHTML,/&lt;Owner&gt;/);
   assert.doesNotMatch(elements.inboundDashboard.innerHTML,/Dock scan/);
+  assert.doesNotMatch(elements.inboundDashboard.innerHTML,/data-inbound-action="delete"/);
   assert.match(elements.inboundTracking.innerHTML,/1Z001234/);
   let calls=0;
   context.fetch=async()=>{calls++;};
@@ -3588,6 +3690,10 @@ test('inbound UI supports read-only notifications, staff scans, safe rendering a
   assert.equal(vm.runInContext('inboundState.shipments.length',context),1);
   vm.runInContext("state.isAdmin=true;state.session={clientId:'CL-000',role:'staff'};renderInboundShipments()",context);
   assert.match(elements.inboundDashboard.innerHTML,/Dock scan/);
+  assert.doesNotMatch(elements.inboundDashboard.innerHTML,/data-inbound-action="delete"/,'staff cannot delete shipments');
+  vm.runInContext("state.session.role='admin';renderInboundShipments()",context);
+  assert.match(elements.inboundDashboard.innerHTML,/data-inbound-action="delete"/,'only admins see deletion controls');
+  vm.runInContext("state.session.role='staff'",context);
   context.fetch=async(url,options)=>{
     assert.equal(url,'/api/inbound-shipments/check-in');
     submitted=JSON.parse(options.body);

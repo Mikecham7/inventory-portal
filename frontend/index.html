@@ -928,6 +928,7 @@
               <p>The inbound section shows en-route and arrived shipments with their expected contents. ECL staff select the client account, focus the <strong>Dock scan</strong> field, scan the tracking barcode with a USB scanner and press Enter. Staff can also use a shipment's arrival button. If a number matches more than one record, use the button on the correct shipment.</p>
               <p>Arrival records include the time and staff member. After arrival, a staff-only receiving popup shows each product, suggested inventory matches and an option to create a new inventory line. Staff confirm usable received, lost and damaged quantities totaling the expected amount. Only usable received units are added to stock (or Quantity Received for fulfillment accounts); lost and damaged units remain logged on the shipment. Arrival alone does not change quantities. Use Review received products to reopen the popup or retry a pending decision; do not manually add units after an uncertain save.</p>
               <p>Amazon and eBay search links appear automatically in receiving reviews and inventory item details. Search results are not verified listings. An optional exact retailer URL can fetch product name, SKU and image for review; choose the correct result before applying it. Saving receiving or item details preserves the confirmed product listing URL. Public website restrictions still apply; manual entry remains supported. This log reflects ECL check-ins, not live carrier delivery events.</p>
+              <p>Only administrators can delete an inbound shipment. Select Delete shipment, enter a required reason and the administrator deletion PIN. The server must have ADMIN_DELETION_PIN privately configured; the browser-only protected-action PIN does not authorize deletion. Safe deletion reverses only that package's usable received stock and its product metadata, and removes newly created product lines only when they contain no other stock. Pending receipts, shipped/changed inventory, or older receipts without reversal snapshots require reconciliation first. The Inbound_Deletion_Audit sheet retains who requested deletion, when, why, the original shipment and the reversal plan. Deletion never erases that audit.</p>
             </div>
           </details>
           <details class="faq-item" data-keywords="packaging prep special instructions sop standard operating procedure bubble wrap thank you card">
@@ -1081,6 +1082,20 @@
       </form>
     </dialog>
 
+    <dialog class="inventory-item-dialog" id="inboundDeleteDialog" aria-labelledby="inboundDeleteTitle">
+      <form id="inboundDeleteForm">
+        <header class="inventory-dialog-header"><h2 id="inboundDeleteTitle">Delete inbound shipment</h2><button type="button" class="inventory-dialog-close" id="inboundDeleteClose" aria-label="Cancel deletion">&times;</button></header>
+        <p id="inboundDeleteTracking"></p>
+        <p class="inventory-dialog-hint">Administrator only. This removes the shipment from the active list, reverses its usable received quantities, and removes product lines created solely by this package when safe. Changed or shipped stock blocks deletion. Original records and your reason remain in the deletion audit.</p>
+        <label for="inboundDeleteReason">Why are you deleting this shipment?</label>
+        <textarea id="inboundDeleteReason" minlength="5" maxlength="1000" rows="4" required placeholder="Test shipment, canceled order, package never arrived..."></textarea>
+        <label for="inboundDeletePin">Administrator deletion PIN</label>
+        <input id="inboundDeletePin" type="password" maxlength="64" autocomplete="off" required />
+        <p id="inboundDeleteError" class="inventory-dialog-error" role="alert"></p>
+        <footer class="inventory-dialog-footer"><button type="submit" class="btn-set" id="inboundDeleteSave">Delete shipment and reverse its stock</button></footer>
+      </form>
+    </dialog>
+
     <dialog class="inventory-item-dialog" id="receivingDialog" aria-labelledby="receivingTitle">
       <header class="inventory-dialog-header"><h2 id="receivingTitle">Review received products</h2><button type="button" class="inventory-dialog-close" id="receivingClose" aria-label="Close receiving review">&times;</button></header>
       <p class="inventory-dialog-hint">Verify each product before changing inventory. Choose a matching inventory item or create a new product line. Account for every expected unit as usable received, lost or damaged; only usable units are added to stock. Similar names and marketplace searches are not proof of an exact match.</p>
@@ -1123,6 +1138,6 @@
     <div class="toast" id="toast"></div>
 
     <script src="vendor/html5-qrcode.min.js"></script>
-    <script src="app.js?v=20261111f"></script>
+    <script src="app.js?v=20261111g"></script>
   </body>
 </html>
