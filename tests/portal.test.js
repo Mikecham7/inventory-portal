@@ -3580,9 +3580,12 @@ test('inbound deletion endpoint requires admin PIN and reason, audits reversals 
       Object.assign(stored, values);
     } };
   };
+  const inventoryReadRanges = [];
+  const inventoryCellRanges = [];
   let cells = new Map();
   const inventorySheet = { title: 'CL-004', rowCount: 25, columnCount: 6,
-    loadCells: async () => { cells = new Map(); },
+    getCellsInRange: async range => { inventoryReadRanges.push(range); return inventory.map(row => [...row]); },
+    loadCells: async ranges => { inventoryCellRanges.push(ranges); cells = new Map(); },
     getCell: (r, c) => { const key = `${r}:${c}`; if (!cells.has(key)) cells.set(key, { value: inventory[r]?.[c] ?? '' }); return cells.get(key); },
     saveUpdatedCells: async () => { for (const [key, cell] of cells) { const [r, c] = key.split(':').map(Number); if (cell.value === (inventory[r]?.[c] ?? '')) continue; inventory[r] ||= []; inventory[r][c] = cell.value; } }
   };
@@ -3623,6 +3626,8 @@ test('inbound deletion endpoint requires admin PIN and reason, audits reversals 
     assert.ok(audits[0].Completed_At);
     assert.ok(JSON.parse(audits[0].Shipment_JSON).receiving[0]);
     assert.doesNotMatch(JSON.stringify(audits), /test-only-pin/);
+    assert.deepEqual(inventoryReadRanges, ['A1:F25', 'A1:F25']);
+    assert.deepEqual(inventoryCellRanges, [['A2:F2'], ['A2:F2']]);
     assert.ok(sourceValues.Deleted_At);
     assert.equal(sourceValues.Contents_JSON, '[]');
     assert.equal((await post()).status, 200);

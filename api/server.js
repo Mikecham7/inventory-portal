@@ -2914,7 +2914,8 @@ app.post('/api/admin/inbound-shipments/delete', (req, res, next) => {
     if (audit && audit.get('Reason') !== reason) return res.status(409).json({ success: false, error: 'Deletion is pending. Retry with the original reason or contact an administrator.' });
     const inventorySheet = await findSheetByTitle(clientId);
     if (!inventorySheet) return res.status(404).json({ success: false, error: 'Inventory sheet not found.' });
-    const rows = await loadSheetRows(clientId);
+    const inventoryRange = `A1:${columnIndexToLetter(inventorySheet.columnCount)}${inventorySheet.rowCount}`;
+    const rows = await withRetry(() => inventorySheet.getCellsInRange(inventoryRange)) || [];
     let plans;
     if (audit) plans = JSON.parse(audit.get('Plan_JSON'));
     else {
@@ -2940,8 +2941,15 @@ app.post('/api/admin/inbound-shipments/delete', (req, res, next) => {
     }
     source.set('Deletion_State', 'pending');
     await source.save({ raw: true });
-    plans.forEach(plan => plan.after.forEach((value, column) => { inventorySheet.getCell(plan.rowIndex, column).value = value; }));
-    if (plans.length) await inventorySheet.saveUpdatedCells();
+    if (plans.length) {
+      const ranges = plans.map(({ rowIndex, after }) => {
+        const row = rowIndex + 1;
+        return `A${row}:${columnIndexToLetter(after.length)}${row}`;
+      });
+      await withRetry(() => inventorySheet.loadCells(ranges));
+      plans.forEach(plan => plan.after.forEach((value, column) => { inventorySheet.getCell(plan.rowIndex, column).value = value; }));
+      await inventorySheet.saveUpdatedCells();
+    }
     invalidateReadCache('inventory:');
     const completedAt = new Date().toISOString();
     audit.set('State', 'complete');
