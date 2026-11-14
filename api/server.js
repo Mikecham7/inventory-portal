@@ -1871,6 +1871,9 @@ app.post('/api/inventory/create', async (req, res) => {
     }
     // Staff status comes from the signed session, never from what the browser claims.
     const adminAccess = isStaffSession(readNotificationSession(req));
+    if (!adminAccess && qty != null && Number(qty) !== 0) {
+      return res.status(403).json({ success: false, error: 'Only warehouse staff can set in-stock quantities.' });
+    }
 
     // Fields the admin switched off for this form are dropped server-side too, not just hidden.
     if (!isStaffSession(readNotificationSession(req))) {
@@ -1917,7 +1920,7 @@ app.post('/api/inventory/create', async (req, res) => {
       // Generic clients (created through the admin "Add Client" flow) always use the
       // SKU | Title | ...custom fields... | Qty | Status | Notes column layout.
       const shipmentKeys = findShipmentFieldKeys(profile.fields);
-      const baseQuantity = targetClientId === 'CL-003'
+      const baseQuantity = !adminAccess ? 0 : targetClientId === 'CL-003'
         ? Number(values.quantityReceived) || 0
         : targetClientId === 'CL-002'
           ? Number(values.quantityOrdered ?? qty) || 0
@@ -1933,7 +1936,7 @@ app.post('/api/inventory/create', async (req, res) => {
           ? fulfillmentStatus('', shipmentKeys ? values[shipmentKeys.received] : 0, shipmentKeys ? values[shipmentKeys.shipped] : 0)
           : shipmentKeys
           ? SHIPMENT_STATUS_TEXT[getShipmentStage(values[shipmentKeys.received], values[shipmentKeys.shipped])]
-          : String(status || (Number(qty) <= 5 ? 'Low Stock' : 'In Stock')),
+          : !adminAccess ? 'Out of Stock' : String(status || (Number(qty) <= 5 ? 'Low Stock' : 'In Stock')),
         String(notes || '')
       ];
     } else {
@@ -1942,7 +1945,7 @@ app.post('/api/inventory/create', async (req, res) => {
         itemSku || title || 'N/A',
         itemTitle || title || 'Untitled',
         Number(qty) || 0,
-        String(status || (Number(qty) <= 5 ? 'Low Stock' : 'In Stock')),
+        !adminAccess ? 'Out of Stock' : String(status || (Number(qty) <= 5 ? 'Low Stock' : 'In Stock')),
         String(notes || '')
       ];
     }
@@ -1980,7 +1983,7 @@ async function checkQuickEditAccess(req, session, clientId) {
   if (quickEditMode === 'password') {
     const unlock = readToken(req.get('X-Quick-Edit-Token'), 'quick-edit');
     if (!unlock || unlock.username !== session.username || unlock.clientId !== clientId) {
-      return { code: 'QUICK_EDIT_PIN_REQUIRED', error: 'Enter the Quick Edit PIN to change quantities.' };
+      return { code: 'QUICK_EDIT_PIN_REQUIRED', error: 'Enter the Quick Edit PIN to change stock status.' };
     }
   }
   return null;
@@ -2287,6 +2290,9 @@ app.put('/api/inventory/item', async (req, res) => {
     if ('status' in values && profile.inventoryMode === 'custom' && !staff) {
       return res.status(403).json({ success: false, error: 'Only ECL staff can change fulfillment stages.' });
     }
+    if ('qty' in values && !staff) {
+      return res.status(403).json({ success: false, error: 'Only warehouse staff can change in-stock quantities.' });
+    }
     if ('qty' in values || ('status' in values && profile.inventoryMode !== 'custom')) {
       if (profile.inventoryMode === 'custom' && (shipmentKeys || ['CL-002', 'CL-003'].includes(clientId))) {
         return res.status(400).json({ success: false, error: 'Quantity and status are managed through the shipment workflow.' });
@@ -2380,13 +2386,9 @@ app.put('/api/inventory/quantity', async (req, res) => {
     if (!clientId || !sku || !Number.isSafeInteger(quantity) || quantity < 0 || (!isStaff && session.clientId !== clientId)) {
       return res.status(400).json({ success: false, error: 'Invalid inventory update.' });
     }
+    if (!isStaff) return res.status(403).json({ success: false, error: 'Only warehouse staff can change in-stock quantities.' });
     const profile = await getClientProfile(clientId);
     if (profile.inventoryMode === 'custom' && (clientId === 'CL-002' || findShipmentFieldKeys(profile.fields))) return res.status(400).json({ success: false, error: 'Use the shipment workflow for this client.' });
-    if (!isStaff) {
-      const denied = await checkQuickEditAccess(req, session, clientId);
-      if (denied) return res.status(403).json({ success: false, ...denied });
-    }
-
     const sheet = await findSheetByTitle(clientId);
     if (!sheet) return res.status(404).json({ success: false, error: 'Inventory sheet not found.' });
     const skuColumn = profile.legacy && clientId === 'CL-001' ? 1 : 0;

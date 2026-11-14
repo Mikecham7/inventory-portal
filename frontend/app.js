@@ -534,7 +534,7 @@ function setPage(pageId) {
     return;
   }
   if (pageId !== 'page-dashboard') closePackagingDialog();
-  if (!['page-dashboard', 'page-tracking'].includes(pageId)) closeInboundDialog();
+  if (!['page-dashboard', 'page-tracking', 'page-update'].includes(pageId)) closeInboundDialog();
   if (pageId !== 'page-update') stopBarcodeCamera();
   if (pageId !== 'page-store-settings') resetStoreConnection();
   const typingIndicator = document.getElementById('typingIndicator');
@@ -1039,7 +1039,7 @@ function syncDashboardColumns() {
       ? profile.dashboardColumns
       : ['PRODUCT TITLE', 'QTY', 'STATUS', 'EDIT'];
 
-    updateInventoryMarkup(headerRow, columns.map((label) => {
+    updateInventoryMarkup(headerRow, columns.filter((label) => label !== 'EDIT' || hasWarehouseAccess()).map((label) => {
       const centered = ['QTY', 'STATUS', 'EDIT'].includes(label);
       return `<th${centered ? ' class="center"' : ''}>${label}</th>`;
     }).join(''));
@@ -1099,7 +1099,7 @@ function renderTable() {
     .filter((field) => clientId !== 'CL-002' || field.key !== 'productDescription');
   const dashboardFieldKeys = (profile && profile.dashboardFieldKeys) || fields.map((field) => field.key);
   const showQty = !(profile && profile.hideQtyColumn);
-  const showEdit = !(profile && (profile.readOnly || profile.hideQuickEdit));
+  const showEdit = hasWarehouseAccess() && !(profile && (profile.readOnly || profile.hideQuickEdit));
   const columnCount = 2 + dashboardFieldKeys.length + Number(showQty) + Number(showEdit);
   const metaFields = dashboardFieldKeys.length ? [] : fields.slice(0, 2);
 
@@ -1957,6 +1957,11 @@ function renderProductForm() {
   const profile = state.clientProfile && state.clientProfile.clientId === clientId ? state.clientProfile : null;
   const syncButton = document.getElementById('catalogSyncSubmit');
   const canAdd = canAddInventoryItems(clientId);
+  const quantityInput = document.getElementById('newProductQty');
+  if (quantityInput) {
+    quantityInput.readOnly = !hasWarehouseAccess();
+    if (quantityInput.readOnly) quantityInput.value = '0';
+  }
   if (syncButton) syncButton.disabled = !canAdd;
 
   syncAddTabVisibility();
@@ -2334,7 +2339,7 @@ function openPinPrompt(cb, mode = 'page') {
   const title = document.getElementById('pinTitle');
   const message = document.getElementById('pinMessage');
   if (title) title.textContent = quickEdit ? 'Quick Edit Locked' : 'Protected Action';
-  if (message) message.textContent = quickEdit ? "Enter this account's Quick Edit PIN to change quantities." : 'Enter your 3-digit PIN to continue';
+  if (message) message.textContent = quickEdit ? "Enter this account's Quick Edit PIN to change stock status." : 'Enter your 3-digit PIN to continue';
   if (pinOverlay) pinOverlay.style.display = 'flex';
   if (pinInput) {
     pinInput.maxLength = quickEdit ? 32 : 3;
@@ -2413,7 +2418,7 @@ function requestUpdatePage() {
   const clientId = state.activeClientId || state.session?.clientId || 'CL-001';
   const config = getClientInventoryFields(clientId);
 
-  if (hasWarehouseAccess() || (!config.readOnly && !config.requirePin)) {
+  if (hasWarehouseAccess() || (!config.readOnly && !config.requirePin) || (config.readOnly && inboundAvailable())) {
     setPage('page-update');
     return;
   }
@@ -3024,6 +3029,10 @@ function renderInboundShipments() {
   const current = inboundState.clientId === state.activeClientId;
   const shipments = current ? inboundState.shipments : null;
   const busy = current && inboundState.busy;
+  const updateInbound = document.getElementById('updateInbound');
+  if (updateInbound) updateInbound.hidden = !visible;
+  const updateInboundAdd = document.getElementById('updateInboundAdd');
+  if (updateInboundAdd) updateInboundAdd.disabled = Boolean(busy);
   ['inboundDashboard', 'inboundTracking'].forEach((id) => {
     const host = document.getElementById(id);
     if (!host) return;
@@ -3087,7 +3096,7 @@ function addInboundLine() {
     <label for="inboundName${id}">Product name<input id="inboundName${id}" data-inbound-name list="inboundProductOptions" maxlength="500" required /></label>
     <label for="inboundSku${id}">SKU (optional)<input id="inboundSku${id}" data-inbound-sku maxlength="100" /></label>
     <label for="inboundUrl${id}">Product listing URL (optional)<input id="inboundUrl${id}" data-inbound-url type="url" maxlength="2000" placeholder="https://retailer.com/product" /></label>
-    <label for="inboundQty${id}">Expected quantity<input id="inboundQty${id}" data-inbound-quantity type="number" min="1" max="1000000" step="1" required /></label>
+    <label for="inboundQty${id}">Inbound quantity (expected)<input id="inboundQty${id}" data-inbound-quantity type="number" min="1" max="1000000" step="1" required /></label>
     <button type="button" class="filter-clear" data-inbound-remove aria-label="Remove contents line">Remove</button></div>`);
   document.getElementById('inboundAddLine').disabled = host.children.length >= 50;
 }
@@ -4194,8 +4203,10 @@ function selectItem(id) {
   const keys = getShipmentFieldKeys(item.clientId || state.activeClientId);
   const shipmentEditor = document.getElementById('shipmentEditor');
   const stockEditor = document.getElementById('stockEditor');
+  const stockAdjustments = document.getElementById('stockAdjustments');
   if (shipmentEditor) shipmentEditor.hidden = !keys;
   if (stockEditor) stockEditor.hidden = Boolean(keys);
+  if (stockAdjustments) stockAdjustments.hidden = !hasWarehouseAccess();
   if (!keys) return;
 
   const current = document.getElementById('shipCurrent');
@@ -4253,15 +4264,22 @@ function itemFieldValue(item, key) {
   return item[key] ?? '';
 }
 
+function fulfillmentStageField() {
+  return hasWarehouseAccess()
+    ? { key: 'status', label: 'Fulfillment stage', type: 'select', options: Object.values(FULFILLMENT_STATUSES) }
+    : { key: 'status', label: 'Fulfillment stage', type: 'display' };
+}
+
 function renderItemDetails(item) {
   const section = document.getElementById('detailsEditor');
   const host = document.getElementById('detailFields');
   if (!section || !host) return;
   const clientId = item.clientId || state.activeClientId;
   const viewOnly = !state.isAdmin && Boolean(state.clientProfile?.readOnly);
-  const fields = getEditableItemFields(clientId);
+  let fields = getEditableItemFields(clientId);
   if (isFulfillmentClient(clientId)) {
-    fields.push({ key: 'status', label: 'Fulfillment stage', type: 'select', options: Object.values(FULFILLMENT_STATUSES), readOnly: !state.isAdmin });
+    fields = fields.filter((field) => field.key !== 'status');
+    fields.push(fulfillmentStageField());
   }
   section.hidden = viewOnly || !fields.length;
   if (section.hidden) return;
@@ -4272,6 +4290,7 @@ function renderItemDetailFields(item, fields, prefix, viewOnly = false) {
   return fields.map((field) => {
     const id = escapeHtml(`${prefix}${field.key}`);
     const value = escapeHtml(itemFieldValue(item, field.key));
+    if (field.type === 'display') return `<div><span class="ac-label">${escapeHtml(field.label)}</span><p>${value}</p></div>`;
     const label = `<label class="ac-label" for="${id}">${escapeHtml(field.label)}</label>`;
     const prep = CATALOG_FIELDS.find((entry) => entry.key === 'prepInstructions');
     const common = `id="${id}" class="ac-input detail-input" data-key="${escapeHtml(field.key)}"${catalogFieldMatches(prep, field) ? ' maxlength="5000"' : ''}${viewOnly || field.readOnly ? ' disabled' : ''}`;
@@ -4310,14 +4329,14 @@ function openInventoryItemDialog(itemId) {
   const shipment = isFulfillmentClient(clientId) && (Boolean(getShipmentFieldKeys(clientId)) || ['CL-002', 'CL-003'].includes(clientId));
   const stockLocked = shipment || (!state.isAdmin && profile?.quickEditMode === 'disabled');
   const fulfillment = isFulfillmentClient(clientId);
-  const fields = getEditableItemFields(clientId).map((field) => ({ ...field }));
+  const fields = getEditableItemFields(clientId).filter((field) => !fulfillment || field.key !== 'status').map((field) => ({ ...field }));
   if (clientId === 'CL-002' && profile?.legacy) fields.unshift({ key: 'title', label: 'Product Title', type: 'text' });
   if (!fields.some((field) => ['sku', 'upc'].includes(field.key))) {
     fields.unshift({ key: 'sku', label: 'SKU', type: 'text', readOnly: true });
   }
   fields.push(
-    { key: 'qty', label: shipment ? 'Quantity (shipment-managed)' : 'Quantity', type: 'number', readOnly: stockLocked },
-    { key: 'status', label: fulfillment ? 'Fulfillment stage' : 'Status', type: 'select', options: fulfillment ? Object.values(FULFILLMENT_STATUSES) : ['In Stock', 'Low Stock', 'Out of Stock'], readOnly: fulfillment ? !state.isAdmin : stockLocked }
+    { key: 'qty', label: shipment ? 'Quantity (shipment-managed)' : 'In-stock quantity', type: 'number', readOnly: stockLocked || !hasWarehouseAccess() },
+    fulfillment ? fulfillmentStageField() : { key: 'status', label: 'Status', type: 'select', options: ['In Stock', 'Low Stock', 'Out of Stock'], readOnly: stockLocked }
   );
   if (!fields.some((field) => field.key === 'notes')) fields.push({ key: 'notes', label: 'Notes / Comments', type: 'textarea' });
   const uniqueFields = fields.filter((field, index) => fields.findIndex((other) => other.key === field.key) === index);
@@ -4329,7 +4348,9 @@ function openInventoryItemDialog(itemId) {
     ? 'This account is view-only. Contact your ECL team to request changes.'
     : shipment
       ? 'Edit product details here. Received and shipped quantities are managed in Updates.'
-      : 'Update product details, stock levels, and notes for this item.';
+      : hasWarehouseAccess()
+        ? 'Update product details, stock levels, and notes for this item.'
+        : 'Update product details and notes. Warehouse staff manage in-stock quantities.';
   document.getElementById('inventoryItemFields').innerHTML = renderItemDetailFields(snapshot, uniqueFields, 'modalItem_', viewOnly);
   const productLinks = document.getElementById('inventoryProductLinks');
   if (productLinks) productLinks.innerHTML = productSearchLinks(item.title, item.productUrl);
@@ -4375,12 +4396,12 @@ async function saveInventoryItemDialog(event) {
   try {
     if (!pinWrap.hidden) {
       const pin = document.getElementById('inventoryItemPin').value.trim();
-      if (!pin) throw new Error('Enter your Quick Edit PIN to save stock changes.');
+      if (!pin) throw new Error('Enter your Quick Edit PIN to save stock status.');
       const unlockResponse = await fetch(QUICK_EDIT_UNLOCK_URL, {
         method: 'POST', headers, body: JSON.stringify({ clientId: editor.clientId, pin })
       });
       const unlock = await unlockResponse.json();
-      if (!unlockResponse.ok || !unlock.success) throw new Error(unlock.error || 'Unable to unlock stock changes.');
+      if (!unlockResponse.ok || !unlock.success) throw new Error(unlock.error || 'Unable to unlock stock status changes.');
       if (inventoryItemEditor !== editor) return;
       state.quickEditUnlock = { clientId: editor.clientId, token: unlock.token, expiresAt: unlock.expiresAt };
       document.getElementById('inventoryItemPin').value = '';
@@ -4505,6 +4526,10 @@ async function saveShipment() {
 }
 
 async function saveQuantity(item, quantity) {
+  if (!hasWarehouseAccess()) {
+    showToast('Only warehouse staff can change in-stock quantities.', 'error');
+    return;
+  }
   const clientId = state.activeClientId;
   try {
     const response = await fetch(UPDATE_QUANTITY_URL, {
@@ -4513,11 +4538,6 @@ async function saveQuantity(item, quantity) {
       body: JSON.stringify({ clientId, sku: item.sku, qty: quantity })
     });
     const result = await response.json();
-    if (result.code === 'QUICK_EDIT_PIN_REQUIRED') {
-      state.quickEditUnlock = null;
-      openPinPrompt(() => saveQuantity(item, quantity), 'quick-edit');
-      return;
-    }
     if (!response.ok || !result.success) throw new Error(result.error || 'Unable to update inventory.');
     if (clientId !== state.activeClientId || !state.auth) return;
     item.qty = quantity;
@@ -4577,7 +4597,7 @@ async function createProduct() {
   const titleInput = document.getElementById(`${form.prefix}Title`);
   const productNameInput = document.getElementById(`${form.fieldPrefix}productName`);
   const title = (titleInput?.value?.trim() || productNameInput?.value?.trim() || '');
-  const qty = Number(document.getElementById(`${form.prefix}Qty`)?.value ?? 0);
+  const qty = hasWarehouseAccess() ? Number(document.getElementById(`${form.prefix}Qty`)?.value ?? 0) : 0;
   const extraFields = {};
   const allowedFields = getFormFields(clientId, 'inventory');
 
@@ -4664,6 +4684,7 @@ document.getElementById('packagingClose')?.addEventListener('click', closePackag
 document.getElementById('packagingDialog')?.addEventListener('cancel', closePackagingDialog);
 document.getElementById('inboundForm')?.addEventListener('submit', submitInboundShipment);
 document.getElementById('inboundClose')?.addEventListener('click', closeInboundDialog);
+document.getElementById('updateInboundAdd')?.addEventListener('click', openInboundDialog);
 document.getElementById('inboundDialog')?.addEventListener('cancel', () => { inboundDraftId = null; });
 document.getElementById('inboundAddLine')?.addEventListener('click', addInboundLine);
 document.getElementById('inboundContents')?.addEventListener('click', (event) => {

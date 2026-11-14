@@ -245,6 +245,11 @@
     <div id="page-update" class="page content" style="display:none;">
       <header class="page-heading"><h2>Inventory updates</h2><p>Find an item, then update its quantities, shipment progress, or details.</p></header>
       <div id="warehousePackagingBanner"></div>
+      <section class="update-card" id="updateInbound" hidden>
+        <h3>Inbound quantity</h3>
+        <p class="billing-hint">Log expected quantities in an inbound shipment. Stock changes only after warehouse receiving verification.</p>
+        <button type="button" class="btn-set" id="updateInboundAdd">Notify Restock / Add Inbound Shipment</button>
+      </section>
       <section class="update-card barcode-checkin" aria-labelledby="barcodeCheckInHeading">
         <h3 id="barcodeCheckInHeading">Scan to check in</h3>
         <p class="billing-hint" id="barcodeScanHint">Scan a UPC, SKU or tracking number with your USB scanner and press Enter, or use your camera. A unique active match records arrival without changing quantities. Staff access is required.</p>
@@ -319,6 +324,7 @@
             <span class="badge" id="selBadge"></span>
           </div>
           <hr class="divider" />
+          <div id="stockAdjustments">
           <h3>Quick adjust</h3>
           <div class="amt-row">
             <label>Amount:</label>
@@ -337,6 +343,7 @@
           </div>
           </div>
           </details>
+          </div>
           </div>
         </div>
       </div>
@@ -366,7 +373,7 @@
                 <input type="text" id="newProductTitle" class="ac-input" placeholder="Copper Marker" />
               </div>
               <div>
-                <label class="ac-label" for="newProductQty">Quantity</label>
+                <label class="ac-label" for="newProductQty">In-stock quantity</label>
                 <input type="number" id="newProductQty" class="ac-input" value="0" min="0" />
               </div>
               <div id="customProductFields" hidden></div>
@@ -613,7 +620,7 @@
             <select id="acInventoryMode" class="ac-input"><option value="custom">Order fulfillment</option><option value="inventory">Stock levels</option></select>
           </div>
           <div>
-            <label class="ac-label" for="acQuickEditMode">Quick Edit (table +/− buttons)</label>
+            <label class="ac-label" for="acQuickEditMode">Client stock status editing</label>
             <select id="acQuickEditMode" class="ac-input" onchange="syncQuickEditPinField('ac')">
               <option value="enabled">Enabled</option>
               <option value="password">Password Protected</option>
@@ -709,7 +716,7 @@
               <select id="ecInventoryMode" class="ac-input"><option value="inventory">Stock levels</option><option value="custom">Order fulfillment</option></select>
             </div>
             <div>
-              <label class="ac-label" for="ecQuickEditMode">Quick Edit (table +/− buttons)</label>
+              <label class="ac-label" for="ecQuickEditMode">Client stock status editing</label>
               <select id="ecQuickEditMode" class="ac-input" onchange="syncQuickEditPinField('ec')">
                 <option value="enabled">Enabled</option>
                 <option value="password">Password Protected</option>
@@ -854,7 +861,7 @@
             <div class="faq-answer">
               <p><strong>Administrators</strong> can switch client accounts, manage client configuration and staff, and access billing and system settings.</p>
               <p><strong>Warehouse staff</strong> can switch accounts for receiving, barcode check-in, inspection, fulfillment updates and activity logs. In Updates, choose Scan Barcode, center one barcode in the green target and hold steady. A highlighted message and a beep (when audio is available) confirm capture. Close camera or press Escape to release the camera; leaving Updates or hiding the page also stops it. Administrators and warehouse staff can add inventory even when an account is view-only for its client. Staff Settings contains client branding only; warehouse staff cannot access billing, master settings, staff management or store credentials.</p>
-              <p><strong>Clients</strong> can access only their own inventory, inbound shipments, tracking, chat and activity. Item editing still follows their account's inventory permissions. Clients can maintain their own packaging notes and optional store configuration; billing is available only when shared by an administrator. The API enforces account boundaries as well as hiding restricted controls.</p>
+              <p><strong>Clients</strong> can access only their own inventory, inbound shipments, tracking, chat and activity. Item editing still follows their account's inventory permissions. Clients can view fulfillment stages, but only administrators and warehouse staff can change them. Clients can maintain their own packaging notes and optional store configuration; billing is available only when shared by an administrator. The API enforces account boundaries as well as hiding restricted controls.</p>
             </div>
           </details>
           <details class="faq-item" id="integrationGuide" data-keywords="store integration optional api keys shopify woocommerce bigcommerce amazon wix custom token webhook url sync manual scraping public feed consumer secret settings automation">
@@ -942,20 +949,20 @@
           <details class="faq-item" data-keywords="new item create sku product add inventory">
             <summary>How do I add a new inventory item?</summary>
             <div class="faq-answer">
-              <p>Open the <strong>Add item</strong> tab, enter the product title and starting quantity (the SKU is optional), fill in any extra fields for your account, then select <strong>Add</strong>.</p>
+              <p>Open the <strong>Add item</strong> tab, enter the product title (the SKU is optional), fill in any extra fields for your account, then select <strong>Add</strong>. Only staff can set the starting in-stock quantity. Clients can notify an inbound shipment with its expected quantities.</p>
               <p>If you don't see an Add item tab, your account is view-only or PIN-protected. Message the ECL team in <strong>Chat</strong> and they can add it for you.</p>
             </div>
           </details>
           <details class="faq-item" data-keywords="update quantity adjust received shipped edit stock count pin">
             <summary>How do I update quantities or shipment progress?</summary>
             <div class="faq-answer">
-              <p>Open <strong>Updates</strong>, search for the item by SKU or product name, and select it. You can then:</p>
+              <p>Clients can use <strong>Updates</strong> to notify an inbound shipment and enter expected quantities. Only warehouse staff and administrators can change in-stock quantities. Staff can search for an item and:</p>
               <ul>
                 <li>Enter quantities received and shipped under <strong>Received &amp; shipped</strong>.</li>
                 <li>Use <strong>+ Add</strong> / <strong>− Remove</strong> for quick adjustments.</li>
                 <li>Open <strong>Set exact quantity</strong> to replace the on-hand count.</li>
               </ul>
-              <p>Some accounts ask for a PIN before changes can be made.</p>
+              <p>Inbound quantities do not change stock until staff verify receiving.</p>
             </div>
           </details>
           <details class="faq-item" data-keywords="search filter find dashboard inventory status sort">

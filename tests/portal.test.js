@@ -1267,7 +1267,7 @@ test('notification API isolates client threads and persists read cursors in the 
     assert.equal(admin.inventory, 0);
     const update = await fetch(`http://127.0.0.1:${server.address().port}/api/inventory/quantity`, {
       method: 'PUT',
-      headers: { Authorization: `Bearer ${signNotificationSession('MetalGarden', 'CL-001', 'client')}`, 'Content-Type': 'application/json' },
+      headers: { Authorization: `Bearer ${signNotificationSession('DockStaff', 'CL-000', 'staff')}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ clientId: 'CL-001', sku: 'SKU-1', qty: 7 })
     });
     assert.equal(update.status, 200);
@@ -1873,22 +1873,22 @@ test('field toggles, quick-edit PIN protection, and legacy settings edits are en
     assert.ok(!JSON.stringify(profile).includes('$2'));
 
     const item = { clientId: 'CL-004', sku: 'X', title: 'Widget', qty: 3, extraFields: { fragile: 'Y', carrier: 'UPS' } };
-    assert.equal((await call('POST', '/inventory/create', { ...item, kind: 'order', sku: 'ORD-1' }, acmeToken)).status, 200);
-    assert.equal((await call('POST', '/inventory/create', { ...item, sku: 'INV-1', status: 'Low Stock' }, acmeToken)).status, 200);
-    assert.deepEqual(added, [['ORD-1', 'Widget', 'Y', '', 3, 'In Transit to Warehouse', ''], ['INV-1', 'Widget', 'Y', 'UPS', 3, 'In Transit to Warehouse', '']]);
+    assert.equal((await call('POST', '/inventory/create', item, acmeToken)).status, 403);
+    assert.equal((await call('POST', '/inventory/create', { ...item, qty: 0, kind: 'order', sku: 'ORD-1' }, acmeToken)).status, 200);
+    assert.equal((await call('POST', '/inventory/create', { ...item, qty: 0, sku: 'INV-1', status: 'Low Stock' }, acmeToken)).status, 200);
+    assert.deepEqual(added, [['ORD-1', 'Widget', 'Y', '', 0, 'In Transit to Warehouse', ''], ['INV-1', 'Widget', 'Y', 'UPS', 0, 'In Transit to Warehouse', '']]);
 
     const quantity = { clientId: 'CL-004', sku: 'SKU-9', qty: 4 };
     const locked = await call('PUT', '/inventory/quantity', quantity, acmeToken);
     assert.equal(locked.status, 403);
-    assert.equal((await locked.json()).code, 'QUICK_EDIT_PIN_REQUIRED');
+    assert.match((await locked.json()).error, /Only warehouse staff/);
     assert.equal((await call('POST', '/quick-edit/unlock', { clientId: 'CL-004', pin: '0000' }, acmeToken)).status, 401);
     assert.equal((await call('POST', '/quick-edit/unlock', { clientId: 'CL-003', pin: '2468' }, acmeToken)).status, 400);
     const unlock = await (await call('POST', '/quick-edit/unlock', { clientId: 'CL-004', pin: '9876' }, acmeToken)).json();
     assert.ok(unlock.success);
     assert.equal((await call('GET', '/clients', null, unlock.token)).status, 401);
     assert.equal((await call('PUT', '/inventory/quantity', quantity, cjaToken, { 'X-Quick-Edit-Token': unlock.token })).status, 400);
-    assert.equal((await call('PUT', '/inventory/quantity', quantity, acmeToken, { 'X-Quick-Edit-Token': unlock.token })).status, 200);
-    assert.equal(cells.get('1:4').value, 4);
+    assert.equal((await call('PUT', '/inventory/quantity', quantity, acmeToken, { 'X-Quick-Edit-Token': unlock.token })).status, 403);
     assert.equal((await call('PUT', '/inventory/quantity', { ...quantity, qty: 5 }, adminToken)).status, 200);
 
     assert.equal((await call('PUT', '/admin/clients/CL-002', { quickEditMode: 'password' }, adminToken)).status, 400);
@@ -1952,7 +1952,7 @@ test('field toggles, quick-edit PIN protection, and legacy settings edits are en
     assert.equal((await call('PUT', '/admin/clients/CL-002', {}, adminToken)).status, 404);
 
     assert.equal((await call('PUT', '/admin/clients/CL-003', { quickEditMode: 'password' }, adminToken)).status, 200);
-    assert.equal((await call('PUT', '/inventory/quantity', { clientId: 'CL-003', sku: 'A', qty: 1 }, cjaToken, { 'X-Quick-Edit-Token': unlock.token })).status, 400, 'shipment quantities cannot be changed through stock quick edit');
+    assert.equal((await call('PUT', '/inventory/quantity', { clientId: 'CL-003', sku: 'A', qty: 1 }, cjaToken, { 'X-Quick-Edit-Token': unlock.token })).status, 403, 'clients cannot change quantities through stock quick edit');
     assert.ok((await (await call('POST', '/quick-edit/unlock', { clientId: 'CL-003', pin: '2468' }, cjaToken)).json()).success);
     assert.match(credentialRows[1].values.Quick_Edit_PIN_Hash, /^\$2[aby]\$/);
     assert.equal(credentialRows[1].values.Edit_PIN, '2468');
@@ -2156,7 +2156,10 @@ test('staff update received then shipped quantities and the status follows the w
       const saved = await (await update({received:12,shipped:10},admin)).json();
       assert.equal(saved.status, status, 'quantity updates retain verified/prep stages');
     }
+    assert.equal((await editItem({ values: { status: 'Received & Verified' } }, signNotificationSession('Staff', 'CL-000', 'staff'))).status, 200);
+    assert.equal(grid[1][5], 'Received & Verified');
     assert.equal((await editItem({ values: { status: 'In Prep' } }, client)).status, 403);
+    assert.equal(grid[1][5], 'Received & Verified');
     assert.equal((await editItem({ values: { status: 'In Stock' } }, admin)).status, 400);
     assert.equal((await update({received:12,shipped:12},admin)).status, 200);
     assert.equal((await scan('A-1')).status, 409, 'shipped items cannot be checked in');
@@ -2722,7 +2725,7 @@ test('catalog sync and manual product saves keep images and bundles in modern an
     for (const clientId of ['CL-004','CL-002','CL-003']) {
       const token=clientId==='CL-004'?client:staff;
       const original=grids[clientId][1].slice();
-      const body={clientId,title:'Review title',sku:'CAT-1',qty:10,extraFields:{imageUrl:product.imageUrl,bundled:'Y',bundleQty:'3',productName:'Review title',merchant:'Shop',prepInstructions:'Wrap in bubble wrap'}};
+      const body={clientId,title:'Review title',sku:'CAT-1',qty:clientId==='CL-004'?0:10,extraFields:{imageUrl:product.imageUrl,bundled:'Y',bundleQty:'3',productName:'Review title',merchant:'Shop',prepInstructions:'Wrap in bubble wrap'}};
       const created=await call('/inventory/create',body,token);
       assert.equal(created.status,200,JSON.stringify(await created.json()));
       const [headers,,row]=grids[clientId];
@@ -2779,7 +2782,7 @@ test('item detail edits atomically save stock, SKU and notes while enforcing acc
       get value() { return rows[row]?.[column] ?? ''; },
       set value(value) { rows[row][column] = value; }
     }),
-    saveUpdatedCells: async () => {}
+    saveUpdatedCells: async () => {}, addRow: async (row) => { rows.push(row); }
   });
   const sheets = {
     User_Credentials: { headerValues: [], loadHeaderRow: async () => {}, setHeaderRow: async () => {}, getRows: async () => credentials },
@@ -2804,13 +2807,22 @@ test('item detail edits atomically save stock, SKU and notes while enforcing acc
   try {
     const locked = await put({ qty: 6, notes: 'Do not write yet' });
     assert.equal(locked.status, 403);
-    assert.equal((await locked.json()).code, 'QUICK_EDIT_PIN_REQUIRED');
+    assert.match((await locked.json()).error, /Only warehouse staff/);
     assert.deepEqual(grid[1], ['A-1', 'Widget', 10, 'In Stock', 'Original']);
     const unlock = await (await fetch(`${base}/quick-edit/unlock`, {
       method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${client}` },
       body: JSON.stringify({ clientId: 'CL-004', pin: '9876' })
     })).json();
     assert.ok(unlock.token);
+    const create = (qty, token = client) => fetch(`${base}/inventory/create`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ clientId: 'CL-004', title: 'New item', sku: 'NEW', qty, status: 'In Stock' })
+    });
+    assert.equal((await create(9)).status, 403);
+    assert.equal((await create(0)).status, 200);
+    assert.deepEqual(grid[2].slice(0, 5), ['NEW', 'New item', 0, 'Out of Stock', '']);
+    assert.equal((await create(9, admin)).status, 200);
+    assert.deepEqual(grid[3].slice(0, 5), ['NEW', 'New item', 9, 'In Stock', '']);
     for (const qty of [-1, 1.5, '', 'not-a-number']) {
       assert.equal((await put({ notes: 'Invalid', qty }, admin)).status, 400);
       assert.equal(grid[1][4], 'Original');
@@ -2818,8 +2830,9 @@ test('item detail edits atomically save stock, SKU and notes while enforcing acc
     assert.equal((await put({ notes: 'Invalid', status: 'Anything' }, admin)).status, 400);
     assert.equal((await put({ notes: 'x'.repeat(501) }, admin)).status, 400);
     assert.equal(grid[1][4], 'Original');
-    assert.equal((await put({ qty: 6 }, client, { title: 'Moved', unlock: unlock.token })).status, 409);
-    assert.equal((await put({ sku: 'A-2', qty: 6, status: 'Low Stock', notes: 'Handle carefully' }, client, { unlock: unlock.token })).status, 200);
+    assert.equal((await put({ qty: 6 }, client, { unlock: unlock.token })).status, 403);
+    assert.equal((await put({ qty: 6 }, admin, { title: 'Moved' })).status, 409);
+    assert.equal((await put({ sku: 'A-2', qty: 6, status: 'Low Stock', notes: 'Handle carefully' }, admin)).status, 200);
     assert.deepEqual(grid[1], ['A-2', 'Widget', 6, 'Low Stock', 'Handle carefully']);
     assert.equal((await put({ qty: 0 }, admin)).status, 200);
     assert.deepEqual(grid[1].slice(2, 4), [0, 'Out of Stock']);
@@ -3265,10 +3278,91 @@ test('inventory row dialog supports delegated opening, safe snapshots, permissio
     state.items = [{id:'CL-002-1',clientId:'CL-002',title:'Shipment',upc:'00123',qty:10,quantityReceived:8,quantityShipped:3}];
     openInventoryItemDialog('CL-002-1')`, context);
   assert.match(elements.inventoryItemFields.innerHTML, /data-key="qty" disabled/);
-  assert.match(elements.inventoryItemFields.innerHTML, /data-key="status" disabled/);
+  assert.doesNotMatch(elements.inventoryItemFields.innerHTML, /data-key="status"/);
   assert.match(elements.inventoryItemFields.innerHTML, /Arrived \/ Check-In/);
   assert.doesNotMatch(elements.inventoryItemFields.innerHTML, /data-key="productDescription"/);
   assert.match(elements.inventoryItemFields.innerHTML, /data-key="title"/);
+});
+
+test('fulfillment stage is read-only text for clients and editable in both views for staff and admins', () => {
+  const elements = Object.fromEntries([
+    'detailsEditor', 'detailFields', 'inventoryItemDialog', 'inventoryItemTitle', 'inventoryItemHint',
+    'inventoryItemFields', 'inventoryItemError', 'inventoryItemPinWrap', 'inventoryItemPin', 'inventoryItemSave'
+  ].map((id) => [id, {
+    hidden: false, innerHTML: '', textContent: '', value: '', style: {},
+    addEventListener() {}, showModal() { this.open = true; }, close() { this.open = false; }
+  }]));
+  const context = vm.createContext({
+    document: { getElementById: (id) => elements[id] || null, querySelectorAll: () => [], addEventListener() {} },
+    window: { location: { hostname: 'localhost' }, addEventListener() {} },
+    setTimeout: () => 0, clearTimeout() {}, console
+  });
+  vm.runInContext(fs.readFileSync(require.resolve('../frontend/app.js'), 'utf8'), context);
+  vm.runInContext(`state.auth = true; state.activeClientId = 'CL-004';
+    state.clientProfile = {clientId:'CL-004',inventoryMode:'custom',fields:[]};
+    state.items = [{id:'CL-004-1',clientId:'CL-004',title:'Widget',status:'In Prep'}];`, context);
+  for (const role of ['client', 'admin', 'staff']) {
+    vm.runInContext(`state.session = {role:'${role}'}; state.isAdmin = ${role !== 'client'};
+      renderItemDetails(state.items[0]); openInventoryItemDialog('CL-004-1');`, context);
+    for (const host of [elements.detailFields, elements.inventoryItemFields]) {
+      assert.match(host.innerHTML, /In Prep/);
+      if (role === 'client') {
+        assert.doesNotMatch(host.innerHTML, /data-key="status"|In Transit to Warehouse|Received &amp; Verified/);
+      } else {
+        assert.match(host.innerHTML, /<select[^>]*data-key="status"/);
+        assert.match(host.innerHTML, /In Transit to Warehouse/);
+        assert.match(host.innerHTML, /Received &amp; Verified/);
+      }
+    }
+    vm.runInContext('closeInventoryItemDialog()', context);
+  }
+});
+
+test('stock controls are staff-only while Updates opens editable inbound shipment quantities', async () => {
+  const listeners = {};
+  const ids = ['inventoryBody', 'inventoryHeaderRow', 'stockEditor', 'stockAdjustments', 'shipmentEditor',
+    'detailsEditor', 'detailFields', 'newProductQty', 'updateInbound', 'updateInboundAdd',
+    'inboundDialog', 'inboundForm', 'inboundFields', 'inboundSave', 'inboundError', 'inboundContents',
+    'inboundProductOptions', 'inboundAddLine', 'inboundCarrier'];
+  const elements = Object.fromEntries(ids.map((id) => [id, {
+    hidden: false, value: '', innerHTML: '', textContent: '', style: {}, dataset: {}, children: [],
+    addEventListener(type, fn) { listeners[`${id}:${type}`] = fn; },
+    insertAdjacentHTML(_position, html) { this.innerHTML += html; this.children.push({}); },
+    reset() {}, focus() {}, showModal() { this.open = true; }, close() { this.open = false; }
+  }]));
+  let requests = 0;
+  const context = vm.createContext({
+    document: { getElementById: (id) => elements[id] || null, querySelectorAll: () => [], addEventListener() {} },
+    window: { location: { hostname: 'localhost' }, addEventListener() {} },
+    crypto: { randomUUID: () => '00000000-0000-4000-8000-000000000001' },
+    fetch: async () => { requests++; return { ok: true, json: async () => ({ success: true }) }; },
+    setTimeout: () => 0, clearTimeout() {}, console
+  });
+  vm.runInContext(fs.readFileSync(require.resolve('../frontend/app.js'), 'utf8'), context);
+  vm.runInContext(`state.auth=true; state.activeClientId='CL-004';
+    state.clientProfile={clientId:'CL-004',inventoryMode:'inventory',fields:[],readOnly:false};
+    state.items=[{id:'CL-004-1',clientId:'CL-004',sku:'A',title:'Widget',qty:5,status:'Low Stock'}];
+    state.session={role:'client',clientId:'CL-004'}; state.isAdmin=false;
+    renderProductForm(); selectItem('CL-004-1'); renderTable();`, context);
+  assert.equal(elements.newProductQty.readOnly, true);
+  assert.equal(elements.stockAdjustments.hidden, true);
+  assert.doesNotMatch(elements.inventoryBody.innerHTML, /data-action="adjust"/);
+  assert.doesNotMatch(elements.inventoryHeaderRow.innerHTML, />EDIT</);
+  assert.equal(elements.updateInbound.hidden, false);
+  listeners['updateInboundAdd:click']();
+  assert.equal(elements.inboundDialog.open, true);
+  assert.match(elements.inboundContents.innerHTML, /Inbound quantity \(expected\).*data-inbound-quantity/);
+  assert.doesNotMatch(elements.inboundContents.innerHTML, /data-inbound-quantity[^>]*(?:disabled|readonly)/);
+  await vm.runInContext('saveQuantity(state.items[0], 8)', context);
+  assert.equal(requests, 0);
+  for (const role of ['admin', 'staff']) {
+    vm.runInContext(`state.session={role:'${role}',clientId:'CL-000'}; state.isAdmin=true;
+      renderProductForm(); selectItem('CL-004-1'); renderTable();`, context);
+    assert.equal(elements.newProductQty.readOnly, false);
+    assert.equal(elements.stockAdjustments.hidden, false);
+    assert.match(elements.inventoryBody.innerHTML, /data-action="adjust"/);
+    assert.match(elements.inventoryHeaderRow.innerHTML, />EDIT</);
+  }
 });
 
 test('packaging notes are edited in Settings and displayed read-only on Dashboard only after saving notes', async () => {
@@ -3642,7 +3736,7 @@ test('inbound deletion endpoint requires admin PIN and reason, audits reversals 
 });
 
 test('inbound UI supports read-only notifications, staff scans, safe rendering and stale-response cleanup', async () => {
-  const ids=['inboundDashboard','inboundTracking','inboundForm','inboundDialog','inboundFields','inboundSave','inboundError','inboundContents','inboundCarrier','inboundTrackingNumber','inboundExpectedDate'];
+  const ids=['inboundDashboard','inboundTracking','updateInbound','updateInboundAdd','inboundForm','inboundDialog','inboundFields','inboundSave','inboundError','inboundContents','inboundCarrier','inboundTrackingNumber','inboundExpectedDate'];
   const elements=Object.fromEntries(ids.map(id=>[id,{
     value:'',hidden:false,innerHTML:'',textContent:'',disabled:false,style:{},
     classList:{contains:()=>false},addEventListener(){},reset(){},close(){this.open=false;}
@@ -3659,6 +3753,8 @@ test('inbound UI supports read-only notifications, staff scans, safe rendering a
   const shipment={id:'00000000-0000-4000-8000-000000000001',clientId:'CL-001',carrier:'UPS',trackingNumber:'1Z001234',expectedDeliveryDate:'2026-11-20',contents:[{sku:'<SKU>',quantity:12}],createdAt:'2026-11-10T12:00:00Z',createdBy:'<Owner>',status:'In Transit to Warehouse',arrivedAt:'',arrivedBy:''};
   context.fetch=async()=>({ok:true,json:async()=>({success:true,clientId:'CL-001',shipments:[shipment]})});
   await context.loadInboundShipments();
+  assert.equal(elements.updateInbound.hidden,false);
+  assert.equal(elements.updateInboundAdd.disabled,false);
   assert.equal(elements.inboundDashboard.hidden,false);
   assert.match(elements.inboundDashboard.innerHTML,/Notify Restock/);
   assert.match(elements.inboundDashboard.innerHTML,/Expected boxes and product contents for Garden &lt;Markers&gt;\./);
@@ -3720,6 +3816,7 @@ test('inbound UI supports read-only notifications, staff scans, safe rendering a
   assert.doesNotMatch(elements.inboundDashboard.innerHTML,/1Z001234/,'previous account shipments are not retained');
   assert.equal(vm.runInContext('inboundState.shipments',context),null);
   vm.runInContext("state.clientProfile.enableInboundShipments=false;renderInboundShipments()",context);
+  assert.equal(elements.updateInbound.hidden,true);
   assert.equal(elements.inboundDashboard.hidden,true);
   assert.equal(elements.inboundTracking.hidden,true);
   assert.equal(elements.inboundDashboard.innerHTML,'');
